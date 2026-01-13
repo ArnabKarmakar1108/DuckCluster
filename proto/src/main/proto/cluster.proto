@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package duckcluster.v1;
+
+option java_multiple_files = true;
+option java_package = "io.duckcluster.proto.v1";
+option java_outer_classname = "ClusterProto";
+
+// Called by workers on startup and for periodic liveness.
+service CoordinatorService {
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
+}
+
+// Called by the coordinator to reach worker nodes.
+service WorkerService {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc ExecuteFragment(FragmentRequest) returns (stream RowBatch);
+}
+
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  string host = 2;
+  int32 port = 3;
+  int32 num_threads = 4;
+}
+
+message RegisterWorkerResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  double load = 2;
+}
+
+message HeartbeatResponse {
+  bool healthy = 1;
+}
+
+message PingRequest {}
+
+message PingResponse {
+  bool ok = 1;
+  string worker_id = 2;
+}
+
+enum MergeHint {
+  MERGE_HINT_UNSPECIFIED = 0;
+  CONCAT = 1;
+  PARTIAL_AGG = 2;
+  GROUP_BY = 3;
+  TOP_K = 4;
+}
+
+message FragmentRequest {
+  string query_id = 1;
+  uint32 fragment_id = 2;
+  string sql = 3;
+  MergeHint merge_hint = 4;
+  repeated string result_column_names = 5;
+}
+
+message RowBatch {
+  uint64 row_count = 1;
+  repeated string column_names = 2;
+  repeated Column column_values = 3;
+}
+
+message Column {
+  string name = 1;
+  repeated string values = 2;
+}
