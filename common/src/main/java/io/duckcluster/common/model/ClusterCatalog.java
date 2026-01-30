@@ -1,18 +1,17 @@
 package io.duckcluster.common.model;
 
-import java.util.Collections;
 import java.util.Map;
-import java.util.Set;
 
 public final class ClusterCatalog {
+    public static ClusterCatalog demo(int shardCount) {
+        return new ClusterCatalog(Map.of(
+                "events", new TableShardConfig("events", shardCount, "id")));
+    }
+
     private final Map<String, TableShardConfig> tables;
 
     public ClusterCatalog(Map<String, TableShardConfig> tables) {
         this.tables = Map.copyOf(tables);
-    }
-
-    public static ClusterCatalog empty() {
-        return new ClusterCatalog(Collections.emptyMap());
     }
 
     public boolean hasTable(String tableName) {
@@ -25,9 +24,5 @@ public final class ClusterCatalog {
             throw new IllegalArgumentException("Unknown table: " + tableName);
         }
         return config;
-    }
-
-    public Set<String> tableNames() {
-        return tables.keySet();
     }
 }
