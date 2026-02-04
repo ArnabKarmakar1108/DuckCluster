@@ -15,6 +15,10 @@
 
     <dependencies>
         <dependency>
+            <groupId>io.duckcluster</groupId>
+            <artifactId>duckcluster-proto</artifactId>
+        </dependency>
+        <dependency>
             <groupId>org.apache.calcite</groupId>
             <artifactId>calcite-core</artifactId>
             <version>${calcite.version}</version>
