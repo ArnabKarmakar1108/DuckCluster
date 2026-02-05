@@ -1,6 +1,6 @@
 package io.duckcluster.common.model;
 
-public enum MergeStrategy {
+public enum MergeStrategyType {
     CONCATENATE,
     PARTIAL_AGG,
     GROUP_BY_MERGE,

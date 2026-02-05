@@ -4,6 +4,7 @@ import java.util.List;
 
 public record PlannedQuery(
         String originalSql,
+        String tableName,
         List<FragmentSpec> fragments,
-        MergeStrategy mergeStrategy,
+        MergeStrategyType mergeStrategy,
         List<ColumnDef> schema) {}
