@@ -9,18 +9,21 @@ public final class ClusterConfig {
     private final int coordinatorHttpPort;
     private final Duration heartbeatInterval;
     private final int heartbeatMissThreshold;
+    private final int shardCount;
 
     public ClusterConfig(
             String coordinatorHost,
             int coordinatorGrpcPort,
             int coordinatorHttpPort,
             Duration heartbeatInterval,
-            int heartbeatMissThreshold) {
+            int heartbeatMissThreshold,
+            int shardCount) {
         this.coordinatorHost = Objects.requireNonNull(coordinatorHost, "coordinatorHost");
         this.coordinatorGrpcPort = coordinatorGrpcPort;
         this.coordinatorHttpPort = coordinatorHttpPort;
         this.heartbeatInterval = Objects.requireNonNull(heartbeatInterval, "heartbeatInterval");
         this.heartbeatMissThreshold = heartbeatMissThreshold;
+        this.shardCount = shardCount;
     }
 
     public static ClusterConfig fromEnvironment() {
@@ -29,7 +32,8 @@ public final class ClusterConfig {
                 parseInt("DUCKCLUSTER_COORDINATOR_GRPC_PORT", 9090),
                 parseInt("DUCKCLUSTER_COORDINATOR_HTTP_PORT", 8080),
                 Duration.ofSeconds(parseInt("DUCKCLUSTER_HEARTBEAT_INTERVAL_SEC", 5)),
-                parseInt("DUCKCLUSTER_HEARTBEAT_MISS_THRESHOLD", 3));
+                parseInt("DUCKCLUSTER_HEARTBEAT_MISS_THRESHOLD", 3),
+                parseInt("DUCKCLUSTER_SHARD_COUNT", 3));
     }
 
     public String coordinatorHost() {
@@ -50,6 +54,10 @@ public final class ClusterConfig {
 
     public int heartbeatMissThreshold() {
         return heartbeatMissThreshold;
+    }
+
+    public int shardCount() {
+        return shardCount;
     }
 
     private static String getenv(String key, String defaultValue) {
