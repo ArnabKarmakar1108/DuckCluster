@@ -2,9 +2,13 @@ package io.duckcluster.worker;
 
 import io.duckcluster.common.config.ClusterConfig;
 import io.duckcluster.worker.client.CoordinatorClient;
+import io.duckcluster.worker.duckdb.FragmentExecutor;
+import io.duckcluster.worker.duckdb.WorkerDemoDataLoader;
 import io.duckcluster.worker.grpc.WorkerGrpcServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.sql.Connection;
 
 public final class WorkerMain {
     private static final Logger LOG = LoggerFactory.getLogger(WorkerMain.class);
@@ -21,12 +25,22 @@ public final class WorkerMain {
         int numThreads = args.length > 3 ? Integer.parseInt(args[3]) : 1;
 
         ClusterConfig config = ClusterConfig.fromEnvironment();
-        WorkerGrpcServer workerServer = new WorkerGrpcServer(workerId, host, port);
+        int shardIndex = parseShardIndex(workerId);
+        Connection connection = WorkerDemoDataLoader.openInMemoryConnection();
+        WorkerDemoDataLoader.initialize(connection, shardIndex, config.shardCount());
+
+        FragmentExecutor fragmentExecutor = new FragmentExecutor(connection);
+        WorkerGrpcServer workerServer = new WorkerGrpcServer(workerId, host, port, fragmentExecutor);
         CoordinatorClient coordinatorClient = new CoordinatorClient(config);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Shutting down worker {}", workerId);
             workerServer.stop();
+            try {
+                connection.close();
+            } catch (Exception e) {
+                LOG.warn("Failed to close DuckDB connection", e);
+            }
         }));
 
         workerServer.start();
@@ -37,5 +51,13 @@ public final class WorkerMain {
                 workerId, host, port, config.coordinatorHost(), config.coordinatorGrpcPort());
 
         Thread.currentThread().join();
+    }
+
+    static int parseShardIndex(String workerId) {
+        int dash = workerId.lastIndexOf('-');
+        if (dash < 0 || dash == workerId.length() - 1) {
+            return 0;
+        }
+        return Integer.parseInt(workerId.substring(dash + 1)) - 1;
     }
 }
