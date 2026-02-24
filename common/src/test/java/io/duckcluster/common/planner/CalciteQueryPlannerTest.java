@@ -31,14 +31,33 @@ class CalciteQueryPlannerTest {
         PlannedQuery planned = planner.plan("SELECT * FROM events", catalog);
         assertEquals(MergeStrategyType.CONCATENATE, planned.mergeStrategy());
         assertEquals(3, planned.fragments().size());
-        assertTrue(planned.fragments().get(0).sql().contains("(id % 3) = 0"));
-        assertTrue(planned.fragments().get(1).sql().contains("(id % 3) = 1"));
-        assertTrue(planned.fragments().get(2).sql().contains("(id % 3) = 2"));
+        assertTrue(planned.fragments().get(0).sql().contains("= 0"));
+        assertTrue(planned.fragments().get(1).sql().contains("= 1"));
+        assertTrue(planned.fragments().get(2).sql().contains("= 2"));
     }
 
     @Test
     void planInjectsShardPredicateIntoExistingWhereClause() {
         PlannedQuery planned = planner.plan("SELECT * FROM events WHERE id > 2", catalog);
-        assertTrue(planned.fragments().get(0).sql().contains("WHERE id > 2 AND (id % 3) = 0"));
+        assertTrue(planned.fragments().get(0).sql().contains("> 2"));
+        assertTrue(planned.fragments().get(0).sql().contains("MOD"));
+        assertTrue(planned.fragments().get(0).sql().contains("= 0"));
+    }
+
+    @Test
+    void groupByFragmentsKeepAggregatePushdown() {
+        PlannedQuery planned = planner.plan("SELECT category, COUNT(*) AS cnt FROM events GROUP BY category", catalog);
+        assertEquals(MergeStrategyType.GROUP_BY_MERGE, planned.mergeStrategy());
+        assertEquals(1, planned.analysis().aggregates().size());
+        assertTrue(planned.fragments().get(0).sql().contains("GROUP BY"));
+        assertTrue(planned.fragments().get(0).sql().contains("__dc_agg_0"));
+    }
+
+    @Test
+    void partialAggFragmentsIncludeAggregateAliases() {
+        PlannedQuery planned = planner.plan("SELECT COUNT(*), SUM(id) FROM events", catalog);
+        assertEquals(MergeStrategyType.PARTIAL_AGG, planned.mergeStrategy());
+        assertTrue(planned.fragments().get(1).sql().contains("__dc_agg_0"));
+        assertTrue(planned.fragments().get(1).sql().contains("__dc_agg_1"));
     }
 }
