@@ -1,7 +1,9 @@
 package io.duckcluster.coordinator.http;
 
 import io.duckcluster.common.config.ClusterConfig;
+import io.duckcluster.common.model.QueryResult;
 import io.duckcluster.common.registry.WorkerRegistry;
+import io.duckcluster.coordinator.execution.QueryExecutionService;
 import io.javalin.Javalin;
 import io.javalin.http.HttpStatus;
 import org.slf4j.Logger;
@@ -16,15 +18,27 @@ public final class CoordinatorHttpServer {
 
     private final ClusterConfig config;
     private final WorkerRegistry registry;
+    private final QueryExecutionService queryExecutionService;
     private Javalin app;
 
-    public CoordinatorHttpServer(ClusterConfig config, WorkerRegistry registry) {
+    public CoordinatorHttpServer(
+            ClusterConfig config, WorkerRegistry registry, QueryExecutionService queryExecutionService) {
         this.config = config;
         this.registry = registry;
+        this.queryExecutionService = queryExecutionService;
     }
 
     public void start() {
         app = Javalin.create(cfg -> cfg.showJavalinBanner = false)
+                .post("/v1/query", ctx -> {
+                    QueryRequest request = ctx.bodyAsClass(QueryRequest.class);
+                    if (request.sql == null || request.sql.isBlank()) {
+                        ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", "sql is required"));
+                        return;
+                    }
+                    QueryResult result = queryExecutionService.execute(request.sql);
+                    ctx.json(toResponse(result));
+                })
                 .get("/v1/cluster/health", ctx -> {
                     Map<String, Object> body = new LinkedHashMap<>();
                     body.put("status", registry.isHealthy() ? "UP" : "DEGRADED");
@@ -49,6 +63,12 @@ public final class CoordinatorHttpServer {
                     ctx.json(Map.of("workers", workers));
                 })
                 .get("/", ctx -> ctx.result("DuckCluster coordinator"))
+                .exception(IllegalArgumentException.class, (exception, ctx) -> {
+                    ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", exception.getMessage()));
+                })
+                .exception(IllegalStateException.class, (exception, ctx) -> {
+                    ctx.status(HttpStatus.SERVICE_UNAVAILABLE).json(Map.of("error", exception.getMessage()));
+                })
                 .exception(Exception.class, (exception, ctx) -> {
                     LOG.error("HTTP error", exception);
                     ctx.status(HttpStatus.INTERNAL_SERVER_ERROR)
@@ -63,5 +83,25 @@ public final class CoordinatorHttpServer {
         if (app != null) {
             app.stop();
         }
+    }
+
+    private static Map<String, Object> toResponse(QueryResult result) {
+        Map<String, Object> stats = new LinkedHashMap<>();
+        stats.put("mergeStrategy", result.stats().mergeStrategy().name());
+        stats.put("workersUsed", result.stats().workersUsed());
+        stats.put("fragmentsExecuted", result.stats().fragmentsExecuted());
+        stats.put("durationMs", result.stats().durationMs());
+        stats.put("workerDurationsMs", result.stats().workerDurationsMs());
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("queryId", result.queryId());
+        response.put("columns", result.columns());
+        response.put("rows", result.rows());
+        response.put("stats", stats);
+        return response;
+    }
+
+    private static final class QueryRequest {
+        public String sql;
     }
 }
