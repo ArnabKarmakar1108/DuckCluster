@@ -6,6 +6,8 @@ import io.duckcluster.proto.v1.HeartbeatRequest;
 import io.duckcluster.proto.v1.HeartbeatResponse;
 import io.duckcluster.proto.v1.RegisterWorkerRequest;
 import io.duckcluster.proto.v1.RegisterWorkerResponse;
+import io.duckcluster.proto.v1.ShardOwnership;
+import io.duckcluster.proto.v1.UpdateShardRequest;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.stub.StreamObserver;
@@ -13,6 +15,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -36,18 +39,29 @@ public final class CoordinatorClient implements AutoCloseable {
         this.asyncStub = CoordinatorServiceGrpc.newStub(channel);
     }
 
-    public void registerWorker(String workerId, String host, int port, int numThreads) {
+    public void registerWorker(String workerId, String host, int port, int numThreads,
+                               List<ShardOwnership> ownedShards) {
         RegisterWorkerRequest request = RegisterWorkerRequest.newBuilder()
                 .setWorkerId(workerId)
                 .setHost(host)
                 .setPort(port)
                 .setNumThreads(numThreads)
+                .addAllOwnedShards(ownedShards)
                 .build();
         RegisterWorkerResponse response = blockingStub.registerWorker(request);
         if (!response.getAccepted()) {
             throw new IllegalStateException("Worker registration rejected: " + response.getMessage());
         }
-        LOG.info("Registered with coordinator as {}", workerId);
+        LOG.info("Registered with coordinator as {} ({} shards)", workerId, ownedShards.size());
+    }
+
+    public void updateShardOwnership(String workerId, List<ShardOwnership> ownedShards) {
+        UpdateShardRequest request = UpdateShardRequest.newBuilder()
+                .setWorkerId(workerId)
+                .addAllOwnedShards(ownedShards)
+                .build();
+        blockingStub.updateShardOwnership(request);
+        LOG.debug("Updated shard ownership: {} shards", ownedShards.size());
     }
 
     public void startHeartbeat(String workerId, Duration interval) {
