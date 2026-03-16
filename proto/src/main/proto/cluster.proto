@@ -10,12 +10,15 @@ option java_outer_classname = "ClusterProto";
 service CoordinatorService {
   rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
   rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
+  rpc UpdateShardOwnership(UpdateShardRequest) returns (UpdateShardResponse);
 }
 
 // Called by the coordinator to reach worker nodes.
 service WorkerService {
   rpc Ping(PingRequest) returns (PingResponse);
   rpc ExecuteFragment(FragmentRequest) returns (stream RowBatch);
+  rpc ReadShard(ReadShardRequest) returns (stream ShardDataChunk);
+  rpc ReceiveShard(stream ShardDataChunk) returns (ReceiveShardResponse);
 }
 
 message RegisterWorkerRequest {
@@ -23,6 +26,22 @@ message RegisterWorkerRequest {
   string host = 2;
   int32 port = 3;
   int32 num_threads = 4;
+  repeated ShardOwnership owned_shards = 5;
+}
+
+message ShardOwnership {
+  string table_name = 1;
+  uint32 shard_id = 2;
+  uint64 row_count = 3;
+}
+
+message UpdateShardRequest {
+  string worker_id = 1;
+  repeated ShardOwnership owned_shards = 2;
+}
+
+message UpdateShardResponse {
+  bool accepted = 1;
 }
 
 message RegisterWorkerResponse {
@@ -71,4 +90,21 @@ message RowBatch {
 message Column {
   string name = 1;
   repeated string values = 2;
+}
+
+message ReadShardRequest {
+  string table_name = 1;
+  uint32 shard_id = 2;
+}
+
+message ShardDataChunk {
+  string table_name = 1;
+  uint32 shard_id = 2;
+  bytes data = 3;
+  bool is_last = 4;
+}
+
+message ReceiveShardResponse {
+  bool accepted = 1;
+  string message = 2;
 }
