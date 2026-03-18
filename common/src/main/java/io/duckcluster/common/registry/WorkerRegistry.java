@@ -51,6 +51,14 @@ public final class WorkerRegistry {
         return Optional.of(updated);
     }
 
+    public boolean removeWorker(String workerId) {
+        return workers.remove(workerId) != null;
+    }
+
+    public Optional<WorkerRecord> getWorker(String workerId) {
+        return Optional.ofNullable(workers.get(workerId));
+    }
+
     public List<WorkerRecord> listWorkers() {
         return new ArrayList<>(workers.values());
     }
