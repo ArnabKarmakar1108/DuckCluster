@@ -31,17 +31,17 @@ class CalciteQueryPlannerTest {
         PlannedQuery planned = planner.plan("SELECT * FROM events", catalog);
         assertEquals(MergeStrategyType.CONCATENATE, planned.mergeStrategy());
         assertEquals(3, planned.fragments().size());
-        assertTrue(planned.fragments().get(0).sql().contains("= 0"));
-        assertTrue(planned.fragments().get(1).sql().contains("= 1"));
-        assertTrue(planned.fragments().get(2).sql().contains("= 2"));
+        assertTrue(planned.fragments().get(0).sql().contains("events_shard0"));
+        assertTrue(planned.fragments().get(1).sql().contains("events_shard1"));
+        assertTrue(planned.fragments().get(2).sql().contains("events_shard2"));
     }
 
     @Test
-    void planInjectsShardPredicateIntoExistingWhereClause() {
+    void planUsesQualifiedTableNameWithFilter() {
         PlannedQuery planned = planner.plan("SELECT * FROM events WHERE id > 2", catalog);
-        assertTrue(planned.fragments().get(0).sql().contains("> 2"));
-        assertTrue(planned.fragments().get(0).sql().contains("MOD"));
-        assertTrue(planned.fragments().get(0).sql().contains("= 0"));
+        String sql = planned.fragments().get(0).sql();
+        assertTrue(sql.contains("> 2"));
+        assertTrue(sql.contains("events_shard0"));
     }
 
     @Test
