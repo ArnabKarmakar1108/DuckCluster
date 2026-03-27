@@ -7,4 +7,5 @@ public record PlannedQuery(
         String tableName,
         List<FragmentSpec> fragments,
         MergeStrategyType mergeStrategy,
+        QueryAnalysis analysis,
         List<ColumnDef> schema) {}
