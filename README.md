@@ -8,15 +8,19 @@ Built in Java 17 as a multi-module Maven project.
 
 ## Status
 
-| Phase | Focus |
-|-------|--------|
-| **0** | Foundation — gRPC, worker registry, REST health, Calcite skeleton
-| **1** | Scan fan-out — `POST /v1/query`, fragment execution, concatenate merge
-| **2** | Pushdown + aggregation — filter/project pushdown, two-phase GROUP BY & partial agg
-| **3** | ORDER BY + LIMIT — top-K merge across shards
-| **4+** | Reliability, dashboard, Arrow transfer | 📋 See [roadmap](#roadmap) |
+| Phase | Focus | Status |
+|-------|--------|--------|
+| **0** | Foundation — gRPC, worker registry, REST health, Calcite skeleton | Done |
+| **1** | Scan fan-out — `POST /v1/query`, fragment execution, concatenate merge | Done |
+| **2** | Pushdown + aggregation — filter/project pushdown, two-phase GROUP BY & partial agg | Done |
+| **3** | ORDER BY + LIMIT — top-K merge across shards | Done |
+| **A** | Connection pool — bounded DuckDB pool per worker, file-backed databases | Done |
+| **B** | Data locality — consistent hash ring, shard catalog, replication factor | Done |
+| **C** | Shard file watcher — dynamic discovery, ATTACH/DETACH, replication streaming | Done |
+| **D** | Data ingestion tooling — split-and-distribute script, online rebalance, heartbeat monitor | Done |
+| **E+** | Remote read fallback, dashboard, Arrow transfer | Planned |
 
-For design details, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+For design details, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/DESIGN-DECISIONS.md`](docs/DESIGN-DECISIONS.md).
 
 ---
 
@@ -41,7 +45,7 @@ Coordinator merges partial results (embedded DuckDB)
     JSON response
 ```
 
-**Sharding model:** tables are registered in a cluster catalog with a shard key (demo: `id % N`). Each worker holds a disjoint subset of rows. Fragment SQL is generated in DuckDB dialect with predicates like `MOD(id, 3) = 0`.
+**Sharding model:** data is pre-split into `.duckdb` shard files (e.g. `events_shard0.duckdb`) and distributed to worker data directories. Workers auto-discover and ATTACH these files at startup. A consistent hash ring determines shard placement with configurable replication factor.
 
 **Merge strategies:**
 
@@ -74,7 +78,7 @@ mvn clean package
 ./scripts/start-cluster.sh
 ```
 
-This starts one coordinator (HTTP `8080`, gRPC `9090`) and three workers (`9101`–`9103`), each with a demo `events` table sharded by `id`.
+This builds the project, splits demo data into shard files distributed across worker data directories, then starts one coordinator (HTTP `8080`, gRPC `9090`) and three workers (`9101`-`9103`). Requires `duckdb` CLI on PATH for shard file creation.
 
 ### Submit a query
 
@@ -154,9 +158,15 @@ Environment variables (defaults shown):
 | `DUCKCLUSTER_COORDINATOR_HOST` | `127.0.0.1` | Coordinator bind/connect host |
 | `DUCKCLUSTER_COORDINATOR_HTTP_PORT` | `8080` | REST API port |
 | `DUCKCLUSTER_COORDINATOR_GRPC_PORT` | `9090` | Worker registration / heartbeat port |
-| `DUCKCLUSTER_HEARTBEAT_INTERVAL_SEC` | `5` | Heartbeat period |
-| `DUCKCLUSTER_HEARTBEAT_MISS_THRESHOLD` | `3` | Missed beats before worker marked unhealthy |
+| `DUCKCLUSTER_HEARTBEAT_INTERVAL_SEC` | `5` | Heartbeat period (seconds) |
+| `DUCKCLUSTER_HEARTBEAT_MISS_THRESHOLD` | `3` | Missed beats before worker removed |
 | `DUCKCLUSTER_SHARD_COUNT` | `3` | Logical shard count for demo catalog |
+| `DUCKCLUSTER_DATA_DIR` | `./data` | Worker data directory for shard files |
+| `DUCKCLUSTER_POOL_SIZE` | `max(2, min(4, CPUs-1))` | DuckDB connections per worker |
+| `DUCKCLUSTER_POOL_WAIT_MS` | `200` | Max wait for a free connection (ms) |
+| `DUCKCLUSTER_REPLICATION_FACTOR` | `2` | Shard copies across workers |
+| `DUCKCLUSTER_VNODES_PER_WORKER` | `100` | Virtual nodes in hash ring |
+| `DUCKCLUSTER_WATCHER_INTERVAL_MS` | `2000` | Shard file polling interval (ms) |
 
 ---
 
@@ -165,12 +175,13 @@ Environment variables (defaults shown):
 ```
 DuckCluster/
 ├── proto/           # Protobuf + gRPC service definitions
-├── common/          # Models, config, Calcite planner, merge interfaces
-├── coordinator/     # REST API, worker registry, query execution, merger
-├── worker/          # gRPC server, DuckDB JDBC fragment executor
-├── scripts/         # start-cluster.sh, integration test helpers
+├── common/          # Models, config, Calcite planner, consistent hash ring
+├── coordinator/     # REST API, query execution, shard catalog, replication
+├── worker/          # gRPC server, DuckDB pool, shard manager, file watcher
+├── scripts/         # start-cluster.sh, split-and-distribute.sh, test helpers
 └── docs/
-    └── ARCHITECTURE.md
+    ├── ARCHITECTURE.md
+    └── DESIGN-DECISIONS.md
 ```
 
 **Run manually**
@@ -201,51 +212,31 @@ java -jar worker/target/duckcluster-worker-0.1.0-SNAPSHOT.jar worker-1 127.0.0.1
 
 ## Roadmap
 
-### Phase 0 — Foundation
+### Completed phases
 
-Maven multi-module layout, protobuf/gRPC codegen, worker registration with bidirectional heartbeat, REST health endpoints, and a `QueryPlanner` interface backed by Calcite.
+**Phase 0-3** — Foundation, scan fan-out, pushdown + aggregation, ORDER BY + LIMIT. Full distributed SQL execution with filter/project/aggregate pushdown, two-phase GROUP BY, and top-K merge.
 
-### Phase 1 — Scan fan-out
+**Phase A** — Bounded connection pool per worker over file-backed DuckDB.
 
-`POST /v1/query`, Calcite-based fragment generation with shard predicate injection, worker `ExecuteFragment` with streaming `RowBatch` responses, and concatenate merge on the coordinator.
+**Phase B** — Consistent hash ring, shard catalog, replication-factor-aware routing.
 
-### Phase 2 — Pushdown + aggregation
+**Phase C** — Dynamic shard discovery via file watcher, ATTACH/DETACH, file-level replication streaming between workers.
 
-Calcite fragment SQL generation with filter/project/aggregate pushdown, partial aggregate aliases (`__dc_agg_N`), and coordinator-side merge via embedded DuckDB for `GROUP_BY_MERGE` and `PARTIAL_AGG` strategies.
+**Phase D** — Data ingestion tooling (`split-and-distribute.sh`), heartbeat monitor, online rebalance on topology changes, `WorkerDemoDataLoader` deprecated from production.
 
-Example supported today:
-
-```sql
-SELECT category, COUNT(*) AS cnt
-FROM events
-GROUP BY category
-```
-
-### Phase 3 — ORDER BY + LIMIT ⏳
-
-Distributed **top-K** queries: each worker returns local top-K rows for the requested sort key; the coordinator performs a final sort and `LIMIT` in DuckDB.
-
-Planned deliverable:
-
-```sql
-SELECT * FROM events ORDER BY value DESC LIMIT 10
-```
-
-Infrastructure already in place: `MergeStrategyType.TOP_K`, gRPC `MergeHint.TOP_K`, and planner detection for queries with `ORDER BY` / `FETCH`. The `TopKMergeStrategy` implementation is still a stub.
-
-### Later phases
+### Upcoming
 
 | Phase | Focus |
 |-------|--------|
-| **4** | Failure detection, shard reassignment, in-flight fragment retry, SSE event stream |
-| **5** | HTML dashboard, broader integration tests |
-| **6** | Apache Arrow transfer, broadcast join, Docker Compose, load-aware scheduler |
+| **E** | Remote read fallback — stream shard data to non-owner workers when all owners are exhausted |
+| **F** | HTML dashboard, broader integration tests, SSE event stream |
+| **G** | Apache Arrow transfer, broadcast join, Docker Compose, load-aware scheduler |
 
 ---
 
 ## Demo data
 
-Each worker loads a small in-memory `events` table at startup (`id`, `name`, `value`, `category`), containing only rows where `id % shardCount == shardIndex`. This is for development and integration tests — production deployments should load pre-partitioned files or attach shared storage per worker (see architecture doc).
+`start-cluster.sh` uses `split-and-distribute.sh` to create `.duckdb` shard files from a CSV source and places them in per-worker data directories. Workers discover these at startup via their `ShardFileWatcher` and ATTACH them automatically.
 
 ---
 
