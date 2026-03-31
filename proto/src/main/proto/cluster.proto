@@ -11,6 +11,7 @@ service CoordinatorService {
   rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
   rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
   rpc UpdateShardOwnership(UpdateShardRequest) returns (UpdateShardResponse);
+  rpc UpdateShardCache(UpdateShardCacheRequest) returns (UpdateShardCacheResponse);
 }
 
 // Called by the coordinator to reach worker nodes.
@@ -19,6 +20,7 @@ service WorkerService {
   rpc ExecuteFragment(FragmentRequest) returns (stream RowBatch);
   rpc ReadShard(ReadShardRequest) returns (stream ShardDataChunk);
   rpc ReceiveShard(stream ShardDataChunk) returns (ReceiveShardResponse);
+  rpc LoadTempData(stream ShardDataChunk) returns (LoadTempDataResponse);
 }
 
 message RegisterWorkerRequest {
@@ -107,4 +109,18 @@ message ShardDataChunk {
 message ReceiveShardResponse {
   bool accepted = 1;
   string message = 2;
+}
+
+message LoadTempDataResponse {
+  bool accepted = 1;
+  string catalog_name = 2;
+}
+
+message UpdateShardCacheRequest {
+  string worker_id = 1;
+  repeated ShardOwnership cached_shards = 2;
+}
+
+message UpdateShardCacheResponse {
+  bool accepted = 1;
 }

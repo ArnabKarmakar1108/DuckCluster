@@ -7,4 +7,4 @@ target/
 .DS_Store
 *.log
 pids/
-docs/DESIGN.md
+docs/PROPOSAL-*.md
