@@ -23,6 +23,7 @@ public final class ShardManager implements AutoCloseable {
     private final Connection adminConnection;
     private final Path dataDir;
     private final Map<String, ShardFileMetadata> attachedShards = new ConcurrentHashMap<>();
+    private final Map<String, ShardFileMetadata> cachedShards = new ConcurrentHashMap<>();
 
     public ShardManager(String mainDbPath, Path dataDir) throws SQLException {
         this.adminConnection = DriverManager.getConnection("jdbc:duckdb:" + mainDbPath);
@@ -82,6 +83,65 @@ public final class ShardManager implements AutoCloseable {
         }
         LOG.info("Batch-attached {} shard files from {}", count, dataDir);
         return count;
+    }
+
+    public synchronized void attachCachedShard(ShardFileMetadata meta) throws SQLException {
+        String catalogName = meta.catalogName();
+        if (cachedShards.containsKey(catalogName) || attachedShards.containsKey(catalogName)) {
+            return;
+        }
+        String sql = String.format("ATTACH '%s' AS %s (READ_ONLY)",
+                meta.filePath().toAbsolutePath(), catalogName);
+        try (Statement stmt = adminConnection.createStatement()) {
+            stmt.execute(sql);
+        }
+        cachedShards.put(catalogName, meta);
+        LOG.info("Attached cached shard: {} -> {}", catalogName, meta.filePath());
+    }
+
+    public synchronized void detachCachedShard(ShardFileMetadata meta) throws SQLException {
+        String catalogName = meta.catalogName();
+        if (!cachedShards.containsKey(catalogName)) {
+            return;
+        }
+        try (Statement stmt = adminConnection.createStatement()) {
+            stmt.execute("DETACH " + catalogName);
+        }
+        cachedShards.remove(catalogName);
+        LOG.info("Detached cached shard: {}", catalogName);
+    }
+
+    public boolean hasCachedShard(String tableName, int shardId) {
+        String catalogName = tableName + "_shard" + shardId;
+        return cachedShards.containsKey(catalogName);
+    }
+
+    public int scanAndAttachDimensions(Path dimensionsDir) throws IOException, SQLException {
+        int count = 0;
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dimensionsDir, "*.duckdb")) {
+            for (Path path : stream) {
+                String filename = path.getFileName().toString();
+                String catalogName = filename.substring(0, filename.length() - ".duckdb".length());
+                try {
+                    attachDimensionTable(catalogName, path);
+                    count++;
+                } catch (SQLException e) {
+                    LOG.warn("Failed to attach dimension {}: {}", catalogName, e.getMessage());
+                }
+            }
+        }
+        if (count > 0) {
+            LOG.info("Attached {} dimension tables from {}", count, dimensionsDir);
+        }
+        return count;
+    }
+
+    public synchronized void attachDimensionTable(String catalogName, Path filePath) throws SQLException {
+        String sql = String.format("ATTACH '%s' AS %s (READ_ONLY)", filePath.toAbsolutePath(), catalogName);
+        try (Statement stmt = adminConnection.createStatement()) {
+            stmt.execute(sql);
+        }
+        LOG.info("Attached dimension table: {} -> {}", catalogName, filePath);
     }
 
     public Path getDataDir() {
