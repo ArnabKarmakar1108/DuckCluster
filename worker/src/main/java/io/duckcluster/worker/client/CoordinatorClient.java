@@ -7,6 +7,7 @@ import io.duckcluster.proto.v1.HeartbeatResponse;
 import io.duckcluster.proto.v1.RegisterWorkerRequest;
 import io.duckcluster.proto.v1.RegisterWorkerResponse;
 import io.duckcluster.proto.v1.ShardOwnership;
+import io.duckcluster.proto.v1.UpdateShardCacheRequest;
 import io.duckcluster.proto.v1.UpdateShardRequest;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -62,6 +63,21 @@ public final class CoordinatorClient implements AutoCloseable {
                 .build();
         blockingStub.updateShardOwnership(request);
         LOG.debug("Updated shard ownership: {} shards", ownedShards.size());
+    }
+
+    public void updateShardCache(String workerId, List<io.duckcluster.worker.duckdb.TempShardCache.CacheEntry> cachedEntries) {
+        List<ShardOwnership> cachedShards = cachedEntries.stream()
+                .map(e -> ShardOwnership.newBuilder()
+                        .setTableName(e.tableName())
+                        .setShardId(e.shardId())
+                        .build())
+                .toList();
+        UpdateShardCacheRequest request = UpdateShardCacheRequest.newBuilder()
+                .setWorkerId(workerId)
+                .addAllCachedShards(cachedShards)
+                .build();
+        blockingStub.updateShardCache(request);
+        LOG.debug("Updated shard cache: {} cached shards", cachedShards.size());
     }
 
     public void startHeartbeat(String workerId, Duration interval) {
