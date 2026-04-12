@@ -3,6 +3,7 @@ package io.duckcluster.coordinator.health;
 import io.duckcluster.common.registry.WorkerRegistry;
 import io.duckcluster.coordinator.catalog.ShardCatalog;
 import io.duckcluster.coordinator.replication.ShardReplicator;
+import io.duckcluster.coordinator.worker.WorkerChannelPool;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -20,15 +21,17 @@ public final class HeartbeatMonitor implements AutoCloseable {
     private final WorkerRegistry registry;
     private final ShardCatalog shardCatalog;
     private final ShardReplicator shardReplicator;
+    private final WorkerChannelPool channelPool;
     private final Duration heartbeatTimeout;
     private final ScheduledExecutorService executor;
 
     public HeartbeatMonitor(WorkerRegistry registry, ShardCatalog shardCatalog,
-                            ShardReplicator shardReplicator, Duration heartbeatInterval,
-                            int missThreshold) {
+                            ShardReplicator shardReplicator, WorkerChannelPool channelPool,
+                            Duration heartbeatInterval, int missThreshold) {
         this.registry = registry;
         this.shardCatalog = shardCatalog;
         this.shardReplicator = shardReplicator;
+        this.channelPool = channelPool;
         this.heartbeatTimeout = heartbeatInterval.multipliedBy(missThreshold);
         this.executor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "heartbeat-monitor");
@@ -58,6 +61,7 @@ public final class HeartbeatMonitor implements AutoCloseable {
                 LOG.warn("Worker {} missed heartbeat deadline, removing from cluster", workerId);
                 registry.removeWorker(workerId);
                 shardCatalog.onWorkerRemoved(workerId);
+                channelPool.removeChannel(workerId);
             }
 
             if (!toRemove.isEmpty()) {
