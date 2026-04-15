@@ -7,6 +7,7 @@ import io.duckcluster.worker.duckdb.DuckDBConnectionPool;
 import io.duckcluster.worker.duckdb.FragmentExecutor;
 import io.duckcluster.worker.duckdb.ShardFileWatcher;
 import io.duckcluster.worker.duckdb.ShardManager;
+import io.duckcluster.worker.duckdb.TempShardCache;
 import io.duckcluster.worker.grpc.WorkerGrpcServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,10 +40,21 @@ public final class WorkerMain {
         ShardManager shardManager = new ShardManager(dbPath, dataDir);
         shardManager.scanAndAttachAll();
 
+        Path dimensionsDir = dataDir.resolve("dimensions");
+        if (Files.exists(dimensionsDir)) {
+            shardManager.scanAndAttachDimensions(dimensionsDir);
+        }
+
         DuckDBConnectionPool pool = new DuckDBConnectionPool(dbPath, config.poolSize(), config.poolWaitMs());
         FragmentExecutor fragmentExecutor = new FragmentExecutor(pool);
-        WorkerGrpcServer workerServer = new WorkerGrpcServer(workerId, host, port, fragmentExecutor, shardManager);
         CoordinatorClient coordinatorClient = new CoordinatorClient(config);
+
+        Path cacheDir = dataDir.resolve(".cache");
+        TempShardCache tempShardCache = new TempShardCache(
+                shardManager, coordinatorClient, workerId, cacheDir, config.cacheMaxShards());
+
+        WorkerGrpcServer workerServer = new WorkerGrpcServer(
+                workerId, host, port, fragmentExecutor, shardManager, tempShardCache);
 
         ShardFileWatcher watcher = new ShardFileWatcher(
                 dataDir, shardManager, coordinatorClient, workerId, config.watcherIntervalMs());
@@ -50,6 +62,7 @@ public final class WorkerMain {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Shutting down worker {}", workerId);
             watcher.close();
+            tempShardCache.close();
             workerServer.stop();
             pool.close();
             shardManager.close();

@@ -2,6 +2,8 @@ package io.duckcluster.worker.duckdb;
 
 import io.duckcluster.proto.v1.Column;
 import io.duckcluster.proto.v1.RowBatch;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,13 +20,27 @@ public final class FragmentExecutor {
     private static final Logger LOG = LoggerFactory.getLogger(FragmentExecutor.class);
     private static final int BATCH_SIZE = 1024;
 
-    private final Connection connection;
+    private final DuckDBConnectionPool pool;
 
-    public FragmentExecutor(Connection connection) {
-        this.connection = connection;
+    public FragmentExecutor(DuckDBConnectionPool pool) {
+        this.pool = pool;
     }
 
     public void execute(String sql, StreamObserver<RowBatch> responseObserver) {
+        Connection connection;
+        try {
+            connection = pool.checkout();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            responseObserver.onError(Status.RESOURCE_EXHAUSTED
+                    .withDescription("Connection pool checkout interrupted").asRuntimeException());
+            return;
+        }
+        if (connection == null) {
+            responseObserver.onError(Status.RESOURCE_EXHAUSTED
+                    .withDescription("Connection pool exhausted").asRuntimeException());
+            return;
+        }
         try (Statement statement = connection.createStatement();
                 ResultSet resultSet = statement.executeQuery(sql)) {
             ResultSetMetaData metadata = resultSet.getMetaData();
@@ -59,7 +75,15 @@ public final class FragmentExecutor {
             responseObserver.onCompleted();
         } catch (SQLException e) {
             LOG.error("Failed to execute fragment SQL: {}", sql, e);
-            responseObserver.onError(e);
+            if (e.getMessage() != null && e.getMessage().contains("Catalog") && e.getMessage().contains("does not exist")) {
+                responseObserver.onError(Status.FAILED_PRECONDITION
+                        .withDescription("Catalog not found: " + e.getMessage()).asRuntimeException());
+            } else {
+                responseObserver.onError(Status.INTERNAL
+                        .withDescription(e.getMessage()).asRuntimeException());
+            }
+        } finally {
+            pool.checkin(connection);
         }
     }
 

@@ -1,6 +1,7 @@
 package io.duckcluster.worker.grpc;
 
 import io.duckcluster.proto.v1.FragmentRequest;
+import io.duckcluster.proto.v1.LoadTempDataResponse;
 import io.duckcluster.proto.v1.PingRequest;
 import io.duckcluster.proto.v1.PingResponse;
 import io.duckcluster.proto.v1.ReadShardRequest;
@@ -11,6 +12,7 @@ import io.duckcluster.proto.v1.WorkerServiceGrpc;
 import io.duckcluster.worker.duckdb.FragmentExecutor;
 import io.duckcluster.worker.duckdb.ShardFileMetadata;
 import io.duckcluster.worker.duckdb.ShardManager;
+import io.duckcluster.worker.duckdb.TempShardCache;
 import com.google.protobuf.ByteString;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
@@ -37,15 +39,18 @@ public final class WorkerGrpcServer {
     private final int port;
     private final FragmentExecutor fragmentExecutor;
     private final ShardManager shardManager;
+    private final TempShardCache tempShardCache;
     private Server server;
 
     public WorkerGrpcServer(String workerId, String host, int port,
-                            FragmentExecutor fragmentExecutor, ShardManager shardManager) {
+                            FragmentExecutor fragmentExecutor, ShardManager shardManager,
+                            TempShardCache tempShardCache) {
         this.workerId = workerId;
         this.host = host;
         this.port = port;
         this.fragmentExecutor = fragmentExecutor;
         this.shardManager = shardManager;
+        this.tempShardCache = tempShardCache;
     }
 
     public void start() throws IOException {
@@ -180,6 +185,75 @@ public final class WorkerGrpcServer {
                             .setMessage("Shard received: " + tableName + "_shard" + shardId)
                             .build());
                     responseObserver.onCompleted();
+                }
+
+                private void cleanup() {
+                    if (outputStream != null) {
+                        try {
+                            outputStream.close();
+                        } catch (IOException ignored) {}
+                        outputStream = null;
+                    }
+                }
+            };
+        }
+
+        @Override
+        public StreamObserver<ShardDataChunk> loadTempData(StreamObserver<LoadTempDataResponse> responseObserver) {
+            return new StreamObserver<>() {
+                private FileOutputStream outputStream;
+                private Path tempPath;
+                private String tableName;
+                private int shardId;
+
+                @Override
+                public void onNext(ShardDataChunk chunk) {
+                    try {
+                        if (outputStream == null) {
+                            tableName = chunk.getTableName();
+                            shardId = chunk.getShardId();
+                            tempPath = Files.createTempFile("shard_cache_", ".duckdb.tmp");
+                            outputStream = new FileOutputStream(tempPath.toFile());
+                            LOG.info("Loading temp data: {}_shard{}", tableName, shardId);
+                        }
+                        if (!chunk.getData().isEmpty()) {
+                            chunk.getData().writeTo(outputStream);
+                        }
+                        if (chunk.getIsLast()) {
+                            outputStream.close();
+                            outputStream = null;
+                        }
+                    } catch (IOException e) {
+                        LOG.error("Error writing temp data chunk: {}", e.getMessage());
+                        cleanup();
+                        responseObserver.onError(Status.INTERNAL
+                                .withDescription("Failed to write temp data: " + e.getMessage())
+                                .asRuntimeException());
+                    }
+                }
+
+                @Override
+                public void onError(Throwable t) {
+                    LOG.warn("LoadTempData stream error: {}", t.getMessage());
+                    cleanup();
+                }
+
+                @Override
+                public void onCompleted() {
+                    cleanup();
+                    try {
+                        String catalogName = tempShardCache.loadShard(tableName, shardId, tempPath);
+                        responseObserver.onNext(LoadTempDataResponse.newBuilder()
+                                .setAccepted(true)
+                                .setCatalogName(catalogName)
+                                .build());
+                        responseObserver.onCompleted();
+                    } catch (Exception e) {
+                        LOG.error("Failed to cache shard {}_shard{}: {}", tableName, shardId, e.getMessage());
+                        responseObserver.onError(Status.INTERNAL
+                                .withDescription("Failed to cache shard: " + e.getMessage())
+                                .asRuntimeException());
+                    }
                 }
 
                 private void cleanup() {
