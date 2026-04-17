@@ -1,5 +1,6 @@
 package io.duckcluster.coordinator.catalog;
 
+import io.duckcluster.common.model.ClusterCatalog;
 import io.duckcluster.common.routing.ConsistentHashRing;
 import io.duckcluster.proto.v1.ShardOwnership;
 import org.slf4j.Logger;
@@ -17,11 +18,18 @@ public final class ShardCatalog {
 
     private final ConsistentHashRing ring;
     private final int replicationFactor;
+    private final ClusterCatalog clusterCatalog;
     private final Map<String, Set<String>> actualOwnership = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> shardCache = new ConcurrentHashMap<>();
 
-    public ShardCatalog(ConsistentHashRing ring, int replicationFactor) {
+    public ShardCatalog(ConsistentHashRing ring, int replicationFactor, ClusterCatalog clusterCatalog) {
         this.ring = ring;
         this.replicationFactor = replicationFactor;
+        this.clusterCatalog = clusterCatalog;
+    }
+
+    public ShardCatalog(ConsistentHashRing ring, int replicationFactor) {
+        this(ring, replicationFactor, new ClusterCatalog());
     }
 
     public void onWorkerAdded(String workerId) {
@@ -32,6 +40,7 @@ public final class ShardCatalog {
     public void onWorkerRemoved(String workerId) {
         ring.removeWorker(workerId);
         actualOwnership.remove(workerId);
+        shardCache.remove(workerId);
         LOG.info("Worker {} removed from hash ring (total workers: {})", workerId, ring.getWorkerCount());
     }
 
@@ -39,6 +48,7 @@ public final class ShardCatalog {
         Set<String> keys = new HashSet<>();
         for (ShardOwnership shard : shards) {
             keys.add(shardKey(shard.getTableName(), shard.getShardId()));
+            clusterCatalog.registerTable(shard.getTableName(), shard.getShardId() + 1);
         }
         actualOwnership.put(workerId, keys);
         LOG.debug("Worker {} reports {} shards", workerId, shards.size());
@@ -87,6 +97,26 @@ public final class ShardCatalog {
             }
         }
         return result;
+    }
+
+    public void registerCachedShards(String workerId, List<ShardOwnership> shards) {
+        Set<String> keys = new HashSet<>();
+        for (ShardOwnership shard : shards) {
+            keys.add(shardKey(shard.getTableName(), shard.getShardId()));
+        }
+        shardCache.put(workerId, keys);
+        LOG.debug("Worker {} reports {} cached shards", workerId, shards.size());
+    }
+
+    public List<String> getCachedWorkers(String tableName, int shardId) {
+        String key = shardKey(tableName, shardId);
+        List<String> workers = new ArrayList<>();
+        for (Map.Entry<String, Set<String>> entry : shardCache.entrySet()) {
+            if (entry.getValue().contains(key)) {
+                workers.add(entry.getKey());
+            }
+        }
+        return workers;
     }
 
     public int getWorkerCount() {
