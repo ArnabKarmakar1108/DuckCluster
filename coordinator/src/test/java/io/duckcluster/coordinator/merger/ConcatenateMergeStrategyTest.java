@@ -21,7 +21,8 @@ class ConcatenateMergeStrategyTest {
     void mergesRowsFromAllFragments() {
         PlannedQuery plan = new PlannedQuery(
                 "SELECT * FROM events",
-                "events",
+                List.of("events"),
+                List.of(),
                 List.of(),
                 MergeStrategyType.CONCATENATE,
                 QueryAnalysis.empty(),

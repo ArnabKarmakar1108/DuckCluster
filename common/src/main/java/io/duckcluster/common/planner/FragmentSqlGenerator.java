@@ -2,9 +2,12 @@ package io.duckcluster.common.planner;
 
 import io.duckcluster.common.model.AggregateSpec;
 import io.duckcluster.common.model.QueryAnalysis;
-import io.duckcluster.common.model.TableShardConfig;
+import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlIdentifier;
+import org.apache.calcite.sql.SqlJoin;
+import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNodeList;
 import org.apache.calcite.sql.SqlSelect;
@@ -16,25 +19,101 @@ import org.apache.calcite.sql.pretty.SqlPrettyWriter;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 public final class FragmentSqlGenerator {
     private static final SqlDialect DIALECT = DuckDBSqlDialect.DEFAULT;
 
     private FragmentSqlGenerator() {}
 
-    public static String generate(SqlSelect select, TableShardConfig tableConfig, int shardId, QueryAnalysis analysis) {
+    public static String generate(SqlSelect select, int shardId, QueryAnalysis analysis,
+                                   String drivingTable, Map<String, Integer> broadcastShardCounts) {
         SqlSelect fragmentSelect = (SqlSelect) select.clone(SqlParserPos.ZERO);
 
-        String catalogName = tableConfig.tableName() + "_shard" + shardId;
-        SqlIdentifier qualifiedTable = new SqlIdentifier(
-                List.of(catalogName, tableConfig.tableName()), SqlParserPos.ZERO);
-        fragmentSelect.setFrom(qualifiedTable);
+        SqlNode rewrittenFrom = rewriteFrom(select.getFrom(), shardId, drivingTable, broadcastShardCounts);
+        fragmentSelect.setFrom(rewrittenFrom);
 
         if (analysis.hasAggregates()) {
             fragmentSelect.setSelectList(rewriteAggregates(select.getSelectList(), analysis.aggregates()));
         }
 
         return toSql(fragmentSelect);
+    }
+
+    private static SqlNode rewriteFrom(SqlNode from, int shardId,
+                                        String drivingTable, Map<String, Integer> broadcastShardCounts) {
+        if (from instanceof SqlIdentifier identifier) {
+            return rewriteTableIdentifier(identifier, shardId, drivingTable, broadcastShardCounts);
+        }
+        if (from instanceof SqlJoin join) {
+            SqlNode left = rewriteFrom(join.getLeft(), shardId, drivingTable, broadcastShardCounts);
+            SqlNode right = rewriteFrom(join.getRight(), shardId, drivingTable, broadcastShardCounts);
+            return new SqlJoin(
+                    join.getParserPosition(),
+                    left,
+                    join.isNaturalNode(),
+                    join.getJoinTypeNode(),
+                    right,
+                    join.getConditionTypeNode(),
+                    join.getCondition());
+        }
+        if (from instanceof SqlBasicCall call && call.getKind() == SqlKind.AS) {
+            SqlNode inner = call.operand(0);
+            SqlNode alias = call.operand(1);
+            String tableName = extractTableName(inner);
+            if (tableName != null && broadcastShardCounts.containsKey(tableName.toLowerCase())) {
+                SqlNode unionAll = buildUnionAll(tableName.toLowerCase(), broadcastShardCounts.get(tableName.toLowerCase()));
+                return SqlStdOperatorTable.AS.createCall(call.getParserPosition(), unionAll, alias);
+            }
+            SqlNode rewrittenInner = rewriteFrom(inner, shardId, drivingTable, broadcastShardCounts);
+            return SqlStdOperatorTable.AS.createCall(call.getParserPosition(), rewrittenInner, alias);
+        }
+        return from;
+    }
+
+    private static SqlNode rewriteTableIdentifier(SqlIdentifier identifier, int shardId,
+                                                   String drivingTable, Map<String, Integer> broadcastShardCounts) {
+        if (identifier.names.size() != 1) {
+            return identifier;
+        }
+        String tableName = identifier.getSimple();
+        String tableNameLower = tableName.toLowerCase();
+
+        if (tableNameLower.equals(drivingTable.toLowerCase())) {
+            String catalogName = tableNameLower + "_shard" + shardId;
+            return new SqlIdentifier(List.of(catalogName, tableNameLower), SqlParserPos.ZERO);
+        } else if (broadcastShardCounts.containsKey(tableNameLower)) {
+            return buildUnionAll(tableNameLower, broadcastShardCounts.get(tableNameLower));
+        } else {
+            return new SqlIdentifier(List.of(tableNameLower, tableNameLower), SqlParserPos.ZERO);
+        }
+    }
+
+    private static SqlNode buildUnionAll(String tableName, int shardCount) {
+        SqlNode result = buildShardSelect(tableName, 0);
+        for (int i = 1; i < shardCount; i++) {
+            SqlNode next = buildShardSelect(tableName, i);
+            result = SqlStdOperatorTable.UNION_ALL.createCall(SqlParserPos.ZERO, result, next);
+        }
+        return result;
+    }
+
+    private static SqlNode buildShardSelect(String tableName, int shardId) {
+        SqlIdentifier qualifiedTable = new SqlIdentifier(
+                List.of(tableName + "_shard" + shardId, tableName), SqlParserPos.ZERO);
+        return new SqlSelect(
+                SqlParserPos.ZERO,
+                null,
+                SqlNodeList.of(SqlIdentifier.star(SqlParserPos.ZERO)),
+                qualifiedTable,
+                null, null, null, null, null, null, null, SqlNodeList.EMPTY);
+    }
+
+    private static String extractTableName(SqlNode node) {
+        if (node instanceof SqlIdentifier id && id.names.size() == 1) {
+            return id.getSimple();
+        }
+        return null;
     }
 
     private static SqlNodeList rewriteAggregates(SqlNodeList selectList, List<AggregateSpec> aggregates) {

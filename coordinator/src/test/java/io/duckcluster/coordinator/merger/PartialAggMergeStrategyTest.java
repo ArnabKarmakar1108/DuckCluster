@@ -29,7 +29,8 @@ class PartialAggMergeStrategyTest {
                 List.of("count", "total"));
         PlannedQuery plan = new PlannedQuery(
                 "SELECT COUNT(*), SUM(id) FROM events",
-                "events",
+                List.of("events"),
+                List.of(),
                 List.of(),
                 MergeStrategyType.PARTIAL_AGG,
                 analysis,

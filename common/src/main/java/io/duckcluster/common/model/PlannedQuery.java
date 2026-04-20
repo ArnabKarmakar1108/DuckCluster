@@ -4,8 +4,14 @@ import java.util.List;
 
 public record PlannedQuery(
         String originalSql,
-        String tableName,
+        List<String> shardedTables,
+        List<BroadcastTable> broadcastTables,
         List<FragmentSpec> fragments,
         MergeStrategyType mergeStrategy,
         QueryAnalysis analysis,
-        List<ColumnDef> schema) {}
+        List<ColumnDef> schema) {
+
+    public String tableName() {
+        return shardedTables.get(0);
+    }
+}

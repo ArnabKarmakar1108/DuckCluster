@@ -27,7 +27,8 @@ class GroupByMergeStrategyTest {
                 List.of("category", "cnt"));
         PlannedQuery plan = new PlannedQuery(
                 "SELECT category, COUNT(*) AS cnt FROM events GROUP BY category",
-                "events",
+                List.of("events"),
+                List.of(),
                 List.of(),
                 MergeStrategyType.GROUP_BY_MERGE,
                 analysis,

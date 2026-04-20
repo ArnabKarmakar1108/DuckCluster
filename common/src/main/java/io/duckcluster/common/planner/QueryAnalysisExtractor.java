@@ -111,7 +111,8 @@ public final class QueryAnalysisExtractor {
 
     private static String columnName(SqlNode node) {
         if (node instanceof SqlIdentifier identifier) {
-            return identifier.getSimple();
+            List<String> names = identifier.names;
+            return names.get(names.size() - 1);
         }
         throw new IllegalArgumentException("Expected column identifier but found: " + node);
     }
