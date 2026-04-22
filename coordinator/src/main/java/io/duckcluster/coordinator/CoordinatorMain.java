@@ -12,6 +12,7 @@ import io.duckcluster.coordinator.health.HeartbeatMonitor;
 import io.duckcluster.coordinator.http.CoordinatorHttpServer;
 import io.duckcluster.coordinator.merger.MergeStrategyRegistry;
 import io.duckcluster.coordinator.replication.ShardReplicator;
+import io.duckcluster.coordinator.worker.WorkerChannelPool;
 import io.duckcluster.coordinator.worker.WorkerNodeClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,11 +23,12 @@ public final class CoordinatorMain {
     public static void main(String[] args) throws Exception {
         ClusterConfig config = ClusterConfig.fromEnvironment();
         WorkerRegistry registry = new WorkerRegistry();
-        ClusterCatalog catalog = ClusterCatalog.demo(config.shardCount());
+        ClusterCatalog catalog = new ClusterCatalog();
 
         ConsistentHashRing ring = new ConsistentHashRing(config.vnodesPerWorker());
-        ShardCatalog shardCatalog = new ShardCatalog(ring, config.replicationFactor());
-        WorkerNodeClient workerClient = new WorkerNodeClient();
+        ShardCatalog shardCatalog = new ShardCatalog(ring, config.replicationFactor(), catalog);
+        WorkerChannelPool channelPool = new WorkerChannelPool();
+        WorkerNodeClient workerClient = new WorkerNodeClient(channelPool);
 
         QueryExecutionService queryExecutionService = new QueryExecutionService(
                 new CalciteQueryPlanner(),
@@ -38,7 +40,7 @@ public final class CoordinatorMain {
 
         ShardReplicator shardReplicator = new ShardReplicator(shardCatalog, registry, workerClient);
         HeartbeatMonitor heartbeatMonitor = new HeartbeatMonitor(
-                registry, shardCatalog, shardReplicator,
+                registry, shardCatalog, shardReplicator, channelPool,
                 config.heartbeatInterval(), config.heartbeatMissThreshold());
 
         CoordinatorGrpcServer grpcServer = new CoordinatorGrpcServer(config, registry, shardCatalog, shardReplicator);
@@ -50,6 +52,7 @@ public final class CoordinatorMain {
             shardReplicator.close();
             httpServer.stop();
             grpcServer.stop();
+            channelPool.close();
         }));
 
         grpcServer.start();

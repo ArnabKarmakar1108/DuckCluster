@@ -8,6 +8,8 @@ import io.duckcluster.proto.v1.HeartbeatRequest;
 import io.duckcluster.proto.v1.HeartbeatResponse;
 import io.duckcluster.proto.v1.RegisterWorkerRequest;
 import io.duckcluster.proto.v1.RegisterWorkerResponse;
+import io.duckcluster.proto.v1.UpdateShardCacheRequest;
+import io.duckcluster.proto.v1.UpdateShardCacheResponse;
 import io.duckcluster.proto.v1.UpdateShardRequest;
 import io.duckcluster.proto.v1.UpdateShardResponse;
 import io.grpc.Server;
@@ -97,6 +99,15 @@ public final class CoordinatorGrpcServer {
             LOG.info("Updated shard ownership for worker {}: {} shards",
                     request.getWorkerId(), request.getOwnedShardsList().size());
             responseObserver.onNext(UpdateShardResponse.newBuilder().setAccepted(true).build());
+            responseObserver.onCompleted();
+        }
+
+        @Override
+        public void updateShardCache(UpdateShardCacheRequest request, StreamObserver<UpdateShardCacheResponse> responseObserver) {
+            shardCatalog.registerCachedShards(request.getWorkerId(), request.getCachedShardsList());
+            LOG.debug("Updated shard cache for worker {}: {} cached shards",
+                    request.getWorkerId(), request.getCachedShardsList().size());
+            responseObserver.onNext(UpdateShardCacheResponse.newBuilder().setAccepted(true).build());
             responseObserver.onCompleted();
         }
 
