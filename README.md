@@ -18,7 +18,9 @@ Built in Java 17 as a multi-module Maven project.
 | **B** | Data locality — consistent hash ring, shard catalog, replication factor | Done |
 | **C** | Shard file watcher — dynamic discovery, ATTACH/DETACH, replication streaming | Done |
 | **D** | Data ingestion tooling — split-and-distribute script, online rebalance, heartbeat monitor | Done |
-| **E+** | Remote read fallback, dashboard, Arrow transfer | Planned |
+| **E** | Parallel dispatch, persistent gRPC channels, 3-tier rescheduling, remote read fallback | Done |
+| **F** | JOIN support — dynamic table discovery, broadcast shuffle joins, coordinator prefetch | Done |
+| **G+** | Benchmarking, dashboard, Arrow transfer | Planned |
 
 For design details, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/DESIGN-DECISIONS.md`](docs/DESIGN-DECISIONS.md).
 
@@ -31,12 +33,14 @@ Client SQL
     │
     ▼
 Coordinator (REST + Calcite planner)
-    ├─ Detect merge strategy (scan / partial agg / group-by / top-k)
-    ├─ Generate N fragment SQL with shard predicates
-    └─ Dispatch fragments to workers via gRPC
+    ├─ Classify tables (driving vs broadcast), detect merge strategy
+    ├─ Generate N fragment SQL (qualified catalog.table names, UNION ALL for broadcast)
+    ├─ Resolve target workers (3-tier: ring owners → cached → remote read)
+    ├─ Prefetch broadcast shards to target workers (if JOIN)
+    └─ Dispatch fragments in parallel via persistent gRPC channels
            │
            ▼
-    Worker 0 … Worker N  (embedded DuckDB per node)
+    Worker 0 … Worker N  (embedded DuckDB per node, all data local)
            │
            ▼
 Coordinator merges partial results (embedded DuckDB)
@@ -45,7 +49,7 @@ Coordinator merges partial results (embedded DuckDB)
     JSON response
 ```
 
-**Sharding model:** data is pre-split into `.duckdb` shard files (e.g. `events_shard0.duckdb`) and distributed to worker data directories. Workers auto-discover and ATTACH these files at startup. A consistent hash ring determines shard placement with configurable replication factor.
+**Sharding model:** data is pre-split into `.duckdb` shard files (e.g. `events_shard0.duckdb`) via `split-and-distribute.sh` and distributed to worker data directories independently per table. Workers auto-discover and ATTACH these files at startup. A consistent hash ring determines shard placement with configurable replication factor. Tables can have different shard counts and keys — the coordinator handles JOINs via broadcast shuffle at query time.
 
 **Merge strategies:**
 
@@ -88,15 +92,15 @@ curl -s -X POST http://127.0.0.1:8080/v1/query \
   -H 'Content-Type: application/json' \
   -d '{"sql":"SELECT * FROM events WHERE id > 2"}' | python3 -m json.tool
 
-# Distributed GROUP BY (Phase 2)
+# Distributed GROUP BY
 curl -s -X POST http://127.0.0.1:8080/v1/query \
   -H 'Content-Type: application/json' \
   -d '{"sql":"SELECT category, COUNT(*) AS cnt FROM events GROUP BY category"}' | python3 -m json.tool
 
-# Global aggregates without GROUP BY (Phase 2)
+# JOIN across independently-sharded tables (broadcast shuffle)
 curl -s -X POST http://127.0.0.1:8080/v1/query \
   -H 'Content-Type: application/json' \
-  -d '{"sql":"SELECT COUNT(*) AS row_count, SUM(id) AS total FROM events"}' | python3 -m json.tool
+  -d '{"sql":"SELECT c.c_name, SUM(l.l_extendedprice) FROM lineitem l JOIN customer c ON l.l_custkey = c.c_custkey GROUP BY c.c_name"}' | python3 -m json.tool
 ```
 
 ### Cluster health
@@ -222,15 +226,19 @@ java -jar worker/target/duckcluster-worker-0.1.0-SNAPSHOT.jar worker-1 127.0.0.1
 
 **Phase C** — Dynamic shard discovery via file watcher, ATTACH/DETACH, file-level replication streaming between workers.
 
-**Phase D** — Data ingestion tooling (`split-and-distribute.sh`), heartbeat monitor, online rebalance on topology changes, `WorkerDemoDataLoader` deprecated from production.
+**Phase D** — Data ingestion tooling (`split-and-distribute.sh`), heartbeat monitor, online rebalance on topology changes.
+
+**Phase E** — Parallel fragment dispatch via `CompletableFuture` + cached thread pool, persistent gRPC channel pool (one channel per worker, reused across queries), 3-tier fragment rescheduling (ring owners → cached copies → remote read fallback).
+
+**Phase F** — JOIN support with dynamic table discovery. All tables are sharded independently; the coordinator classifies tables at query time (driving vs broadcast), generates UNION ALL fragment SQL for broadcast tables, prefetches missing shards to target workers before dispatch. No placement restrictions — any join combination works.
 
 ### Upcoming
 
 | Phase | Focus |
 |-------|--------|
-| **E** | Remote read fallback — stream shard data to non-owner workers when all owners are exhausted |
-| **F** | HTML dashboard, broader integration tests, SSE event stream |
-| **G** | Apache Arrow transfer, broadcast join, Docker Compose, load-aware scheduler |
+| **G** | Benchmarking harness — TPC-H at multiple scale factors, compare against single-node DuckDB |
+| **H** | HTML dashboard, SSE event stream, broader integration tests |
+| **I** | Apache Arrow transfer, Docker Compose, load-aware scheduler |
 
 ---
 

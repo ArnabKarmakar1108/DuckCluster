@@ -1,6 +1,6 @@
 # Design Decisions
 
-This document covers the key architectural decisions, configuration knobs, and runtime behavior of DuckCluster's data locality and reliability layers (Phases A-D).
+This document covers the key architectural decisions, configuration knobs, and runtime behavior of DuckCluster's data locality, reliability, dispatch, and join execution layers.
 
 ---
 
@@ -250,47 +250,151 @@ The coordinator never polls workers. This is a push-only model — workers are t
 
 ---
 
-## 5. Fragment Assignment and Fallback
+## 5. Parallel Dispatch and Persistent gRPC Channels
 
-### How fragments are routed to workers
+### Problem
+
+Sequential fragment dispatch (one at a time, waiting for each to finish) severely limits throughput — a query with 6 fragments across 3 workers would take 6x the latency of a single fragment instead of ~2x.
+
+Creating a new gRPC channel per RPC call added connection setup overhead to every fragment execution.
+
+### Decision
+
+- **Parallel dispatch:** All fragments are submitted concurrently via `CompletableFuture.supplyAsync()` on a cached thread pool with daemon threads.
+- **Persistent channel pool:** `WorkerChannelPool` maintains one `ManagedChannel` per worker (keyed by workerId), reused across all queries for the lifetime of the worker's registration.
+
+### How it works
 
 ```
 QueryExecutionService.execute(sql)
     │
-    ├── 1. Calcite plans the query → per-shard FragmentSpec[]
-    ├── 2. For each shard: ring.getOwners(shardKey, RF) → [primary, replica...]
-    ├── 3. Dispatch fragment to primary worker
-    │       │
-    │       ├── Success → collect result
-    │       └── RESOURCE_EXHAUSTED → try next replica
-    │
-    └── 4. Merge all fragment results via selected MergeStrategy
+    ├── Plan query → FragmentSpec[]
+    ├── Resolve target worker for each fragment
+    ├── Prefetch broadcast shards (if JOIN)
+    └── CompletableFuture.supplyAsync() for each fragment
+            │ (all run in parallel)
+            ▼
+    WorkerNodeClient.executeFragment(worker, fragment)
+        └── channelPool.getChannel(worker)  ← reused ManagedChannel
 ```
 
-### Fallback strategy
-
-The `executeWithFallback` method implements ordered retry across replica owners:
-
-1. Try the **primary owner** (first in ring order)
-2. If it returns `RESOURCE_EXHAUSTED` (pool full), try the **next replica**
-3. Continue through all replica owners in ring order
-4. If all replicas are exhausted, the query fails with an error
-
-This provides load-based failover without explicit health checks — if a worker's pool is saturated, queries naturally flow to replicas.
-
-### Why RESOURCE_EXHAUSTED specifically?
-
-- `UNAVAILABLE` / `DEADLINE_EXCEEDED` → the worker is down or unresponsive. Retrying immediately on another worker makes sense.
-- `RESOURCE_EXHAUSTED` → the worker is alive but overloaded. The pool's bounded size acts as a natural backpressure signal.
-- Other errors (e.g. SQL syntax errors) → not retried, propagated to the client.
-
-### No speculative execution (yet)
-
-The current design dispatches to one worker at a time, falling back sequentially. Speculative execution (dispatch to all replicas, take the first response) would improve tail latency but wastes cluster resources. This is deferred to a later phase.
+Channels are removed from the pool when a worker is evicted by the `HeartbeatMonitor`, and all channels are shut down gracefully on coordinator shutdown.
 
 ---
 
-## 6. Heartbeats and Worker Health
+## 6. Fragment Rescheduling (3-Tier Fallback)
+
+### Problem
+
+The target worker for a fragment may be unavailable, overloaded, or may have lost its shard file. The system must route work to an available worker without failing the query.
+
+### Decision
+
+A 3-tier resolution strategy determines where each fragment executes:
+
+```
+For each fragment (driving table shard N):
+    │
+    ├── Tier 1: Ring owners (primary + replicas)
+    │   └── ring.getOwners(tableName:shardId, RF) → [worker-2, worker-3]
+    │       Pick first available worker in registry
+    │
+    ├── Tier 2: Workers with cached copy
+    │   └── shardCatalog.getCachedWorkers(table, shard) → [worker-1]
+    │       Workers that previously received this shard via TempShardCache
+    │
+    └── Tier 3: Any available worker (remote read fallback)
+        └── Stream shard file from a source to any idle worker:
+            ReadShard(source) → LoadTempData(target) → execute
+```
+
+### Why resolve before dispatch?
+
+Target resolution happens in a separate phase (`resolveFragmentTargets`) before any fragment is dispatched. This enables the prefetch optimization for JOINs — we know which workers will execute fragments before we start moving broadcast data.
+
+### TempShardCache persistence
+
+When a shard is streamed to a non-owner via Tier 3 (or broadcast prefetch), it's stored in the worker's `TempShardCache` — an LRU cache of shard files attached as READ_ONLY catalogs. Subsequent queries find these cached copies via Tier 2, avoiding repeated transfers. The cache notifies the coordinator via `UpdateShardCache` RPC so the coordinator's `ShardCatalog.shardCache` map stays current.
+
+---
+
+## 7. JOIN Execution: Broadcast Shuffle
+
+### Problem
+
+Tables are sharded independently via `split-and-distribute.sh` — each table gets its own shard count, shard key, and ring placement. Two tables sharded independently will almost never have matching shard assignments (`hash("lineitem_shard0")` and `hash("orders_shard0")` land on different workers). JOINs must produce correct results without requiring coordinated placement at ingestion time.
+
+### Decision
+
+**Broadcast the smaller side.** For a join involving multiple sharded tables:
+1. The table with the most shards becomes the **driving table** (its shard count determines fragment count)
+2. All other sharded tables become **broadcast tables** (all their shards are prefetched to execution workers)
+3. Fragment SQL uses `UNION ALL` of all broadcast shards so every row is visible to every driving-table fragment
+
+### How it works
+
+```
+Query: SELECT ... FROM lineitem(6 shards) l JOIN orders(4 shards) o ON ...
+
+1. PLAN
+   ├── Driving table: lineitem (most shards → 6 fragments)
+   ├── Broadcast table: orders (4 shards, UNION ALL in fragment SQL)
+   └── Fragment 0 SQL:
+         SELECT ... FROM "lineitem_shard0"."lineitem" AS "l"
+         INNER JOIN (
+           SELECT * FROM "orders_shard0"."orders"
+           UNION ALL SELECT * FROM "orders_shard1"."orders"
+           UNION ALL SELECT * FROM "orders_shard2"."orders"
+           UNION ALL SELECT * FROM "orders_shard3"."orders"
+         ) AS "o" ON ...
+
+2. RESOLVE TARGETS
+   └── For each of the 6 fragments, pick a worker owning that lineitem shard
+
+3. PREFETCH
+   ├── For each unique target worker:
+   │   ├── Does it already own orders_shard0? Skip.
+   │   ├── Does it have orders_shard0 cached? Skip.
+   │   └── Otherwise: stream from source via ReadShard → LoadTempData
+   └── All missing shards fetched in parallel (CompletableFuture)
+
+4. DISPATCH
+   └── Send 6 fragments to resolved workers (all broadcast data now local)
+
+5. MERGE
+   └── Standard merge strategy (GROUP_BY_MERGE, PARTIAL_AGG, etc.)
+```
+
+### Why broadcast instead of hash-repartition?
+
+True hash-repartition (read rows, re-hash on join key, redistribute by bucket) requires streaming individual rows at query time — significant infrastructure for row-level shuffling. Broadcasting entire shard files is simpler and leverages existing infrastructure (`ReadShard` + `LoadTempData` + `TempShardCache`).
+
+The tradeoff: broadcasting moves more data when both tables are large. But shard files are cached across queries (`TempShardCache`), so the transfer cost is paid once. For the common pattern (large fact table + smaller dimension-like table), broadcast is efficient.
+
+### Dynamic table classification
+
+There are no hardcoded table lists, no "fact" vs "dimension" env vars, no user-provided classifications. The system derives everything from worker shard reports:
+
+- Workers report `ShardOwnership(tableName, shardId)` at startup
+- The coordinator's `ClusterCatalog` accumulates all known tables and their shard counts
+- At query time, all tables in the FROM clause must be in the catalog (all tables are sharded)
+- The planner picks the driving table by shard count, broadcasts the rest
+
+### Multiple broadcast tables
+
+For 3+ table joins (e.g. `lineitem JOIN orders JOIN customer`):
+- lineitem (most shards) drives
+- orders AND customer are both broadcast
+- Each target worker receives all shards of all broadcast tables
+- Fragment SQL has nested UNION ALL subqueries for each broadcast table
+
+### No placement constraints
+
+`split-and-distribute.sh` runs independently per table with no awareness of what queries will be executed. Different tables can have different shard counts, different shard keys, and different worker placements. The coordinator handles everything at query time.
+
+---
+
+## 8. Heartbeats and Worker Health
 
 ### Heartbeat protocol
 
@@ -344,7 +448,7 @@ We use **push-based heartbeats** (worker → coordinator) rather than coordinato
 
 ---
 
-## 7. Data Ingestion: split-and-distribute.sh
+## 9. Data Ingestion: split-and-distribute.sh
 
 ### Purpose
 
