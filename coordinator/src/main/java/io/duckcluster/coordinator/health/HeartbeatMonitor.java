@@ -65,7 +65,10 @@ public final class HeartbeatMonitor implements AutoCloseable {
             }
 
             if (!toRemove.isEmpty()) {
+                LOG.info("Removed {} dead workers, triggered reconciliation", toRemove.size());
                 shardReplicator.triggerReconcile();
+            } else {
+                LOG.debug("Heartbeat check: {} workers healthy", registry.workerCount());
             }
         } catch (Exception e) {
             LOG.warn("HeartbeatMonitor check error: {}", e.getMessage());

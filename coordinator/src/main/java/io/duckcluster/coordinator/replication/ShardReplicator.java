@@ -82,6 +82,7 @@ public final class ShardReplicator implements AutoCloseable {
                 return;
             }
 
+            long replicationStart = System.currentTimeMillis();
             LOG.info("Replicating {}_shard{} from {} to {}",
                     shard.tableName(), shard.shardId(), shard.sourceWorker(), targetWorkerId);
 
@@ -90,8 +91,9 @@ public final class ShardReplicator implements AutoCloseable {
             boolean success = workerClient.pushShardTo(targetOpt.get(), chunks);
 
             if (success) {
-                LOG.info("Replication complete: {}_shard{} → {}",
-                        shard.tableName(), shard.shardId(), targetWorkerId);
+                LOG.info("Replicated {}_shard{} to {} ({}ms)",
+                        shard.tableName(), shard.shardId(), targetWorkerId,
+                        System.currentTimeMillis() - replicationStart);
             } else {
                 LOG.warn("Replication failed: {}_shard{} → {}",
                         shard.tableName(), shard.shardId(), targetWorkerId);

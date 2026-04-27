@@ -67,7 +67,12 @@ public final class QueryExecutionService {
     public QueryResult execute(String sql) {
         long startMs = System.currentTimeMillis();
         String queryId = UUID.randomUUID().toString();
+        LOG.info("Query [{}] received: {}", queryId, sql);
+
         PlannedQuery plan = planner.plan(sql, catalog);
+        LOG.info("Query [{}] planned: table={}, fragments={}, broadcast={}, strategy={}",
+                queryId, plan.tableName(), plan.fragments().size(),
+                plan.broadcastTables().size(), plan.mergeStrategy());
 
         if (registry.workerCount() == 0) {
             throw new IllegalStateException("No workers registered");
@@ -75,16 +80,19 @@ public final class QueryExecutionService {
 
         MergeStrategy mergeStrategy = mergeStrategyRegistry.get(plan.mergeStrategy());
 
-        // Step 1: Resolve target workers for each fragment (driving table owners)
         Map<Integer, String> fragmentTargets = resolveFragmentTargets(plan);
+        LOG.debug("Query [{}] targets resolved: {}", queryId, fragmentTargets);
 
-        // Step 2: Prefetch broadcast shards to resolved target workers
         if (!plan.broadcastTables().isEmpty()) {
             Set<String> targetWorkerIds = new HashSet<>(fragmentTargets.values());
+            long prefetchStart = System.currentTimeMillis();
+            LOG.info("Query [{}] prefetching {} broadcast shards to {} workers",
+                    queryId, plan.broadcastTables().stream().mapToInt(BroadcastTable::shardCount).sum(),
+                    targetWorkerIds.size());
             prefetchBroadcastShards(plan.broadcastTables(), targetWorkerIds);
+            LOG.info("Query [{}] prefetch complete ({}ms)", queryId, System.currentTimeMillis() - prefetchStart);
         }
 
-        // Step 3: Dispatch fragments to resolved targets
         List<CompletableFuture<ExecutionOutcome>> futures = new ArrayList<>(plan.fragments().size());
         for (FragmentSpec fragment : plan.fragments()) {
             String targetWorkerId = fragmentTargets.get(fragment.shardId());
@@ -105,11 +113,15 @@ public final class QueryExecutionService {
                     outcome.workerId,
                     outcome.durationMs,
                     outcome.batches));
+            LOG.debug("Query [{}] fragment {} completed on {} ({}ms)",
+                    queryId, fragment.fragmentId(), outcome.workerId, outcome.durationMs);
         }
 
         long durationMs = System.currentTimeMillis() - startMs;
         MergeContext context = new MergeContext(queryId, plan, fragmentResults, durationMs);
         QueryResult merged = mergeStrategy.merge(context);
+        LOG.info("Query [{}] complete: {}ms, {} fragments, {} workers",
+                queryId, durationMs, plan.fragments().size(), workerDurationsMs.size());
         return withTiming(merged, durationMs, workerDurationsMs);
     }
 
@@ -191,12 +203,17 @@ public final class QueryExecutionService {
                     "No source worker available for broadcast shard " + tableName + "_shard" + shardId);
         }
 
+        long transferStart = System.currentTimeMillis();
         LOG.info("Prefetching {}_shard{} from {} to {}",
                 tableName, shardId, source.workerId(), target.workerId());
 
         Iterator<ShardDataChunk> chunks = workerClient.streamShardFrom(source, tableName, shardId);
         boolean loaded = workerClient.loadTempData(target, chunks);
-        if (!loaded) {
+        if (loaded) {
+            LOG.info("Prefetched {}_shard{} from {} to {} ({}ms)",
+                    tableName, shardId, source.workerId(), target.workerId(),
+                    System.currentTimeMillis() - transferStart);
+        } else {
             LOG.warn("Failed to prefetch {}_shard{} to {}", tableName, shardId, target.workerId());
         }
     }

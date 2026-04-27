@@ -6,5 +6,6 @@ target/
 .settings/
 .DS_Store
 *.log
+logs/
 pids/
 docs/PROPOSAL-*.md

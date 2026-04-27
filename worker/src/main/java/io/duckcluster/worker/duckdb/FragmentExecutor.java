@@ -27,6 +27,8 @@ public final class FragmentExecutor {
     }
 
     public void execute(String sql, StreamObserver<RowBatch> responseObserver) {
+        long startMs = System.currentTimeMillis();
+        LOG.debug("Executing SQL: {}", sql);
         Connection connection;
         try {
             connection = pool.checkout();
@@ -37,6 +39,7 @@ public final class FragmentExecutor {
             return;
         }
         if (connection == null) {
+            LOG.warn("Connection pool exhausted, rejecting fragment");
             responseObserver.onError(Status.RESOURCE_EXHAUSTED
                     .withDescription("Connection pool exhausted").asRuntimeException());
             return;
@@ -56,6 +59,8 @@ public final class FragmentExecutor {
             }
 
             int rowsInBatch = 0;
+            int totalRows = 0;
+            int batchCount = 0;
             while (resultSet.next()) {
                 for (int columnIndex = 0; columnIndex < columnCount; columnIndex++) {
                     String value = resultSet.getString(columnIndex + 1);
@@ -64,6 +69,8 @@ public final class FragmentExecutor {
                 rowsInBatch++;
                 if (rowsInBatch >= BATCH_SIZE) {
                     emitBatch(responseObserver, columnNames, columnBuilders, rowsInBatch);
+                    totalRows += rowsInBatch;
+                    batchCount++;
                     columnBuilders = newColumnBuilders(columnNames);
                     rowsInBatch = 0;
                 }
@@ -71,7 +78,11 @@ public final class FragmentExecutor {
 
             if (rowsInBatch > 0) {
                 emitBatch(responseObserver, columnNames, columnBuilders, rowsInBatch);
+                totalRows += rowsInBatch;
+                batchCount++;
             }
+            long durationMs = System.currentTimeMillis() - startMs;
+            LOG.info("Fragment executed: {} rows, {} batches, {}ms", totalRows, batchCount, durationMs);
             responseObserver.onCompleted();
         } catch (SQLException e) {
             LOG.error("Failed to execute fragment SQL: {}", sql, e);

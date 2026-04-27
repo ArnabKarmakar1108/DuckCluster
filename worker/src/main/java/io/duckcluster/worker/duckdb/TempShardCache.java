@@ -38,9 +38,11 @@ public final class TempShardCache implements AutoCloseable {
     public synchronized String loadShard(String tableName, int shardId, Path tmpFile) throws IOException, SQLException {
         String key = tableName + ":" + shardId;
         if (entries.containsKey(key)) {
+            LOG.debug("Cache HIT: {}_shard{}", tableName, shardId);
             entries.get(key);
             return entries.get(key).catalogName();
         }
+        LOG.debug("Cache MISS: {}_shard{}, loading...", tableName, shardId);
 
         while (entries.size() >= maxShards) {
             evictLRU();
