@@ -3,7 +3,7 @@ package io.duckcluster.coordinator.merger;
 import io.duckcluster.common.merger.FragmentResult;
 import io.duckcluster.common.merger.MergeContext;
 import io.duckcluster.common.merger.RowBatchData;
-import io.duckcluster.common.model.ClusterCatalog;
+import io.duckcluster.common.model.QueryAnalysis;
 import io.duckcluster.common.model.MergeStrategyType;
 import io.duckcluster.common.model.PlannedQuery;
 import io.duckcluster.common.model.QueryResult;
@@ -24,6 +24,7 @@ class ConcatenateMergeStrategyTest {
                 "events",
                 List.of(),
                 MergeStrategyType.CONCATENATE,
+                QueryAnalysis.empty(),
                 List.of());
         MergeContext context = new MergeContext(
                 "query-1",
