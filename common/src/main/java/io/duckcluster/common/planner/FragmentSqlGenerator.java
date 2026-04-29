@@ -1,7 +1,10 @@
 package io.duckcluster.common.planner;
 
+import io.duckcluster.common.model.AggregateFunction;
 import io.duckcluster.common.model.AggregateSpec;
+import io.duckcluster.common.model.OrderByClause;
 import io.duckcluster.common.model.QueryAnalysis;
+import io.duckcluster.common.model.TopKSpec;
 import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlIdentifier;
@@ -27,7 +30,8 @@ public final class FragmentSqlGenerator {
     private FragmentSqlGenerator() {}
 
     public static String generate(SqlSelect select, int shardId, QueryAnalysis analysis,
-                                   String drivingTable, Map<String, Integer> broadcastShardCounts) {
+                                   String drivingTable, Map<String, Integer> broadcastShardCounts,
+                                   TopKSpec topK) {
         SqlSelect fragmentSelect = (SqlSelect) select.clone(SqlParserPos.ZERO);
 
         SqlNode rewrittenFrom = rewriteFrom(select.getFrom(), shardId, drivingTable, broadcastShardCounts);
@@ -37,7 +41,35 @@ public final class FragmentSqlGenerator {
             fragmentSelect.setSelectList(rewriteAggregates(select.getSelectList(), analysis.aggregates()));
         }
 
-        return toSql(fragmentSelect);
+        return appendTopK(toSql(fragmentSelect), topK);
+    }
+
+    private static String appendTopK(String sql, TopKSpec topK) {
+        if (!topK.hasTopK()) {
+            return sql;
+        }
+        StringBuilder builder = new StringBuilder(sql);
+        if (topK.hasOrderBy()) {
+            builder.append(" ORDER BY ");
+            for (int i = 0; i < topK.orderBy().size(); i++) {
+                if (i > 0) {
+                    builder.append(", ");
+                }
+                OrderByClause clause = topK.orderBy().get(i);
+                builder.append(quoteIdentifier(clause.column()));
+                if (clause.descending()) {
+                    builder.append(" DESC");
+                }
+            }
+        }
+        if (topK.hasLimit()) {
+            builder.append(" LIMIT ").append(topK.limit());
+        }
+        return builder.toString();
+    }
+
+    private static String quoteIdentifier(String identifier) {
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
     }
 
     private static SqlNode rewriteFrom(SqlNode from, int shardId,
@@ -121,10 +153,27 @@ public final class FragmentSqlGenerator {
         int aggregateIndex = 0;
         for (SqlNode item : selectList) {
             if (AggregateSqlSupport.isAggregateExpression(item)) {
-                AggregateSpec aggregate = aggregates.get(aggregateIndex++);
                 SqlCall aggregateCall = (SqlCall) AggregateSqlSupport.unwrapAlias(item);
-                SqlNode alias = new SqlIdentifier(aggregate.mergeColumnName(), SqlParserPos.ZERO);
-                rewritten.add(SqlStdOperatorTable.AS.createCall(SqlParserPos.ZERO, aggregateCall, alias));
+                AggregateFunction function = AggregateSqlSupport.toAggregateFunction(aggregateCall);
+                if (function == AggregateFunction.AVG) {
+                    SqlNode operand = aggregateCall.getOperandList().isEmpty() ? null : aggregateCall.operand(0);
+                    AggregateSpec sumSpec = aggregates.get(aggregateIndex++);
+                    AggregateSpec countSpec = aggregates.get(aggregateIndex++);
+                    SqlNode sumCall = SqlStdOperatorTable.SUM.createCall(aggregateCall.getParserPosition(), operand);
+                    SqlNode countCall = SqlStdOperatorTable.COUNT.createCall(aggregateCall.getParserPosition(), operand);
+                    rewritten.add(SqlStdOperatorTable.AS.createCall(
+                            aggregateCall.getParserPosition(),
+                            sumCall,
+                            new SqlIdentifier(sumSpec.mergeColumnName(), SqlParserPos.ZERO)));
+                    rewritten.add(SqlStdOperatorTable.AS.createCall(
+                            aggregateCall.getParserPosition(),
+                            countCall,
+                            new SqlIdentifier(countSpec.mergeColumnName(), SqlParserPos.ZERO)));
+                } else {
+                    AggregateSpec aggregate = aggregates.get(aggregateIndex++);
+                    SqlNode alias = new SqlIdentifier(aggregate.mergeColumnName(), SqlParserPos.ZERO);
+                    rewritten.add(SqlStdOperatorTable.AS.createCall(SqlParserPos.ZERO, aggregateCall, alias));
+                }
             } else {
                 rewritten.add(item);
             }

@@ -1,6 +1,7 @@
 package io.duckcluster.common.planner;
 
 import io.duckcluster.common.model.AggregateFunction;
+import io.duckcluster.common.model.AggregateSpec;
 import io.duckcluster.common.model.MergeStrategyType;
 import io.duckcluster.common.model.QueryAnalysis;
 import org.apache.calcite.sql.SqlSelect;
@@ -36,5 +37,19 @@ class QueryAnalysisExtractorTest {
         assertEquals(AggregateFunction.COUNT, analysis.aggregates().get(0).function());
         assertEquals(AggregateFunction.SUM, analysis.aggregates().get(1).function());
         assertEquals("id", analysis.aggregates().get(1).inputColumn());
+    }
+
+    @Test
+    void extractsAvgAsSumAndCountParts() {
+        SqlSelect select = (SqlSelect) planner.parse(
+                "SELECT category, AVG(score) AS avg_score FROM events GROUP BY category");
+        QueryAnalysis analysis = QueryAnalysisExtractor.extract(select, MergeStrategyType.GROUP_BY_MERGE);
+
+        assertEquals(2, analysis.aggregates().size());
+        assertEquals(AggregateSpec.AggregatePart.AVG_SUM, analysis.aggregates().get(0).part());
+        assertEquals(AggregateFunction.SUM, analysis.aggregates().get(0).function());
+        assertEquals(AggregateSpec.AggregatePart.AVG_COUNT, analysis.aggregates().get(1).part());
+        assertEquals(AggregateFunction.COUNT, analysis.aggregates().get(1).function());
+        assertEquals("avg_score", analysis.aggregates().get(0).outputName());
     }
 }

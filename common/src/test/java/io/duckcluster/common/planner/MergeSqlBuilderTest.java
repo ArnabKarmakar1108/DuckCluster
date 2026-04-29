@@ -3,6 +3,7 @@ package io.duckcluster.common.planner;
 import io.duckcluster.common.model.AggregateFunction;
 import io.duckcluster.common.model.AggregateSpec;
 import io.duckcluster.common.model.QueryAnalysis;
+import io.duckcluster.common.model.TopKSpec;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -39,6 +40,46 @@ class MergeSqlBuilderTest {
 
         assertEquals(
                 "SELECT SUM(\"__dc_agg_0\") AS \"count\", SUM(\"__dc_agg_1\") AS \"total\" FROM __merge_temp",
+                sql);
+    }
+
+    @Test
+    void buildsAvgMergeSqlFromSumAndCount() {
+        QueryAnalysis analysis = new QueryAnalysis(
+                List.of("category"),
+                List.of(
+                        new AggregateSpec(
+                                "avg_score",
+                                "__dc_agg_0_sum",
+                                AggregateFunction.SUM,
+                                "score",
+                                AggregateSpec.AggregatePart.AVG_SUM),
+                        new AggregateSpec(
+                                "avg_score",
+                                "__dc_agg_0_cnt",
+                                AggregateFunction.COUNT,
+                                "score",
+                                AggregateSpec.AggregatePart.AVG_COUNT)),
+                List.of("category", "avg_score"));
+
+        String sql = MergeSqlBuilder.buildGroupByMerge(analysis);
+
+        assertTrue(sql.contains("CAST(SUM(\"__dc_agg_0_sum\") AS DOUBLE) / NULLIF(SUM(\"__dc_agg_0_cnt\"), 0)"));
+        assertTrue(sql.contains("AS \"avg_score\""));
+    }
+
+    @Test
+    void buildsTopKMergeSql() {
+        QueryAnalysis analysis = new QueryAnalysis(
+                List.of(),
+                List.of(),
+                List.of("id", "value"));
+        TopKSpec topK = new TopKSpec(List.of(new io.duckcluster.common.model.OrderByClause("value", true)), 5);
+
+        String sql = MergeSqlBuilder.buildTopKMerge(analysis, topK);
+
+        assertEquals(
+                "SELECT \"id\", \"value\" FROM __merge_temp ORDER BY CAST(\"value\" AS DOUBLE) DESC LIMIT 5",
                 sql);
     }
 }

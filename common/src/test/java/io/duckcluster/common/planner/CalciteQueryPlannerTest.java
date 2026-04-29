@@ -18,6 +18,39 @@ class CalciteQueryPlannerTest {
     private final ClusterCatalog catalog = ClusterCatalog.demo(3);
 
     @Test
+    void detectsTopKStrategy() {
+        MergeStrategyType strategy = planner.detectMergeStrategy(
+                planner.parse("SELECT id, score FROM events ORDER BY score DESC LIMIT 10"));
+        assertEquals(MergeStrategyType.TOP_K, strategy);
+    }
+
+    @Test
+    void planPushesOrderByAndLimitToFragments() {
+        PlannedQuery planned = planner.plan(
+                "SELECT id, score FROM events ORDER BY score DESC LIMIT 2", catalog);
+        assertEquals(MergeStrategyType.TOP_K, planned.mergeStrategy());
+        assertEquals(2, planned.topK().limit());
+        assertEquals(1, planned.topK().orderBy().size());
+        assertEquals("score", planned.topK().orderBy().get(0).column());
+        assertTrue(planned.topK().orderBy().get(0).descending());
+        assertTrue(planned.fragments().get(0).sql().contains("ORDER BY"));
+        assertTrue(planned.fragments().get(0).sql().contains("LIMIT 2"));
+    }
+
+    @Test
+    void groupByFragmentsDecomposeAvgIntoSumAndCount() {
+        PlannedQuery planned = planner.plan(
+                "SELECT category, AVG(score) AS avg_score FROM events GROUP BY category", catalog);
+        assertEquals(MergeStrategyType.GROUP_BY_MERGE, planned.mergeStrategy());
+        assertEquals(2, planned.analysis().aggregates().size());
+        String sql = planned.fragments().get(0).sql();
+        assertTrue(sql.contains("SUM"), sql);
+        assertTrue(sql.contains("COUNT"), sql);
+        assertTrue(sql.contains("__dc_agg_0_sum"), sql);
+        assertTrue(sql.contains("__dc_agg_0_cnt"), sql);
+    }
+
+    @Test
     void detectsConcatenateStrategyForSimpleSelect() {
         MergeStrategyType strategy = planner.detectMergeStrategy(planner.parse("SELECT * FROM events"));
         assertEquals(MergeStrategyType.CONCATENATE, strategy);

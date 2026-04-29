@@ -9,7 +9,8 @@ public record PlannedQuery(
         List<FragmentSpec> fragments,
         MergeStrategyType mergeStrategy,
         QueryAnalysis analysis,
-        List<ColumnDef> schema) {
+        List<ColumnDef> schema,
+        TopKSpec topK) {
 
     public String tableName() {
         return shardedTables.get(0);

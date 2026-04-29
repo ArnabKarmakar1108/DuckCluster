@@ -3,65 +3,66 @@ package io.duckcluster.coordinator.merger;
 import io.duckcluster.common.merger.FragmentResult;
 import io.duckcluster.common.merger.MergeContext;
 import io.duckcluster.common.merger.RowBatchData;
-import io.duckcluster.common.model.AggregateFunction;
-import io.duckcluster.common.model.AggregateSpec;
 import io.duckcluster.common.model.MergeStrategyType;
+import io.duckcluster.common.model.OrderByClause;
 import io.duckcluster.common.model.PlannedQuery;
 import io.duckcluster.common.model.QueryAnalysis;
-import io.duckcluster.common.model.TopKSpec;
 import io.duckcluster.common.model.QueryResult;
+import io.duckcluster.common.model.TopKSpec;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-class PartialAggMergeStrategyTest {
+class TopKMergeStrategyTest {
 
-    private final PartialAggMergeStrategy strategy = new PartialAggMergeStrategy();
+    private final TopKMergeStrategy strategy = new TopKMergeStrategy();
 
     @Test
-    void mergesPartialCountsAndSums() {
+    void mergesTopRowsAcrossFragments() {
         QueryAnalysis analysis = new QueryAnalysis(
                 List.of(),
-                List.of(
-                        new AggregateSpec("count", "__dc_agg_0", AggregateFunction.COUNT, null),
-                        new AggregateSpec("total", "__dc_agg_1", AggregateFunction.SUM, "id")),
-                List.of("count", "total"));
+                List.of(),
+                List.of("id", "value"));
         PlannedQuery plan = new PlannedQuery(
-                "SELECT COUNT(*), SUM(id) FROM events",
+                "SELECT id, value FROM events ORDER BY value DESC LIMIT 2",
                 List.of("events"),
                 List.of(),
                 List.of(),
-                MergeStrategyType.PARTIAL_AGG,
+                MergeStrategyType.TOP_K,
                 analysis,
                 List.of(),
-                TopKSpec.none());
+                new TopKSpec(List.of(new OrderByClause("value", true)), 2));
         MergeContext context = new MergeContext(
-                "query-2",
+                "query-1",
                 plan,
                 List.of(
                         new FragmentResult(
                                 0,
                                 0,
                                 "worker-1",
-                                4L,
+                                2L,
                                 List.of(new RowBatchData(
-                                        List.of("__dc_agg_0", "__dc_agg_1"), List.of(List.of("2", "9"))))),
+                                        List.of("id", "value"),
+                                        List.of(List.of("1", "50"), List.of("2", "30"))))),
                         new FragmentResult(
                                 1,
                                 1,
                                 "worker-2",
-                                3L,
+                                2L,
                                 List.of(new RowBatchData(
-                                        List.of("__dc_agg_0", "__dc_agg_1"), List.of(List.of("1", "4")))))),
-                7L);
+                                        List.of("id", "value"),
+                                        List.of(List.of("3", "40"), List.of("4", "10")))))),
+                4L);
 
         QueryResult result = strategy.merge(context);
 
-        assertEquals(List.of("count", "total"), result.columns());
-        assertEquals(1, result.rows().size());
-        assertEquals("3", result.rows().get(0).get(0).toString());
-        assertEquals("13", result.rows().get(0).get(1).toString());
+        assertEquals(List.of("id", "value"), result.columns());
+        assertEquals(2, result.rows().size());
+        assertEquals("1", result.rows().get(0).get(0).toString());
+        assertEquals("50", result.rows().get(0).get(1).toString());
+        assertEquals("3", result.rows().get(1).get(0).toString());
+        assertEquals("40", result.rows().get(1).get(1).toString());
     }
 }

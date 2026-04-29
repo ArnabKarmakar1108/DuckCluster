@@ -8,6 +8,7 @@ import io.duckcluster.common.model.AggregateSpec;
 import io.duckcluster.common.model.MergeStrategyType;
 import io.duckcluster.common.model.PlannedQuery;
 import io.duckcluster.common.model.QueryAnalysis;
+import io.duckcluster.common.model.TopKSpec;
 import io.duckcluster.common.model.QueryResult;
 import org.junit.jupiter.api.Test;
 
@@ -32,7 +33,8 @@ class GroupByMergeStrategyTest {
                 List.of(),
                 MergeStrategyType.GROUP_BY_MERGE,
                 analysis,
-                List.of());
+                List.of(),
+                TopKSpec.none());
         MergeContext context = new MergeContext(
                 "query-1",
                 plan,

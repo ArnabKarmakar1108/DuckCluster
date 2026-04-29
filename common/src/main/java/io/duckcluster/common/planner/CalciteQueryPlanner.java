@@ -7,6 +7,7 @@ import io.duckcluster.common.model.MergeStrategyType;
 import io.duckcluster.common.model.PlannedQuery;
 import io.duckcluster.common.model.QueryAnalysis;
 import io.duckcluster.common.model.TableShardConfig;
+import io.duckcluster.common.model.TopKSpec;
 import org.apache.calcite.config.Lex;
 import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlCall;
@@ -42,6 +43,7 @@ public final class CalciteQueryPlanner implements QueryPlanner {
         int shardCount = classification.shardCount();
 
         MergeStrategyType mergeStrategy = detectMergeStrategy(parsed);
+        TopKSpec topK = TopKExtractor.extract(parsed);
         QueryAnalysis analysis = QueryAnalysisExtractor.withMergeColumnNames(
                 QueryAnalysisExtractor.extract(select, mergeStrategy));
 
@@ -54,12 +56,12 @@ public final class CalciteQueryPlanner implements QueryPlanner {
         List<FragmentSpec> fragments = new ArrayList<>(shardCount);
         for (int shardId = 0; shardId < shardCount; shardId++) {
             String fragmentSql = FragmentSqlGenerator.generate(
-                    select, shardId, analysis, drivingTable, broadcastShardCounts);
+                    select, shardId, analysis, drivingTable, broadcastShardCounts, topK);
             fragments.add(new FragmentSpec(shardId, shardId, fragmentSql, mergeStrategy));
         }
 
         return new PlannedQuery(sql, List.of(drivingTable), classification.broadcastTables(),
-                fragments, mergeStrategy, analysis, List.of());
+                fragments, mergeStrategy, analysis, List.of(), topK);
     }
 
     public SqlNode parse(String sql) {

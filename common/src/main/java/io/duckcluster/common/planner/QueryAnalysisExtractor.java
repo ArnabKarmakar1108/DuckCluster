@@ -9,7 +9,6 @@ import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlNode;
-import org.apache.calcite.sql.SqlNodeList;
 import org.apache.calcite.sql.SqlSelect;
 
 import java.util.ArrayList;
@@ -19,8 +18,15 @@ public final class QueryAnalysisExtractor {
     private QueryAnalysisExtractor() {}
 
     public static QueryAnalysis extract(SqlSelect select, MergeStrategyType mergeStrategy) {
-        if (mergeStrategy == MergeStrategyType.CONCATENATE || mergeStrategy == MergeStrategyType.TOP_K) {
+        if (mergeStrategy == MergeStrategyType.CONCATENATE) {
             return QueryAnalysis.empty();
+        }
+        if (mergeStrategy == MergeStrategyType.TOP_K) {
+            List<String> outputColumnNames = new ArrayList<>();
+            for (SqlNode item : select.getSelectList()) {
+                outputColumnNames.add(selectOutputName(item));
+            }
+            return new QueryAnalysis(List.of(), List.of(), outputColumnNames);
         }
 
         List<String> groupByColumns = extractGroupByColumns(select);
@@ -30,9 +36,9 @@ public final class QueryAnalysisExtractor {
         int aggregateIndex = 0;
         for (SqlNode item : select.getSelectList()) {
             if (isAggregate(item)) {
-                AggregateSpec aggregate = toAggregateSpec(item, aggregateIndex++);
-                aggregates.add(aggregate);
-                outputColumnNames.add(aggregate.outputName());
+                List<AggregateSpec> specs = toAggregateSpecs(item, aggregateIndex++);
+                aggregates.addAll(specs);
+                outputColumnNames.add(specs.get(0).outputName());
             } else if (mergeStrategy == MergeStrategyType.GROUP_BY_MERGE) {
                 String columnName = columnName(item);
                 outputColumnNames.add(columnName);
@@ -44,13 +50,35 @@ public final class QueryAnalysisExtractor {
 
     public static QueryAnalysis withMergeColumnNames(QueryAnalysis analysis) {
         List<AggregateSpec> rewritten = new ArrayList<>(analysis.aggregates().size());
-        for (int i = 0; i < analysis.aggregates().size(); i++) {
+        int mergeIndex = 0;
+        for (int i = 0; i < analysis.aggregates().size(); ) {
             AggregateSpec aggregate = analysis.aggregates().get(i);
-            rewritten.add(new AggregateSpec(
-                    aggregate.outputName(),
-                    mergeColumnName(i),
-                    aggregate.function(),
-                    aggregate.inputColumn()));
+            if (aggregate.part() == AggregateSpec.AggregatePart.AVG_SUM) {
+                AggregateSpec count = analysis.aggregates().get(i + 1);
+                rewritten.add(new AggregateSpec(
+                        aggregate.outputName(),
+                        mergeColumnName(mergeIndex) + "_sum",
+                        aggregate.function(),
+                        aggregate.inputColumn(),
+                        AggregateSpec.AggregatePart.AVG_SUM));
+                rewritten.add(new AggregateSpec(
+                        count.outputName(),
+                        mergeColumnName(mergeIndex) + "_cnt",
+                        count.function(),
+                        count.inputColumn(),
+                        AggregateSpec.AggregatePart.AVG_COUNT));
+                mergeIndex++;
+                i += 2;
+            } else {
+                rewritten.add(new AggregateSpec(
+                        aggregate.outputName(),
+                        mergeColumnName(mergeIndex),
+                        aggregate.function(),
+                        aggregate.inputColumn(),
+                        aggregate.part()));
+                mergeIndex++;
+                i++;
+            }
         }
         return new QueryAnalysis(analysis.groupByColumns(), rewritten, analysis.outputColumnNames());
     }
@@ -70,12 +98,27 @@ public final class QueryAnalysisExtractor {
         return columns;
     }
 
-    private static AggregateSpec toAggregateSpec(SqlNode item, int index) {
+    private static List<AggregateSpec> toAggregateSpecs(SqlNode item, int index) {
         SqlCall call = (SqlCall) AggregateSqlSupport.unwrapAlias(item);
         AggregateFunction function = AggregateSqlSupport.toAggregateFunction(call);
         String inputColumn = extractInputColumn(call);
         String outputName = outputName(item, function, inputColumn, index);
-        return new AggregateSpec(outputName, mergeColumnName(index), function, inputColumn);
+        if (function == AggregateFunction.AVG) {
+            return List.of(
+                    new AggregateSpec(
+                            outputName,
+                            mergeColumnName(index) + "_sum",
+                            AggregateFunction.SUM,
+                            inputColumn,
+                            AggregateSpec.AggregatePart.AVG_SUM),
+                    new AggregateSpec(
+                            outputName,
+                            mergeColumnName(index) + "_cnt",
+                            AggregateFunction.COUNT,
+                            inputColumn,
+                            AggregateSpec.AggregatePart.AVG_COUNT));
+        }
+        return List.of(new AggregateSpec(outputName, mergeColumnName(index), function, inputColumn));
     }
 
     private static SqlNode unwrapAlias(SqlNode item) {
@@ -107,6 +150,16 @@ public final class QueryAnalysisExtractor {
             return function.name().toLowerCase() + "_" + inputColumn;
         }
         return function.name().toLowerCase() + "_" + index;
+    }
+
+    private static String selectOutputName(SqlNode item) {
+        if (item instanceof SqlBasicCall call && call.getOperator().getKind() == SqlKind.AS) {
+            SqlNode aliasNode = call.operand(1);
+            if (aliasNode instanceof SqlIdentifier alias) {
+                return alias.getSimple();
+            }
+        }
+        return columnName(item);
     }
 
     private static String columnName(SqlNode node) {
