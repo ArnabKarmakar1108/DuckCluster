@@ -13,7 +13,9 @@ import io.duckcluster.proto.v1.ReceiveShardResponse;
 import io.duckcluster.proto.v1.RowBatch;
 import io.duckcluster.proto.v1.ShardDataChunk;
 import io.duckcluster.proto.v1.WorkerServiceGrpc;
+import io.duckcluster.coordinator.execution.FragmentExecutionException;
 import io.grpc.ManagedChannel;
+import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -47,11 +49,15 @@ public final class WorkerNodeClient {
                 .build();
 
         List<RowBatchData> batches = new ArrayList<>();
-        Iterator<RowBatch> iterator = stub.executeFragment(request);
-        while (iterator.hasNext()) {
-            batches.add(RowBatchConverter.fromProto(iterator.next()));
+        try {
+            Iterator<RowBatch> iterator = stub.executeFragment(request);
+            while (iterator.hasNext()) {
+                batches.add(RowBatchConverter.fromProto(iterator.next()));
+            }
+            return batches;
+        } catch (StatusRuntimeException e) {
+            throw new FragmentExecutionException(e.getStatus(), e);
         }
-        return batches;
     }
 
     public Iterator<ShardDataChunk> streamShardFrom(
