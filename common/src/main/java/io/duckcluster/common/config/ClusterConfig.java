@@ -17,6 +17,7 @@ public final class ClusterConfig {
     private final int vnodesPerWorker;
     private final long watcherIntervalMs;
     private final int cacheMaxShards;
+    private final long fragmentWaitMs;
 
     public ClusterConfig(
             String coordinatorHost,
@@ -31,7 +32,8 @@ public final class ClusterConfig {
             int replicationFactor,
             int vnodesPerWorker,
             long watcherIntervalMs,
-            int cacheMaxShards) {
+            int cacheMaxShards,
+            long fragmentWaitMs) {
         this.coordinatorHost = Objects.requireNonNull(coordinatorHost, "coordinatorHost");
         this.coordinatorGrpcPort = coordinatorGrpcPort;
         this.coordinatorHttpPort = coordinatorHttpPort;
@@ -45,6 +47,7 @@ public final class ClusterConfig {
         this.vnodesPerWorker = vnodesPerWorker;
         this.watcherIntervalMs = watcherIntervalMs;
         this.cacheMaxShards = cacheMaxShards;
+        this.fragmentWaitMs = fragmentWaitMs;
     }
 
     public static ClusterConfig fromEnvironment() {
@@ -62,7 +65,8 @@ public final class ClusterConfig {
                 parseInt("DUCKCLUSTER_REPLICATION_FACTOR", 2),
                 parseInt("DUCKCLUSTER_VNODES_PER_WORKER", 100),
                 parseLong("DUCKCLUSTER_WATCHER_INTERVAL_MS", 2000),
-                parseInt("DUCKCLUSTER_CACHE_MAX_SHARDS", 5));
+                parseInt("DUCKCLUSTER_CACHE_MAX_SHARDS", 5),
+                parseLong("DUCKCLUSTER_FRAGMENT_WAIT_MS", 60_000));
     }
 
     public String coordinatorHost() {
@@ -115,6 +119,10 @@ public final class ClusterConfig {
 
     public int cacheMaxShards() {
         return cacheMaxShards;
+    }
+
+    public long fragmentWaitMs() {
+        return fragmentWaitMs;
     }
 
     private static String getenv(String key, String defaultValue) {

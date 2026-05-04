@@ -19,6 +19,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.duckcluster.coordinator.replication.ShardReplicator;
+import io.duckcluster.coordinator.worker.WorkerChannelPool;
 
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
@@ -30,14 +31,17 @@ public final class CoordinatorGrpcServer {
     private final WorkerRegistry registry;
     private final ShardCatalog shardCatalog;
     private final ShardReplicator shardReplicator;
+    private final WorkerChannelPool channelPool;
     private Server server;
 
     public CoordinatorGrpcServer(ClusterConfig config, WorkerRegistry registry,
-                                 ShardCatalog shardCatalog, ShardReplicator shardReplicator) {
+                                 ShardCatalog shardCatalog, ShardReplicator shardReplicator,
+                                 WorkerChannelPool channelPool) {
         this.config = config;
         this.registry = registry;
         this.shardCatalog = shardCatalog;
         this.shardReplicator = shardReplicator;
+        this.channelPool = channelPool;
     }
 
     public void start() throws IOException {
@@ -66,6 +70,7 @@ public final class CoordinatorGrpcServer {
     private final class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorServiceImplBase {
         @Override
         public void registerWorker(RegisterWorkerRequest request, StreamObserver<RegisterWorkerResponse> responseObserver) {
+            channelPool.removeChannel(request.getWorkerId());
             registry.register(
                     request.getWorkerId(),
                     request.getHost(),

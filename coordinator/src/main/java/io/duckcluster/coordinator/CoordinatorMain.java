@@ -36,14 +36,16 @@ public final class CoordinatorMain {
                 registry,
                 workerClient,
                 new MergeStrategyRegistry(),
-                shardCatalog);
+                shardCatalog,
+                config);
 
         ShardReplicator shardReplicator = new ShardReplicator(shardCatalog, registry, workerClient);
         HeartbeatMonitor heartbeatMonitor = new HeartbeatMonitor(
                 registry, shardCatalog, shardReplicator, channelPool,
                 config.heartbeatInterval(), config.heartbeatMissThreshold());
 
-        CoordinatorGrpcServer grpcServer = new CoordinatorGrpcServer(config, registry, shardCatalog, shardReplicator);
+        CoordinatorGrpcServer grpcServer = new CoordinatorGrpcServer(
+                config, registry, shardCatalog, shardReplicator, channelPool);
         CoordinatorHttpServer httpServer = new CoordinatorHttpServer(config, registry, queryExecutionService);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {

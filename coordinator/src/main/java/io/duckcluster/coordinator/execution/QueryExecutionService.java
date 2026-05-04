@@ -1,5 +1,6 @@
 package io.duckcluster.coordinator.execution;
 
+import io.duckcluster.common.config.ClusterConfig;
 import io.duckcluster.common.merger.FragmentResult;
 import io.duckcluster.common.merger.MergeContext;
 import io.duckcluster.common.merger.MergeStrategy;
@@ -15,11 +16,10 @@ import io.duckcluster.coordinator.catalog.ShardCatalog;
 import io.duckcluster.coordinator.merger.MergeStrategyRegistry;
 import io.duckcluster.coordinator.worker.WorkerNodeClient;
 import io.duckcluster.proto.v1.ShardDataChunk;
-import io.grpc.Status;
-import io.grpc.StatusRuntimeException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.LinkedHashSet;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -35,6 +35,7 @@ import java.util.concurrent.Executors;
 
 public final class QueryExecutionService {
     private static final Logger LOG = LoggerFactory.getLogger(QueryExecutionService.class);
+    private static final long WORKER_WAIT_POLL_MS = 100;
 
     private final QueryPlanner planner;
     private final ClusterCatalog catalog;
@@ -42,6 +43,8 @@ public final class QueryExecutionService {
     private final WorkerNodeClient workerClient;
     private final MergeStrategyRegistry mergeStrategyRegistry;
     private final ShardCatalog shardCatalog;
+    private final WorkerFragmentTracker fragmentTracker;
+    private final long fragmentWaitMs;
     private final ExecutorService fragmentExecutor;
 
     public QueryExecutionService(
@@ -50,13 +53,27 @@ public final class QueryExecutionService {
             WorkerRegistry registry,
             WorkerNodeClient workerClient,
             MergeStrategyRegistry mergeStrategyRegistry,
-            ShardCatalog shardCatalog) {
+            ShardCatalog shardCatalog,
+            ClusterConfig config) {
+        this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog, config.fragmentWaitMs());
+    }
+
+    QueryExecutionService(
+            QueryPlanner planner,
+            ClusterCatalog catalog,
+            WorkerRegistry registry,
+            WorkerNodeClient workerClient,
+            MergeStrategyRegistry mergeStrategyRegistry,
+            ShardCatalog shardCatalog,
+            long fragmentWaitMs) {
         this.planner = planner;
         this.catalog = catalog;
         this.registry = registry;
         this.workerClient = workerClient;
         this.mergeStrategyRegistry = mergeStrategyRegistry;
         this.shardCatalog = shardCatalog;
+        this.fragmentTracker = new WorkerFragmentTracker(registry);
+        this.fragmentWaitMs = fragmentWaitMs;
         this.fragmentExecutor = Executors.newCachedThreadPool(r -> {
             Thread t = new Thread(r);
             t.setDaemon(true);
@@ -91,13 +108,19 @@ public final class QueryExecutionService {
                     targetWorkerIds.size());
             prefetchBroadcastShards(plan.broadcastTables(), targetWorkerIds);
             LOG.info("Query [{}] prefetch complete ({}ms)", queryId, System.currentTimeMillis() - prefetchStart);
+        } else {
+            long prefetchStart = System.currentTimeMillis();
+            prefetchDrivingShards(plan, fragmentTargets);
+            LOG.info("Query [{}] driving-shard prefetch complete ({}ms)",
+                    queryId, System.currentTimeMillis() - prefetchStart);
         }
 
         List<CompletableFuture<ExecutionOutcome>> futures = new ArrayList<>(plan.fragments().size());
         for (FragmentSpec fragment : plan.fragments()) {
-            String targetWorkerId = fragmentTargets.get(fragment.shardId());
+            String preferredWorkerId = fragmentTargets.get(fragment.shardId());
             futures.add(CompletableFuture.supplyAsync(
-                    () -> executeOnWorker(queryId, fragment, targetWorkerId), fragmentExecutor));
+                    () -> executeFragmentWithRetry(queryId, plan, fragment, preferredWorkerId),
+                    fragmentExecutor));
         }
 
         List<FragmentResult> fragmentResults = new ArrayList<>(plan.fragments().size());
@@ -126,31 +149,95 @@ public final class QueryExecutionService {
     }
 
     private Map<Integer, String> resolveFragmentTargets(PlannedQuery plan) {
+        boolean joinQuery = !plan.broadcastTables().isEmpty();
         Map<Integer, String> targets = new LinkedHashMap<>();
         for (FragmentSpec fragment : plan.fragments()) {
-            List<String> owners = shardCatalog.getOwners(plan.tableName(), fragment.shardId());
-            String resolved = null;
-            for (String ownerId : owners) {
-                if (registry.getWorker(ownerId).isPresent()) {
-                    resolved = ownerId;
-                    break;
-                }
-            }
+            String resolved = resolveRegisteredCandidate(plan.tableName(), fragment.shardId());
             if (resolved == null) {
-                List<String> cachedWorkers = shardCatalog.getCachedWorkers(plan.tableName(), fragment.shardId());
-                for (String workerId : cachedWorkers) {
-                    if (registry.getWorker(workerId).isPresent()) {
-                        resolved = workerId;
-                        break;
-                    }
+                if (joinQuery) {
+                    resolved = waitForOwnerOrCachedWorker(plan.tableName(), fragment.shardId());
+                } else {
+                    resolved = pickFallbackWorker();
+                    LOG.info("No registered owner/cache for {}_shard{}, using fallback worker {}",
+                            plan.tableName(), fragment.shardId(), resolved);
                 }
-            }
-            if (resolved == null) {
-                resolved = registry.listWorkers().iterator().next().workerId();
             }
             targets.put(fragment.shardId(), resolved);
         }
         return targets;
+    }
+
+    private String resolveRegisteredCandidate(String tableName, int shardId) {
+        for (String ownerId : shardCatalog.getOwners(tableName, shardId)) {
+            if (registry.getWorker(ownerId).isPresent()) {
+                return ownerId;
+            }
+        }
+        for (String workerId : shardCatalog.getCachedWorkers(tableName, shardId)) {
+            if (registry.getWorker(workerId).isPresent()) {
+                return workerId;
+            }
+        }
+        for (String ownerId : shardCatalog.getActualOwners(tableName, shardId)) {
+            if (registry.getWorker(ownerId).isPresent()) {
+                return ownerId;
+            }
+        }
+        return null;
+    }
+
+    private String waitForOwnerOrCachedWorker(String tableName, int shardId) {
+        long deadline = System.currentTimeMillis() + fragmentWaitMs;
+        while (System.currentTimeMillis() < deadline) {
+            String resolved = resolveRegisteredCandidate(tableName, shardId);
+            if (resolved != null) {
+                LOG.info("Resolved {}_shard{} to owner/cache worker {} after waiting",
+                        tableName, shardId, resolved);
+                return resolved;
+            }
+            sleepQuietly(WORKER_WAIT_POLL_MS);
+        }
+        throw new IllegalStateException(
+                "Timed out waiting for an owner or cached worker for " + tableName + "_shard" + shardId);
+    }
+
+    private String pickFallbackWorker() {
+        return registry.listWorkers().stream()
+                .min((left, right) -> Integer.compare(
+                        fragmentTracker.inFlightCount(left.workerId()),
+                        fragmentTracker.inFlightCount(right.workerId())))
+                .orElseThrow(() -> new IllegalStateException("No workers registered"))
+                .workerId();
+    }
+
+    private void prefetchDrivingShards(PlannedQuery plan, Map<Integer, String> fragmentTargets) {
+        List<CompletableFuture<Void>> prefetchFutures = new ArrayList<>();
+        for (FragmentSpec fragment : plan.fragments()) {
+            String targetWorkerId = fragmentTargets.get(fragment.shardId());
+            if (workerHasShard(targetWorkerId, plan.tableName(), fragment.shardId())) {
+                continue;
+            }
+            Optional<WorkerRegistry.WorkerRecord> targetOpt = registry.getWorker(targetWorkerId);
+            if (targetOpt.isEmpty()) {
+                continue;
+            }
+            WorkerRegistry.WorkerRecord target = targetOpt.get();
+            final int shardId = fragment.shardId();
+            prefetchFutures.add(CompletableFuture.runAsync(
+                    () -> prefetchShard(target, plan.tableName(), shardId), fragmentExecutor));
+        }
+        for (CompletableFuture<Void> future : prefetchFutures) {
+            future.join();
+        }
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for shard worker", e);
+        }
     }
 
     private void prefetchBroadcastShards(List<BroadcastTable> broadcastTables, Set<String> targetWorkerIds) {
@@ -209,25 +296,109 @@ public final class QueryExecutionService {
 
         Iterator<ShardDataChunk> chunks = workerClient.streamShardFrom(source, tableName, shardId);
         boolean loaded = workerClient.loadTempData(target, chunks);
-        if (loaded) {
-            LOG.info("Prefetched {}_shard{} from {} to {} ({}ms)",
-                    tableName, shardId, source.workerId(), target.workerId(),
-                    System.currentTimeMillis() - transferStart);
-        } else {
-            LOG.warn("Failed to prefetch {}_shard{} to {}", tableName, shardId, target.workerId());
+        if (!loaded) {
+            throw new IllegalStateException(
+                    "Failed to prefetch broadcast shard " + tableName + "_shard" + shardId
+                            + " to worker " + target.workerId());
+        }
+        LOG.info("Prefetched {}_shard{} from {} to {} ({}ms)",
+                tableName, shardId, source.workerId(), target.workerId(),
+                System.currentTimeMillis() - transferStart);
+    }
+
+    private ExecutionOutcome executeFragmentWithRetry(
+            String queryId, PlannedQuery plan, FragmentSpec fragment, String preferredWorkerId) {
+        List<String> candidates = buildExecutionCandidates(plan, fragment.shardId(), preferredWorkerId);
+        FragmentExecutionException lastRetryable = null;
+
+        for (String workerId : candidates) {
+            if (registry.getWorker(workerId).isEmpty()) {
+                continue;
+            }
+            ensureShardsLocal(plan, workerId, fragment.shardId());
+            try {
+                return tryExecuteOnWorker(queryId, fragment, workerId);
+            } catch (FragmentExecutionException e) {
+                if (e.retryable()) {
+                    LOG.warn("Query [{}] fragment {} failed on {} ({}), trying next worker",
+                            queryId, fragment.fragmentId(), workerId, e.status().getCode());
+                    lastRetryable = e;
+                } else {
+                    throw e;
+                }
+            }
+        }
+
+        if (lastRetryable != null) {
+            throw new IllegalStateException(
+                    "All candidate workers failed for fragment " + fragment.fragmentId()
+                            + " on table " + plan.tableName() + "_shard" + fragment.shardId(),
+                    lastRetryable);
+        }
+        throw new IllegalStateException(
+                "No candidate workers available for fragment " + fragment.fragmentId());
+    }
+
+    private List<String> buildExecutionCandidates(PlannedQuery plan, int shardId, String preferredWorkerId) {
+        LinkedHashSet<String> candidates = new LinkedHashSet<>();
+        if (preferredWorkerId != null) {
+            candidates.add(preferredWorkerId);
+        }
+        for (String ownerId : shardCatalog.getOwners(plan.tableName(), shardId)) {
+            if (registry.getWorker(ownerId).isPresent()) {
+                candidates.add(ownerId);
+            }
+        }
+        for (String ownerId : shardCatalog.getActualOwners(plan.tableName(), shardId)) {
+            if (registry.getWorker(ownerId).isPresent()) {
+                candidates.add(ownerId);
+            }
+        }
+        for (String workerId : shardCatalog.getCachedWorkers(plan.tableName(), shardId)) {
+            if (registry.getWorker(workerId).isPresent()) {
+                candidates.add(workerId);
+            }
+        }
+        if (plan.broadcastTables().isEmpty()) {
+            registry.listWorkers().stream()
+                    .sorted((left, right) -> Integer.compare(
+                            fragmentTracker.inFlightCount(left.workerId()),
+                            fragmentTracker.inFlightCount(right.workerId())))
+                    .forEach(worker -> candidates.add(worker.workerId()));
+        }
+        return List.copyOf(candidates);
+    }
+
+    private void ensureShardsLocal(PlannedQuery plan, String workerId, int drivingShardId) {
+        Optional<WorkerRegistry.WorkerRecord> targetOpt = registry.getWorker(workerId);
+        if (targetOpt.isEmpty()) {
+            return;
+        }
+        WorkerRegistry.WorkerRecord target = targetOpt.get();
+        if (!workerHasShard(workerId, plan.tableName(), drivingShardId)) {
+            prefetchShard(target, plan.tableName(), drivingShardId);
+        }
+        for (BroadcastTable broadcastTable : plan.broadcastTables()) {
+            for (int shardId = 0; shardId < broadcastTable.shardCount(); shardId++) {
+                if (!workerHasShard(workerId, broadcastTable.tableName(), shardId)) {
+                    prefetchShard(target, broadcastTable.tableName(), shardId);
+                }
+            }
         }
     }
 
-    private ExecutionOutcome executeOnWorker(String queryId, FragmentSpec fragment, String targetWorkerId) {
-        Optional<WorkerRegistry.WorkerRecord> workerOpt = registry.getWorker(targetWorkerId);
-        if (workerOpt.isEmpty()) {
-            throw new IllegalStateException("Target worker " + targetWorkerId + " not available");
+    private ExecutionOutcome tryExecuteOnWorker(String queryId, FragmentSpec fragment, String targetWorkerId) {
+        fragmentTracker.acquireBlocking(targetWorkerId, fragmentWaitMs);
+        try {
+            WorkerRegistry.WorkerRecord worker = registry.getWorker(targetWorkerId)
+                    .orElseThrow(() -> new IllegalStateException("Target worker " + targetWorkerId + " not available"));
+            long fragmentStartMs = System.currentTimeMillis();
+            List<RowBatchData> batches = workerClient.executeFragment(worker, queryId, fragment);
+            long fragmentDurationMs = System.currentTimeMillis() - fragmentStartMs;
+            return new ExecutionOutcome(targetWorkerId, fragmentDurationMs, batches);
+        } finally {
+            fragmentTracker.release(targetWorkerId);
         }
-        WorkerRegistry.WorkerRecord worker = workerOpt.get();
-        long fragmentStartMs = System.currentTimeMillis();
-        List<RowBatchData> batches = workerClient.executeFragment(worker, queryId, fragment);
-        long fragmentDurationMs = System.currentTimeMillis() - fragmentStartMs;
-        return new ExecutionOutcome(targetWorkerId, fragmentDurationMs, batches);
     }
 
 
