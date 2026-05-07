@@ -27,6 +27,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -135,14 +136,19 @@ public final class WorkerGrpcServer {
         @Override
         public StreamObserver<ShardDataChunk> receiveShard(StreamObserver<ReceiveShardResponse> responseObserver) {
             return new StreamObserver<>() {
+                private final AtomicBoolean responseFinished = new AtomicBoolean(false);
                 private FileOutputStream outputStream;
                 private Path tempPath;
                 private Path finalPath;
                 private String tableName;
                 private int shardId;
+                private boolean receivedLast;
 
                 @Override
                 public void onNext(ShardDataChunk chunk) {
+                    if (responseFinished.get()) {
+                        return;
+                    }
                     try {
                         if (outputStream == null) {
                             tableName = chunk.getTableName();
@@ -157,34 +163,58 @@ public final class WorkerGrpcServer {
                             chunk.getData().writeTo(outputStream);
                         }
                         if (chunk.getIsLast()) {
+                            receivedLast = true;
                             outputStream.close();
                             outputStream = null;
                             Files.move(tempPath, finalPath, StandardCopyOption.ATOMIC_MOVE);
+                            tempPath = null;
                             LOG.info("Shard received and placed: {}", finalPath);
                         }
                     } catch (IOException e) {
                         LOG.error("Error writing shard chunk: {}", e.getMessage());
-                        cleanup();
-                        responseObserver.onError(Status.INTERNAL
-                                .withDescription("Failed to write shard: " + e.getMessage())
-                                .asRuntimeException());
+                        fail("Failed to write shard: " + e.getMessage(), e);
                     }
                 }
 
                 @Override
                 public void onError(Throwable t) {
                     LOG.warn("ReceiveShard stream error: {}", t.getMessage());
-                    cleanup();
+                    fail("Client stream failed: " + t.getMessage(), t);
                 }
 
                 @Override
                 public void onCompleted() {
-                    cleanup();
+                    if (responseFinished.get()) {
+                        return;
+                    }
+                    if (!receivedLast) {
+                        fail("Shard stream ended before final chunk", null);
+                        return;
+                    }
+                    succeed();
+                }
+
+                private void succeed() {
+                    if (!responseFinished.compareAndSet(false, true)) {
+                        return;
+                    }
                     responseObserver.onNext(ReceiveShardResponse.newBuilder()
                             .setAccepted(true)
                             .setMessage("Shard received: " + tableName + "_shard" + shardId)
                             .build());
                     responseObserver.onCompleted();
+                }
+
+                private void fail(String description, Throwable cause) {
+                    if (!responseFinished.compareAndSet(false, true)) {
+                        return;
+                    }
+                    cleanup();
+                    Status status = Status.INTERNAL.withDescription(description);
+                    if (cause != null) {
+                        status = status.withCause(cause);
+                    }
+                    responseObserver.onError(status.asRuntimeException());
                 }
 
                 private void cleanup() {
@@ -194,6 +224,12 @@ public final class WorkerGrpcServer {
                         } catch (IOException ignored) {}
                         outputStream = null;
                     }
+                    if (tempPath != null) {
+                        try {
+                            Files.deleteIfExists(tempPath);
+                        } catch (IOException ignored) {}
+                        tempPath = null;
+                    }
                 }
             };
         }
@@ -201,13 +237,18 @@ public final class WorkerGrpcServer {
         @Override
         public StreamObserver<ShardDataChunk> loadTempData(StreamObserver<LoadTempDataResponse> responseObserver) {
             return new StreamObserver<>() {
+                private final AtomicBoolean responseFinished = new AtomicBoolean(false);
                 private FileOutputStream outputStream;
                 private Path tempPath;
                 private String tableName;
                 private int shardId;
+                private boolean receivedLast;
 
                 @Override
                 public void onNext(ShardDataChunk chunk) {
+                    if (responseFinished.get()) {
+                        return;
+                    }
                     try {
                         if (outputStream == null) {
                             tableName = chunk.getTableName();
@@ -220,40 +261,62 @@ public final class WorkerGrpcServer {
                             chunk.getData().writeTo(outputStream);
                         }
                         if (chunk.getIsLast()) {
+                            receivedLast = true;
                             outputStream.close();
                             outputStream = null;
                         }
                     } catch (IOException e) {
                         LOG.error("Error writing temp data chunk: {}", e.getMessage());
-                        cleanup();
-                        responseObserver.onError(Status.INTERNAL
-                                .withDescription("Failed to write temp data: " + e.getMessage())
-                                .asRuntimeException());
+                        fail("Failed to write temp data: " + e.getMessage(), e);
                     }
                 }
 
                 @Override
                 public void onError(Throwable t) {
                     LOG.warn("LoadTempData stream error: {}", t.getMessage());
-                    cleanup();
+                    fail("Client stream failed: " + t.getMessage(), t);
                 }
 
                 @Override
                 public void onCompleted() {
-                    cleanup();
+                    if (responseFinished.get()) {
+                        return;
+                    }
+                    if (!receivedLast || tempPath == null) {
+                        fail("Temp data stream ended before final chunk", null);
+                        return;
+                    }
                     try {
                         String catalogName = tempShardCache.loadShard(tableName, shardId, tempPath);
-                        responseObserver.onNext(LoadTempDataResponse.newBuilder()
-                                .setAccepted(true)
-                                .setCatalogName(catalogName)
-                                .build());
-                        responseObserver.onCompleted();
+                        tempPath = null;
+                        succeed(catalogName);
                     } catch (Exception e) {
                         LOG.error("Failed to cache shard {}_shard{}: {}", tableName, shardId, e.getMessage());
-                        responseObserver.onError(Status.INTERNAL
-                                .withDescription("Failed to cache shard: " + e.getMessage())
-                                .asRuntimeException());
+                        fail("Failed to cache shard: " + e.getMessage(), e);
                     }
+                }
+
+                private void succeed(String catalogName) {
+                    if (!responseFinished.compareAndSet(false, true)) {
+                        return;
+                    }
+                    responseObserver.onNext(LoadTempDataResponse.newBuilder()
+                            .setAccepted(true)
+                            .setCatalogName(catalogName)
+                            .build());
+                    responseObserver.onCompleted();
+                }
+
+                private void fail(String description, Throwable cause) {
+                    if (!responseFinished.compareAndSet(false, true)) {
+                        return;
+                    }
+                    cleanup();
+                    Status status = Status.INTERNAL.withDescription(description);
+                    if (cause != null) {
+                        status = status.withCause(cause);
+                    }
+                    responseObserver.onError(status.asRuntimeException());
                 }
 
                 private void cleanup() {
@@ -262,6 +325,12 @@ public final class WorkerGrpcServer {
                             outputStream.close();
                         } catch (IOException ignored) {}
                         outputStream = null;
+                    }
+                    if (tempPath != null) {
+                        try {
+                            Files.deleteIfExists(tempPath);
+                        } catch (IOException ignored) {}
+                        tempPath = null;
                     }
                 }
             };

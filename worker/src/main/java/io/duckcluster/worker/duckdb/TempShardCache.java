@@ -40,6 +40,7 @@ public final class TempShardCache implements AutoCloseable {
         if (entries.containsKey(key)) {
             LOG.debug("Cache HIT: {}_shard{}", tableName, shardId);
             entries.get(key);
+            Files.deleteIfExists(tmpFile);
             return entries.get(key).catalogName();
         }
         LOG.debug("Cache MISS: {}_shard{}, loading...", tableName, shardId);
@@ -86,6 +87,7 @@ public final class TempShardCache implements AutoCloseable {
         }
         entries.remove(eldest.getKey());
         LOG.info("Evicted cached shard: {}", entry.catalogName());
+        notifyCoordinator();
     }
 
     private void notifyCoordinator() {
