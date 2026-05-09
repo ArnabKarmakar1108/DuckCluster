@@ -35,7 +35,8 @@ final class DuckDbMergeSupport {
                 connection.createStatement().execute("DROP TABLE IF EXISTS " + TEMP_TABLE);
             }
         } catch (SQLException e) {
-            throw new IllegalStateException("Failed to merge partial results in coordinator DuckDB", e);
+            throw new IllegalStateException(
+                    "Failed to merge partial results in coordinator DuckDB: " + e.getMessage(), e);
         }
     }
 
@@ -103,7 +104,8 @@ final class DuckDbMergeSupport {
                     if (i > 0) {
                         insert.append(", ");
                     }
-                    insert.append(toSqlLiteral(row.get(i)));
+                    String sqlType = columnType(analysis, columns.get(i));
+                    insert.append(toSqlLiteral(normalizeValue(row.get(i), sqlType)));
                 }
                 insert.append(")");
                 statement.execute(insert.toString());
@@ -132,14 +134,21 @@ final class DuckDbMergeSupport {
     }
 
     private static String columnType(QueryAnalysis analysis, String column) {
-        if (analysis.groupByColumns().contains(column)) {
-            return "VARCHAR";
+        if (!analysis.aggregates().isEmpty() && !analysis.groupByColumns().contains(column)) {
+            return "BIGINT";
         }
-        return "BIGINT";
+        return "VARCHAR";
     }
 
     private static String quote(String identifier) {
         return "\"" + identifier.replace("\"", "\"\"") + "\"";
+    }
+
+    private static Object normalizeValue(Object value, String sqlType) {
+        if ("BIGINT".equals(sqlType) && value instanceof String text && text.isEmpty()) {
+            return null;
+        }
+        return value;
     }
 
     private static String toSqlLiteral(Object value) {
