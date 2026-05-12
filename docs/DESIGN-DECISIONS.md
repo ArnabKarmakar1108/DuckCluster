@@ -278,43 +278,93 @@ QueryExecutionService.execute(sql)
         └── channelPool.getChannel(worker)  ← reused ManagedChannel
 ```
 
-Channels are removed from the pool when a worker is evicted by the `HeartbeatMonitor`, and all channels are shut down gracefully on coordinator shutdown.
+Channels are removed from the pool when:
+- A worker is evicted by the `HeartbeatMonitor` (missed heartbeats)
+- A worker **re-registers** with the same `workerId` (`registerWorker` calls `removeChannel` first, so a fast restart on a new port gets a fresh channel)
+
+All channels are shut down gracefully on coordinator shutdown.
+
+### Configuration
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| (none) | — | Channel pool has no dedicated env vars; lifecycle tied to worker registration |
 
 ---
 
-## 6. Fragment Rescheduling (3-Tier Fallback)
+## 6. Fragment Routing, Prefetch, and Waiting
 
 ### Problem
 
-The target worker for a fragment may be unavailable, overloaded, or may have lost its shard file. The system must route work to an available worker without failing the query.
+The target worker for a fragment may not own the shard, may be temporarily at capacity, or (for JOINs) broadcast data may not yet be local. The system must route work correctly without silent data loss.
 
 ### Decision
 
-A 3-tier resolution strategy determines where each fragment executes:
+Fragment routing is **split by query shape** (single-table vs JOIN). Prefetch always uses `ReadShard` → `LoadTempData` (temp cache, not permanent ownership). Prefetch failure **fails the query** (no log-and-continue).
+
+### Routing tiers
 
 ```
-For each fragment (driving table shard N):
+For each driving-table fragment (shard N):
     │
     ├── Tier 1: Ring owners (primary + replicas)
-    │   └── ring.getOwners(tableName:shardId, RF) → [worker-2, worker-3]
-    │       Pick first available worker in registry
+    │   └── ring.getOwners(table:N, RF) — first registered worker wins
     │
     ├── Tier 2: Workers with cached copy
-    │   └── shardCatalog.getCachedWorkers(table, shard) → [worker-1]
-    │       Workers that previously received this shard via TempShardCache
+    │   └── shardCatalog.getCachedWorkers(table, N)
+    │       (populated by TempShardCache → UpdateShardCache RPC)
     │
-    └── Tier 3: Any available worker (remote read fallback)
-        └── Stream shard file from a source to any idle worker:
-            ReadShard(source) → LoadTempData(target) → execute
+    └── Tier 3 (single-table queries only): Remote read fallback
+        └── Pick least-loaded registered worker, prefetch driving shard via LoadTempData
 ```
+
+**JOIN queries do not use Tier 3.** If no registered owner or cache holder exists for a driving shard, the coordinator **blocks up to `DUCKCLUSTER_FRAGMENT_WAIT_MS`** (polling every 100ms) for one to appear — e.g. after replication or worker registration. If the timeout expires, the query fails.
+
+**Single-table queries** use Tier 3 when Tiers 1–2 find no registered worker. The driving shard is streamed to the fallback worker before execution (same machinery as broadcast prefetch).
+
+### Prefetch phases
+
+| Query type | What gets prefetched | When |
+|------------|---------------------|------|
+| **JOIN** | All broadcast-table shards missing on each target worker | After target resolution, before dispatch |
+| **Single-table** | Driving shards missing on fallback (Tier 3) workers | After target resolution, before dispatch |
+
+Prefetch skips shards the target already owns (`actualOwnership`) or has cached (`shardCache`). Each missing shard is fetched in parallel via `CompletableFuture`.
+
+On prefetch failure (`loadTempData` returns false or gRPC error), the query throws `IllegalStateException` immediately.
+
+### Worker capacity waiting
+
+`WorkerFragmentTracker` limits concurrent fragments per worker to `numThreads` (from registration). Before dispatching a fragment, the coordinator calls `acquireBlocking(workerId, fragmentWaitMs)` — if the worker is at capacity, the query thread waits (same timeout as join worker resolution) rather than failing immediately.
+
+This applies to **all** queries, so a JOIN routed to a busy owner waits for a free slot.
+
+### TempShardCache and coordinator cache consistency
+
+When a shard is streamed via `LoadTempData`, it lands in the worker's LRU `TempShardCache` (`.cache/` directory, invisible to `ShardFileWatcher`). The worker notifies the coordinator via `UpdateShardCache` (full-replace semantics).
+
+**On LRU eviction**, the worker also calls `notifyCoordinator()` so the coordinator drops the evicted entry. Without this, `getCachedWorkers()` would stay stale and prefetch would be skipped incorrectly.
+
+On cache hit during `loadShard`, the incoming temp file is deleted to avoid leaking orphan files.
+
+### gRPC streaming correctness
+
+`ReceiveShard` and `LoadTempData` handlers require a chunk with `is_last=true` before accepting success. Inbound stream errors complete the response observer with `INTERNAL`; partial temp files are cleaned up. This prevents false `accepted=true` responses after write failures.
 
 ### Why resolve before dispatch?
 
-Target resolution happens in a separate phase (`resolveFragmentTargets`) before any fragment is dispatched. This enables the prefetch optimization for JOINs — we know which workers will execute fragments before we start moving broadcast data.
+Target resolution happens in `resolveFragmentTargets()` before prefetch and dispatch. This lets the coordinator know which workers need broadcast or driving shards streamed before fragments run.
 
-### TempShardCache persistence
+### Execution-time retry
 
-When a shard is streamed to a non-owner via Tier 3 (or broadcast prefetch), it's stored in the worker's `TempShardCache` — an LRU cache of shard files attached as READ_ONLY catalogs. Subsequent queries find these cached copies via Tier 2, avoiding repeated transfers. The cache notifies the coordinator via `UpdateShardCache` RPC so the coordinator's `ShardCatalog.shardCache` map stays current.
+If a fragment fails on the chosen worker with a retryable gRPC status (`RESOURCE_EXHAUSTED`, `FAILED_PRECONDITION`, `UNAVAILABLE`, `DEADLINE_EXCEEDED`), the coordinator tries the next candidate in order:
+
+1. Preferred worker from initial resolution
+2. Ring owners and actual owners (registered)
+3. Cached workers (registered)
+4. Other registered workers (single-table queries only)
+
+Before each attempt, missing driving shards (and broadcast shards on JOINs) are prefetched to the target worker. Non-retryable errors fail immediately.
 
 ---
 
@@ -351,15 +401,18 @@ Query: SELECT ... FROM lineitem(6 shards) l JOIN orders(4 shards) o ON ...
 2. RESOLVE TARGETS
    └── For each of the 6 fragments, pick a worker owning that lineitem shard
 
-3. PREFETCH
+3. PREFETCH (broadcast only — driving shards assumed local on owner/cache)
    ├── For each unique target worker:
    │   ├── Does it already own orders_shard0? Skip.
    │   ├── Does it have orders_shard0 cached? Skip.
-   │   └── Otherwise: stream from source via ReadShard → LoadTempData
+   │   └── Otherwise: stream from source via ReadShard → LoadTempData (fail query on error)
    └── All missing shards fetched in parallel (CompletableFuture)
 
+3b. WAIT (if no owner/cache registered for a driving shard)
+   └── Block up to DUCKCLUSTER_FRAGMENT_WAIT_MS for replication/registration
+
 4. DISPATCH
-   └── Send 6 fragments to resolved workers (all broadcast data now local)
+   └── Acquire worker capacity slot, send fragments (parallel)
 
 5. MERGE
    └── Standard merge strategy (GROUP_BY_MERGE, PARTIAL_AGG, etc.)
@@ -498,6 +551,27 @@ Uses DuckDB's built-in `hash()` function for deterministic partitioning.
 
 ---
 
+## 10. Distributed Merge Correctness
+
+### AVG
+
+`AVG(col)` is decomposed at the fragment into `SUM(col)` + `COUNT(col)` partial aggregates. The coordinator merge computes `SUM(partial_sums) / SUM(partial_counts)` — never `AVG(partial_avgs)`.
+
+### TOP_K
+
+Queries with `ORDER BY` and/or `LIMIT` (and no `GROUP BY`/bare aggregates) use `TOP_K` merge strategy. Each fragment runs local `ORDER BY ... LIMIT K`; the coordinator loads partial rows into DuckDB and applies a global `ORDER BY ... LIMIT K`.
+
+### Supported merge strategies
+
+| Strategy | When | Merge |
+|----------|------|-------|
+| `CONCATENATE` | Simple `SELECT` | Row append |
+| `PARTIAL_AGG` | Aggregates without `GROUP BY` | Sum/count/min/max merge |
+| `GROUP_BY_MERGE` | `GROUP BY` + aggregates | Re-group and merge partials |
+| `TOP_K` | `ORDER BY` / `LIMIT` | Global sort + limit |
+
+---
+
 ## Summary of all configuration flags
 
 | Variable | Default | Component | Purpose |
@@ -514,3 +588,5 @@ Uses DuckDB's built-in `hash()` function for deterministic partitioning.
 | `DUCKCLUSTER_REPLICATION_FACTOR` | `2` | Coordinator | Target replicas |
 | `DUCKCLUSTER_VNODES_PER_WORKER` | `100` | All | Hash ring resolution |
 | `DUCKCLUSTER_WATCHER_INTERVAL_MS` | `2000` | Worker | File watcher poll rate |
+| `DUCKCLUSTER_CACHE_MAX_SHARDS` | `5` | Worker | TempShardCache LRU capacity |
+| `DUCKCLUSTER_FRAGMENT_WAIT_MS` | `60000` | Coordinator | Max wait for owner/cache worker or worker capacity slot |
