@@ -1,0 +1,10 @@
+# columns: id,name,score,category
+1	event-1	10	B
+2	event-2	20	C
+3	event-3	30	A
+4	event-4	40	B
+5	event-5	50	C
+6	event-6	60	A
+7	event-7	70	B
+8	event-8	80	C
+9	event-9	90	A

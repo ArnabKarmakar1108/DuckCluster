@@ -1,0 +1,38 @@
+scenarios:
+  - id: select_all
+    description: Full table scan returns all demo rows
+    query: queries/correctness/select_all.sql
+    tags: [smoke, correctness]
+
+  - id: group_by_count
+    description: GROUP BY category counts match baseline
+    query: queries/correctness/group_by_count.sql
+    tags: [correctness, aggregate]
+
+  - id: partial_agg
+    description: Partial aggregate SUM/COUNT across shards
+    query: queries/correctness/partial_agg.sql
+    tags: [correctness, aggregate]
+
+  - id: avg_score
+    description: Weighted AVG merge across shards
+    query: queries/correctness/avg_score.sql
+    tags: [correctness, aggregate]
+
+  - id: top_k
+    description: ORDER BY score DESC LIMIT 3
+    query: queries/correctness/top_k.sql
+    tags: [correctness, top_k]
+
+  - id: filter_pushdown
+    description: WHERE predicate pushed to fragments
+    query: queries/correctness/filter_pushdown.sql
+    tags: [correctness]
+
+  - id: pool_exhaustion_retry
+    description: Concurrent queries succeed when primary worker pool is saturated
+    query: queries/correctness/group_by_count.sql
+    tags: [resilience, pool]
+    concurrent_requests: 12
+    pool_size: 1
+    pool_wait_ms: 100

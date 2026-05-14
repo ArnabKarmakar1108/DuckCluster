@@ -9,3 +9,8 @@ target/
 logs/
 pids/
 docs/PROPOSAL-*.md
+/data/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
