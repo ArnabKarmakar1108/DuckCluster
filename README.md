@@ -4,24 +4,6 @@ A **distributed SQL query coordinator** for analytical workloads. Clients submit
 
 Built in Java 17 as a multi-module Maven project.
 
----
-
-## Status
-
-| Phase | Focus | Status |
-|-------|--------|--------|
-| **0** | Foundation — gRPC, worker registry, REST health, Calcite skeleton | Done |
-| **1** | Scan fan-out — `POST /v1/query`, fragment execution, concatenate merge | Done |
-| **2** | Pushdown + aggregation — filter/project pushdown, two-phase GROUP BY & partial agg | Done |
-| **3** | ORDER BY + LIMIT — top-K merge across shards | Done |
-| **A** | Connection pool — bounded DuckDB pool per worker, file-backed databases | Done |
-| **B** | Data locality — consistent hash ring, shard catalog, replication factor | Done |
-| **C** | Shard file watcher — dynamic discovery, ATTACH/DETACH, replication streaming | Done |
-| **D** | Data ingestion tooling — split-and-distribute script, online rebalance, heartbeat monitor | Done |
-| **E** | Parallel dispatch, persistent gRPC channels, 3-tier rescheduling, remote read fallback | Done |
-| **F** | JOIN support — dynamic table discovery, broadcast shuffle joins, coordinator prefetch | Done |
-| **G+** | Benchmarking, dashboard, Arrow transfer | Planned |
-
 For design details, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/DESIGN-DECISIONS.md`](docs/DESIGN-DECISIONS.md).
 
 ---
@@ -58,7 +40,7 @@ Coordinator merges partial results (embedded DuckDB)
 | `CONCATENATE` | `SELECT *`, filters | Return matching rows | Append batches |
 | `PARTIAL_AGG` | `SELECT COUNT(*), SUM(x)` | Partial aggregates | Re-aggregate in DuckDB |
 | `GROUP_BY_MERGE` | `SELECT k, COUNT(*) … GROUP BY k` | Partial grouped rows | Final `GROUP BY` in DuckDB |
-| `TOP_K` | `ORDER BY … LIMIT n` | Local top-K per shard | Global sort + limit *(Phase 3)* |
+| `TOP_K` | `ORDER BY … LIMIT n` | Local top-K per shard | Global sort + limit |
 
 ---
 
@@ -68,7 +50,9 @@ Coordinator merges partial results (embedded DuckDB)
 
 - Java 17+
 - Maven 3.8+
+- Python 3.10+ (integration tests)
 - `curl` (and optionally `python3` for pretty JSON)
+- `duckdb` CLI recommended for `start-cluster.sh` (Python `duckdb` package is enough for integration tests)
 
 ### Build
 
@@ -82,7 +66,13 @@ mvn clean package
 ./scripts/start-cluster.sh
 ```
 
-This builds the project, splits demo data into shard files distributed across worker data directories, then starts one coordinator (HTTP `8080`, gRPC `9090`) and three workers (`9101`-`9103`). Requires `duckdb` CLI on PATH for shard file creation.
+This builds the project, splits the bundled sample CSV into shard files, and starts one coordinator (HTTP `8080`, gRPC `9090`) and three workers (`9101`–`9103`).
+
+The default source file is `tests/integration/data/demo-events.csv` (10 rows). Override with:
+
+```bash
+DUCKCLUSTER_DEMO_CSV=/path/to/events.csv ./scripts/start-cluster.sh
+```
 
 ### Submit a query
 
@@ -96,11 +86,6 @@ curl -s -X POST http://127.0.0.1:8080/v1/query \
 curl -s -X POST http://127.0.0.1:8080/v1/query \
   -H 'Content-Type: application/json' \
   -d '{"sql":"SELECT category, COUNT(*) AS cnt FROM events GROUP BY category"}' | python3 -m json.tool
-
-# JOIN across independently-sharded tables (broadcast shuffle)
-curl -s -X POST http://127.0.0.1:8080/v1/query \
-  -H 'Content-Type: application/json' \
-  -d '{"sql":"SELECT c.c_name, SUM(l.l_extendedprice) FROM lineitem l JOIN customer c ON l.l_custkey = c.c_custkey GROUP BY c.c_name"}' | python3 -m json.tool
 ```
 
 ### Cluster health
@@ -112,11 +97,47 @@ curl -s http://127.0.0.1:8080/v1/cluster/workers
 
 ### Integration tests
 
+Integration tests live under `tests/integration/`. They start ephemeral clusters, shard the source CSV automatically, and compare distributed results against a single-node DuckDB baseline.
+
 ```bash
-mvn clean test package
-./scripts/test-phase1.sh   # scan fan-out
-./scripts/test-phase2.sh   # GROUP BY + partial aggregation
+# First-time setup: creates a venv and installs pytest + duckdb
+./scripts/run-integration-tests.sh
 ```
+
+**Options** (passed through to pytest):
+
+```bash
+# Default — bundled 10-row sample CSV (tests/integration/data/demo-events.csv)
+./scripts/run-integration-tests.sh
+
+# Larger synthetic dataset
+./scripts/run-integration-tests.sh --demo-rows 1000
+
+# Custom CSV
+./scripts/run-integration-tests.sh --demo-csv /path/to/events.csv
+```
+
+**Manual shard setup** (optional — tests shard data themselves, but you can pre-split for exploration):
+
+```bash
+mkdir -p data/worker-{1,2,3}
+./scripts/split-and-distribute.sh \
+  --source tests/integration/data/demo-events.csv \
+  --table events \
+  --key id \
+  --shards 6 \
+  --workers worker-1,worker-2,worker-3 \
+  --dirs data/worker-1,data/worker-2,data/worker-3 \
+  --rf 2
+```
+
+Unit tests only:
+
+```bash
+mvn test
+```
+
+See [`tests/integration/README.md`](tests/integration/README.md) for harness layout and scenario details.
 
 ---
 
@@ -183,6 +204,7 @@ DuckCluster/
 ├── coordinator/     # REST API, query execution, shard catalog, replication
 ├── worker/          # gRPC server, DuckDB pool, shard manager, file watcher
 ├── scripts/         # start-cluster.sh, split-and-distribute.sh, test helpers
+├── tests/integration/  # Pytest harness + bundled sample CSV
 └── docs/
     ├── ARCHITECTURE.md
     └── DESIGN-DECISIONS.md
@@ -210,29 +232,11 @@ java -jar worker/target/duckcluster-worker-0.1.0-SNAPSHOT.jar worker-1 127.0.0.1
 | Worker OLAP | DuckDB JDBC |
 | RPC | gRPC + Protobuf |
 | Merge engine | Embedded DuckDB on coordinator |
-| Tests | JUnit 5 |
+| Tests | JUnit 5 (unit), pytest (integration) |
 
 ---
 
-## Roadmap
-
-### Completed phases
-
-**Phase 0-3** — Foundation, scan fan-out, pushdown + aggregation, ORDER BY + LIMIT. Full distributed SQL execution with filter/project/aggregate pushdown, two-phase GROUP BY, and top-K merge.
-
-**Phase A** — Bounded connection pool per worker over file-backed DuckDB.
-
-**Phase B** — Consistent hash ring, shard catalog, replication-factor-aware routing.
-
-**Phase C** — Dynamic shard discovery via file watcher, ATTACH/DETACH, file-level replication streaming between workers.
-
-**Phase D** — Data ingestion tooling (`split-and-distribute.sh`), heartbeat monitor, online rebalance on topology changes.
-
-**Phase E** — Parallel fragment dispatch via `CompletableFuture` + cached thread pool, persistent gRPC channel pool (one channel per worker, reused across queries), 3-tier fragment rescheduling (ring owners → cached copies → remote read fallback).
-
-**Phase F** — JOIN support with dynamic table discovery. All tables are sharded independently; the coordinator classifies tables at query time (driving vs broadcast), generates UNION ALL fragment SQL for broadcast tables, prefetches missing shards to target workers before dispatch. No placement restrictions — any join combination works.
-
-### Upcoming
+## Upcoming
 
 | Phase | Focus |
 |-------|--------|
@@ -244,21 +248,26 @@ java -jar worker/target/duckcluster-worker-0.1.0-SNAPSHOT.jar worker-1 127.0.0.1
 
 ## Demo data
 
-`start-cluster.sh` uses `split-and-distribute.sh` to create `.duckdb` shard files from a CSV source and places them in per-worker data directories. Workers discover these at startup via their `ShardFileWatcher` and ATTACH them automatically.
+`tests/integration/data/demo-events.csv` is a committed 10-row sample (`id`, `name`, `score`, `category`).
+`start-cluster.sh` and the integration harness use it by default. `split-and-distribute.sh` turns it into
+per-worker `.duckdb` shard files; workers discover and ATTACH them via `ShardFileWatcher`.
 
 ---
 
 ## Development
 
 ```bash
-# Run all unit tests
+# Unit tests
 mvn test
 
-# Build shaded JARs for coordinator and worker
+# Integration tests (see Integration tests section above)
+./scripts/run-integration-tests.sh
+
+# Build shaded JARs
 mvn clean package -DskipTests
 ```
 
-**SQL parsing notes:** Calcite treats some identifiers as reserved words (`value`, `count`). Quote them in SQL (`"value"`) or use unambiguous column names in queries.
+**SQL parsing notes:** Calcite treats some identifiers as reserved words (`value`, `count`). Use unambiguous column names (e.g. `score` instead of `value`) or quote identifiers where needed.
 
 ---
 

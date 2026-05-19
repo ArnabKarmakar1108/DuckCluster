@@ -33,22 +33,11 @@ COORDINATOR_JAR="$ROOT/coordinator/target/duckcluster-coordinator-0.1.0-SNAPSHOT
 WORKER_JAR="$ROOT/worker/target/duckcluster-worker-0.1.0-SNAPSHOT.jar"
 
 # Prepare demo data as shard files (replaces WorkerDemoDataLoader)
-DEMO_SOURCE="$ROOT/data/demo-events.csv"
+DEMO_SOURCE="${DUCKCLUSTER_DEMO_CSV:-$ROOT/tests/integration/data/demo-events.csv}"
 if [[ ! -f "$DEMO_SOURCE" ]]; then
-  echo "Generating demo data CSV..."
-  mkdir -p "$DATA_BASE"
-  cat > "$DEMO_SOURCE" <<'CSV'
-id,name,value,category
-1,event-1,10,B
-2,event-2,20,C
-3,event-3,30,A
-4,event-4,40,B
-5,event-5,50,C
-6,event-6,60,A
-7,event-7,70,B
-8,event-8,80,C
-9,event-9,90,A
-CSV
+  echo "ERROR: Demo CSV not found at $DEMO_SOURCE"
+  echo "  Set DUCKCLUSTER_DEMO_CSV or add tests/integration/data/demo-events.csv"
+  exit 1
 fi
 
 # Set up per-worker data directories
