@@ -50,8 +50,8 @@ for id in "${WORKER_IDS[@]}"; do
 done
 
 # Split and distribute demo data to worker directories
+echo "Splitting demo data into shards..."
 if command -v duckdb &>/dev/null; then
-  echo "Splitting demo data into shards..."
   "$ROOT/scripts/split-and-distribute.sh" \
       --source "$DEMO_SOURCE" \
       --table events \
@@ -61,9 +61,16 @@ if command -v duckdb &>/dev/null; then
       --dirs "$WORKER_DIRS" \
       --rf "$DUCKCLUSTER_REPLICATION_FACTOR"
 else
-  echo "ERROR: duckdb CLI not found in PATH. Install it to create shard files."
-  echo "  See: https://duckdb.org/docs/installation"
-  exit 1
+  PYTHON_DUCKDB="$("$ROOT/scripts/ensure-python-duckdb.sh")"
+  echo "Note: duckdb CLI not found; using Python duckdb package"
+  "$PYTHON_DUCKDB" "$ROOT/scripts/prepare-demo-shards.py" \
+      --source "$DEMO_SOURCE" \
+      --table events \
+      --key id \
+      --shards "$DUCKCLUSTER_SHARD_COUNT" \
+      --workers "$(IFS=,; echo "${WORKER_IDS[*]}")" \
+      --dirs "$WORKER_DIRS" \
+      --rf "$DUCKCLUSTER_REPLICATION_FACTOR"
 fi
 
 echo "Starting coordinator..."
