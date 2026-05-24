@@ -11,6 +11,9 @@ Pytest harness for distributed correctness, resilience, replication, and topolog
 # Larger synthetic dataset (1000 rows, generated at cluster startup)
 ./scripts/run-integration-tests.sh --demo-rows 1000
 
+# TPC-H correctness (SF0.01; generates benchmark data on first run)
+./scripts/run-integration-tests.sh -m tpch
+
 # Custom CSV file
 ./scripts/run-integration-tests.sh --demo-csv /path/to/events.csv
 ```
@@ -50,6 +53,7 @@ tests/integration/
 ├── data/demo-events.csv       # Bundled 10-row sample (committed)
 ├── manifest.yaml              # Correctness scenario catalog
 ├── queries/                   # SQL under test
-├── duckcluster/               # Cluster helpers, baseline, compare
+│   └── tpch/                  # TPC-H Q01–Q22 (from benchmark resources)
+├── duckcluster/               # Cluster helpers, baseline, compare, tpch
 └── test_*.py                  # Scenario tests (see per-test docstrings)
 ```

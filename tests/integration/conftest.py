@@ -81,3 +81,7 @@ def demo_csv(cluster_manager: ClusterManager) -> Path:
 @pytest.fixture(scope="session")
 def with_cluster_config(cluster_config: ClusterConfig):
     return lambda **overrides: with_cluster(cluster_config, **overrides)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "tpch: TPC-H benchmark query integration tests")

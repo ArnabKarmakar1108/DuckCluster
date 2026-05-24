@@ -33,9 +33,10 @@ class ClusterConfig:
     heartbeat_interval_sec: int = 2
     heartbeat_miss_threshold: int = 3
     watcher_interval_ms: int = 1000
-    data_mode: Literal["distributed", "primary_only_shard0", "empty"] = "distributed"
+    data_mode: Literal["distributed", "primary_only_shard0", "empty", "tpch"] = "distributed"
     demo_csv: Path | None = None
     demo_row_count: int | None = None
+    tpch_data_dir: Path | None = None
     skip_build: bool = False
 
     @property
@@ -138,7 +139,6 @@ class ClusterManager:
         ClusterManager._jars_built = True
 
     def _prepare_data(self) -> None:
-        demo_source = self._ensure_demo_csv()
         worker_dirs = [str(self.config.data_base / worker_id) for worker_id in self.config.worker_ids]
         for worker_dir in worker_dirs:
             path = Path(worker_dir)
@@ -148,6 +148,12 @@ class ClusterManager:
 
         if self.config.data_mode == "empty":
             return
+
+        if self.config.data_mode == "tpch":
+            self._prepare_tpch_data(worker_dirs)
+            return
+
+        demo_source = self._ensure_demo_csv()
 
         if self.config.data_mode == "primary_only_shard0":
             self._prepare_primary_only_shard0(demo_source, worker_dirs)
@@ -252,6 +258,21 @@ class ClusterManager:
                 worker_index = self.config.worker_ids.index(worker_id)
                 target = Path(worker_dirs[worker_index]) / f"{shard_key}.duckdb"
                 target.write_bytes(shard_path.read_bytes())
+
+    def _prepare_tpch_data(self, worker_dirs: list[str]) -> None:
+        if self.config.tpch_data_dir is None:
+            raise ValueError("tpch_data_dir is required when data_mode='tpch'")
+        source_workers = self.config.tpch_data_dir / "workers"
+        if not source_workers.is_dir():
+            raise FileNotFoundError(f"TPC-H worker data not found: {source_workers}")
+
+        for worker_id, worker_dir in zip(self.config.worker_ids, worker_dirs, strict=True):
+            source_dir = source_workers / worker_id
+            if not source_dir.is_dir():
+                raise FileNotFoundError(f"TPC-H data missing for {worker_id}: {source_dir}")
+            target_dir = Path(worker_dir)
+            for shard_file in source_dir.glob("*.duckdb"):
+                shutil.copy2(shard_file, target_dir / shard_file.name)
 
     def _base_env(self) -> dict[str, str]:
         env = os.environ.copy()

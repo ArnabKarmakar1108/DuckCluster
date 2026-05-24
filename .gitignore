@@ -10,6 +10,8 @@ logs/
 pids/
 docs/PROPOSAL-*.md
 /data/
+benchmark/data/
+benchmark/results/
 .venv/
 __pycache__/
 *.py[cod]
