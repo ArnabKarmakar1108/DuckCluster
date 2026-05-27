@@ -5,6 +5,7 @@ import io.duckcluster.common.model.ClusterCatalog;
 import io.duckcluster.common.model.FragmentSpec;
 import io.duckcluster.common.model.MergeStrategyType;
 import io.duckcluster.common.model.PlannedQuery;
+import io.duckcluster.common.model.NestedDerivedTableSpec;
 import io.duckcluster.common.model.QueryAnalysis;
 import io.duckcluster.common.model.TableShardConfig;
 import io.duckcluster.common.model.TopKSpec;
@@ -24,9 +25,10 @@ import org.apache.calcite.sql.validate.SqlConformanceEnum;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 public final class CalciteQueryPlanner implements QueryPlanner {
@@ -38,6 +40,11 @@ public final class CalciteQueryPlanner implements QueryPlanner {
     public PlannedQuery plan(String sql, ClusterCatalog catalog) {
         SqlNode parsed = parse(sql);
         SqlSelect select = asSelect(parsed);
+
+        Optional<NestedDerivedTableDetector.Match> nested = NestedDerivedTableDetector.detect(select, parsed);
+        if (nested.isPresent()) {
+            return planNestedDerivedTable(sql, parsed, nested.get(), catalog);
+        }
 
         TableClassification classification = classifyTables(select, catalog);
         int shardCount = classification.shardCount();
@@ -64,13 +71,65 @@ public final class CalciteQueryPlanner implements QueryPlanner {
                 fragments, mergeStrategy, analysis, List.of(), topK);
     }
 
+    private PlannedQuery planNestedDerivedTable(
+            String sql,
+            SqlNode parsed,
+            NestedDerivedTableDetector.Match nested,
+            ClusterCatalog catalog) {
+        SqlSelect innerSelect = nested.innerSelect();
+
+        TableClassification classification = classifyTables(innerSelect, catalog);
+        int shardCount = classification.shardCount();
+
+        QueryAnalysis innerAnalysis = QueryAnalysisExtractor.withMergeColumnNames(
+                QueryAnalysisExtractor.extract(innerSelect, MergeStrategyType.GROUP_BY_MERGE));
+        QueryAnalysis outerAnalysis = QueryAnalysisExtractor.withMergeColumnNames(
+                QueryAnalysisExtractor.extract(asSelect(parsed), MergeStrategyType.GROUP_BY_MERGE));
+
+        String drivingTable = classification.drivingTable();
+        Map<String, Integer> broadcastShardCounts = new HashMap<>();
+        for (BroadcastTable bt : classification.broadcastTables()) {
+            broadcastShardCounts.put(bt.tableName().toLowerCase(), bt.shardCount());
+        }
+
+        MergeStrategyType mergeStrategy = MergeStrategyType.NESTED_GROUP_BY_MERGE;
+        NestedDerivedTableSpec nestedSpec = new NestedDerivedTableSpec(
+                outerAnalysis, derivedColumnNames(nested, innerAnalysis), nested.outerTopK());
+
+        List<FragmentSpec> fragments = new ArrayList<>(shardCount);
+        for (int shardId = 0; shardId < shardCount; shardId++) {
+            String fragmentSql = FragmentSqlGenerator.generate(
+                    innerSelect, shardId, innerAnalysis, drivingTable, broadcastShardCounts, TopKSpec.none());
+            fragments.add(new FragmentSpec(shardId, shardId, fragmentSql, mergeStrategy));
+        }
+
+        return new PlannedQuery(sql, List.of(drivingTable), classification.broadcastTables(),
+                fragments, mergeStrategy, innerAnalysis, List.of(), TopKSpec.none(), nestedSpec);
+    }
+
+    private static List<String> derivedColumnNames(
+            NestedDerivedTableDetector.Match nested, QueryAnalysis innerAnalysis) {
+        if (!nested.derivedColumnNames().isEmpty()) {
+            return nested.derivedColumnNames();
+        }
+        return innerAnalysis.outputColumnNames();
+    }
+
     public SqlNode parse(String sql) {
-        SqlParser parser = SqlParser.create(sql, PARSER_CONFIG);
+        SqlParser parser = SqlParser.create(stripTrailingSemicolon(sql), PARSER_CONFIG);
         try {
             return parser.parseStmt();
         } catch (SqlParseException e) {
             throw new IllegalArgumentException("Invalid SQL: " + e.getMessage(), e);
         }
+    }
+
+    private static String stripTrailingSemicolon(String sql) {
+        String trimmed = sql.strip();
+        if (trimmed.endsWith(";")) {
+            return trimmed.substring(0, trimmed.length() - 1).strip();
+        }
+        return trimmed;
     }
 
     public MergeStrategyType detectMergeStrategy(SqlNode parsed) {
@@ -104,7 +163,7 @@ public final class CalciteQueryPlanner implements QueryPlanner {
         int maxShards = catalog.table(drivingTable).shardCount();
         for (String t : allTables) {
             int count = catalog.table(t).shardCount();
-            if (count > maxShards) {
+            if (count >= maxShards) {
                 drivingTable = t;
                 maxShards = count;
             }
@@ -121,15 +180,20 @@ public final class CalciteQueryPlanner implements QueryPlanner {
     }
 
     static List<String> collectTableNames(SqlNode from) {
-        List<String> tables = new ArrayList<>();
+        Set<String> tables = new LinkedHashSet<>();
         collectTableNamesRecursive(from, tables);
-        return tables;
+        return List.copyOf(tables);
     }
 
-    private static void collectTableNamesRecursive(SqlNode node, List<String> tables) {
-        if (node instanceof SqlIdentifier identifier) {
-            if (identifier.names.size() == 1) {
-                tables.add(identifier.getSimple());
+    private static void collectTableNamesRecursive(SqlNode node, Set<String> tables) {
+        String tableName = TableNameSupport.baseTableName(node);
+        if (tableName != null) {
+            tables.add(tableName);
+            return;
+        }
+        if (node instanceof SqlSelect select) {
+            if (select.getFrom() != null) {
+                collectTableNamesRecursive(select.getFrom(), tables);
             }
         } else if (node instanceof SqlJoin join) {
             collectTableNamesRecursive(join.getLeft(), tables);

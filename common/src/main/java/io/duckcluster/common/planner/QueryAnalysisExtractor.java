@@ -60,12 +60,14 @@ public final class QueryAnalysisExtractor {
                         mergeColumnName(mergeIndex) + "_sum",
                         aggregate.function(),
                         aggregate.inputColumn(),
+                        aggregate.inputExpression(),
                         AggregateSpec.AggregatePart.AVG_SUM));
                 rewritten.add(new AggregateSpec(
                         count.outputName(),
                         mergeColumnName(mergeIndex) + "_cnt",
                         count.function(),
                         count.inputColumn(),
+                        count.inputExpression(),
                         AggregateSpec.AggregatePart.AVG_COUNT));
                 mergeIndex++;
                 i += 2;
@@ -75,6 +77,7 @@ public final class QueryAnalysisExtractor {
                         mergeColumnName(mergeIndex),
                         aggregate.function(),
                         aggregate.inputColumn(),
+                        aggregate.inputExpression(),
                         aggregate.part()));
                 mergeIndex++;
                 i++;
@@ -101,53 +104,59 @@ public final class QueryAnalysisExtractor {
     private static List<AggregateSpec> toAggregateSpecs(SqlNode item, int index) {
         SqlCall call = (SqlCall) AggregateSqlSupport.unwrapAlias(item);
         AggregateFunction function = AggregateSqlSupport.toAggregateFunction(call);
-        String inputColumn = extractInputColumn(call);
-        String outputName = outputName(item, function, inputColumn, index);
+        AggregateOperand operand = extractAggregateOperand(call);
+        String outputName = outputName(item, function, operand, index);
         if (function == AggregateFunction.AVG) {
             return List.of(
                     new AggregateSpec(
                             outputName,
                             mergeColumnName(index) + "_sum",
                             AggregateFunction.SUM,
-                            inputColumn,
+                            operand.inputColumn(),
+                            operand.inputExpression(),
                             AggregateSpec.AggregatePart.AVG_SUM),
                     new AggregateSpec(
                             outputName,
                             mergeColumnName(index) + "_cnt",
                             AggregateFunction.COUNT,
-                            inputColumn,
+                            operand.inputColumn(),
+                            operand.inputExpression(),
                             AggregateSpec.AggregatePart.AVG_COUNT));
         }
-        return List.of(new AggregateSpec(outputName, mergeColumnName(index), function, inputColumn));
+        return List.of(new AggregateSpec(
+                outputName,
+                mergeColumnName(index),
+                function,
+                operand.inputColumn(),
+                operand.inputExpression()));
     }
 
-    private static SqlNode unwrapAlias(SqlNode item) {
-        return AggregateSqlSupport.unwrapAlias(item);
-    }
-
-    private static String extractInputColumn(SqlCall call) {
+    private static AggregateOperand extractAggregateOperand(SqlCall call) {
         if (call.getOperandList().isEmpty()) {
-            return null;
+            return new AggregateOperand(null, null);
         }
         SqlNode operand = call.operand(0);
         if (operand instanceof SqlIdentifier identifier && identifier.isStar()) {
-            return null;
+            return new AggregateOperand(null, null);
         }
-        return columnName(operand);
+        if (operand instanceof SqlIdentifier identifier) {
+            return new AggregateOperand(columnNameFromIdentifier(identifier), null);
+        }
+        return new AggregateOperand(null, operand);
     }
 
-    private static String outputName(SqlNode item, AggregateFunction function, String inputColumn, int index) {
+    private static String outputName(SqlNode item, AggregateFunction function, AggregateOperand operand, int index) {
         if (item instanceof SqlBasicCall call && call.getOperator().getKind() == SqlKind.AS) {
             SqlNode aliasNode = call.operand(1);
             if (aliasNode instanceof SqlIdentifier alias) {
                 return alias.getSimple();
             }
         }
-        if (function == AggregateFunction.COUNT && inputColumn == null) {
+        if (function == AggregateFunction.COUNT && operand.inputColumn() == null && operand.inputExpression() == null) {
             return "count";
         }
-        if (inputColumn != null) {
-            return function.name().toLowerCase() + "_" + inputColumn;
+        if (operand.inputColumn() != null) {
+            return function.name().toLowerCase() + "_" + operand.inputColumn();
         }
         return function.name().toLowerCase() + "_" + index;
     }
@@ -164,13 +173,19 @@ public final class QueryAnalysisExtractor {
 
     private static String columnName(SqlNode node) {
         if (node instanceof SqlIdentifier identifier) {
-            List<String> names = identifier.names;
-            return names.get(names.size() - 1);
+            return columnNameFromIdentifier(identifier);
         }
         throw new IllegalArgumentException("Expected column identifier but found: " + node);
+    }
+
+    private static String columnNameFromIdentifier(SqlIdentifier identifier) {
+        List<String> names = identifier.names;
+        return names.get(names.size() - 1);
     }
 
     private static boolean isAggregate(SqlNode node) {
         return AggregateSqlSupport.isAggregateExpression(node);
     }
+
+    private record AggregateOperand(String inputColumn, SqlNode inputExpression) {}
 }

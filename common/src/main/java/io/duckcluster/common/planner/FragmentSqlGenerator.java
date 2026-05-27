@@ -41,7 +41,9 @@ public final class FragmentSqlGenerator {
             fragmentSelect.setSelectList(rewriteAggregates(select.getSelectList(), analysis.aggregates()));
         }
 
-        return appendTopK(toSql(fragmentSelect), topK);
+        // Partial shard GROUP BY results are merged globally; ORDER BY/LIMIT belong on the coordinator.
+        TopKSpec fragmentTopK = analysis.groupByColumns().isEmpty() ? topK : TopKSpec.none();
+        return appendTopK(toSql(fragmentSelect), fragmentTopK);
     }
 
     private static String appendTopK(String sql, TopKSpec topK) {
@@ -77,6 +79,9 @@ public final class FragmentSqlGenerator {
         if (from instanceof SqlIdentifier identifier) {
             return rewriteTableIdentifier(identifier, shardId, drivingTable, broadcastShardCounts);
         }
+        if (from instanceof SqlSelect subquery) {
+            return rewriteSelectFrom(subquery, shardId, drivingTable, broadcastShardCounts);
+        }
         if (from instanceof SqlJoin join) {
             SqlNode left = rewriteFrom(join.getLeft(), shardId, drivingTable, broadcastShardCounts);
             SqlNode right = rewriteFrom(join.getRight(), shardId, drivingTable, broadcastShardCounts);
@@ -89,26 +94,67 @@ public final class FragmentSqlGenerator {
                     join.getConditionTypeNode(),
                     join.getCondition());
         }
-        if (from instanceof SqlBasicCall call && call.getKind() == SqlKind.AS) {
+        if (from instanceof SqlBasicCall call && (call.getKind() == SqlKind.AS || call.getKind() == SqlKind.UNION)) {
+            if (call.getKind() == SqlKind.UNION) {
+                SqlNode rewrittenUnion = rewriteUnionOperands(call, shardId, drivingTable, broadcastShardCounts);
+                return rewrittenUnion;
+            }
             SqlNode inner = call.operand(0);
             SqlNode alias = call.operand(1);
-            String tableName = extractTableName(inner);
+            String tableName = TableNameSupport.baseTableName(inner);
             if (tableName != null && broadcastShardCounts.containsKey(tableName.toLowerCase())) {
                 SqlNode unionAll = buildUnionAll(tableName.toLowerCase(), broadcastShardCounts.get(tableName.toLowerCase()));
                 return SqlStdOperatorTable.AS.createCall(call.getParserPosition(), unionAll, alias);
             }
             SqlNode rewrittenInner = rewriteFrom(inner, shardId, drivingTable, broadcastShardCounts);
-            return SqlStdOperatorTable.AS.createCall(call.getParserPosition(), rewrittenInner, alias);
+            return recreateAsCall(call, rewrittenInner, alias);
         }
         return from;
     }
 
+    private static SqlNode rewriteUnionOperands(
+            SqlBasicCall union,
+            int shardId,
+            String drivingTable,
+            Map<String, Integer> broadcastShardCounts) {
+        List<SqlNode> rewrittenOperands = new ArrayList<>();
+        for (SqlNode operand : union.getOperandList()) {
+            rewrittenOperands.add(rewriteFrom(operand, shardId, drivingTable, broadcastShardCounts));
+        }
+        return union.getOperator().createCall(union.getParserPosition(), rewrittenOperands);
+    }
+
+    private static SqlSelect rewriteSelectFrom(
+            SqlSelect select,
+            int shardId,
+            String drivingTable,
+            Map<String, Integer> broadcastShardCounts) {
+        SqlSelect rewritten = (SqlSelect) select.clone(SqlParserPos.ZERO);
+        if (select.getFrom() != null) {
+            rewritten.setFrom(rewriteFrom(select.getFrom(), shardId, drivingTable, broadcastShardCounts));
+        }
+        return rewritten;
+    }
+
+    private static SqlNode recreateAsCall(SqlBasicCall original, SqlNode rewrittenInner, SqlNode alias) {
+        if (original.operandCount() == 2) {
+            return SqlStdOperatorTable.AS.createCall(original.getParserPosition(), rewrittenInner, alias);
+        }
+        List<SqlNode> operands = new ArrayList<>(original.operandCount());
+        operands.add(rewrittenInner);
+        operands.add(alias);
+        for (int i = 2; i < original.operandCount(); i++) {
+            operands.add(original.operand(i));
+        }
+        return original.getOperator().createCall(original.getParserPosition(), operands);
+    }
+
     private static SqlNode rewriteTableIdentifier(SqlIdentifier identifier, int shardId,
                                                    String drivingTable, Map<String, Integer> broadcastShardCounts) {
-        if (identifier.names.size() != 1) {
+        String tableName = TableNameSupport.baseTableName(identifier);
+        if (tableName == null) {
             return identifier;
         }
-        String tableName = identifier.getSimple();
         String tableNameLower = tableName.toLowerCase();
 
         if (tableNameLower.equals(drivingTable.toLowerCase())) {
@@ -142,10 +188,7 @@ public final class FragmentSqlGenerator {
     }
 
     private static String extractTableName(SqlNode node) {
-        if (node instanceof SqlIdentifier id && id.names.size() == 1) {
-            return id.getSimple();
-        }
-        return null;
+        return TableNameSupport.baseTableName(node);
     }
 
     private static SqlNodeList rewriteAggregates(SqlNodeList selectList, List<AggregateSpec> aggregates) {

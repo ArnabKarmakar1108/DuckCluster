@@ -134,15 +134,16 @@ class CalciteQueryPlannerTest {
                 joinCatalog);
 
         assertEquals(4, planned.fragments().size());
-        assertEquals("lineitem", planned.tableName());
+        // Tied shard counts: last table in FROM traversal order drives.
+        assertEquals("orders", planned.tableName());
         assertEquals(1, planned.broadcastTables().size());
-        assertEquals("orders", planned.broadcastTables().get(0).tableName());
+        assertEquals("lineitem", planned.broadcastTables().get(0).tableName());
 
         String sql0 = planned.fragments().get(0).sql();
-        assertTrue(sql0.contains("\"lineitem_shard0\".\"lineitem\""), "Driving table: " + sql0);
-        assertTrue(sql0.contains("UNION ALL"), "Orders is broadcast: " + sql0);
-        assertTrue(sql0.contains("\"orders_shard0\".\"orders\""), "Orders shard 0: " + sql0);
-        assertTrue(sql0.contains("\"orders_shard3\".\"orders\""), "Orders shard 3: " + sql0);
+        assertTrue(sql0.contains("\"orders_shard0\".\"orders\""), "Driving table: " + sql0);
+        assertTrue(sql0.contains("UNION ALL"), "Lineitem is broadcast: " + sql0);
+        assertTrue(sql0.contains("\"lineitem_shard0\".\"lineitem\""), "Lineitem shard 0: " + sql0);
+        assertTrue(sql0.contains("\"lineitem_shard3\".\"lineitem\""), "Lineitem shard 3: " + sql0);
     }
 
     @Test

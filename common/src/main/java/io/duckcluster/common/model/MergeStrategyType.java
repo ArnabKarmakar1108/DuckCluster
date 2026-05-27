@@ -4,5 +4,6 @@ public enum MergeStrategyType {
     CONCATENATE,
     PARTIAL_AGG,
     GROUP_BY_MERGE,
+    NESTED_GROUP_BY_MERGE,
     TOP_K
 }

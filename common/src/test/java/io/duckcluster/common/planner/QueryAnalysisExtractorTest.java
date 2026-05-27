@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class QueryAnalysisExtractorTest {
@@ -37,6 +38,7 @@ class QueryAnalysisExtractorTest {
         assertEquals(AggregateFunction.COUNT, analysis.aggregates().get(0).function());
         assertEquals(AggregateFunction.SUM, analysis.aggregates().get(1).function());
         assertEquals("id", analysis.aggregates().get(1).inputColumn());
+        assertNull(analysis.aggregates().get(1).inputExpression());
     }
 
     @Test

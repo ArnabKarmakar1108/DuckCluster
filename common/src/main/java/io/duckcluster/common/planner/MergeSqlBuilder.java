@@ -1,7 +1,6 @@
 package io.duckcluster.common.planner;
 
 import io.duckcluster.common.model.AggregateFunction;
-import io.duckcluster.common.model.AggregateFunction;
 import io.duckcluster.common.model.AggregateSpec;
 import io.duckcluster.common.model.OrderByClause;
 import io.duckcluster.common.model.QueryAnalysis;
@@ -15,28 +14,32 @@ public final class MergeSqlBuilder {
     private MergeSqlBuilder() {}
 
     public static String buildGroupByMerge(QueryAnalysis analysis) {
+        return buildGroupByMerge(analysis, TopKSpec.none());
+    }
+
+    public static String buildGroupByMerge(QueryAnalysis analysis, TopKSpec topK) {
+        return buildGroupByMerge(analysis, topK, null);
+    }
+
+    public static String buildGroupByMerge(QueryAnalysis analysis, TopKSpec topK, List<String> outputAliases) {
         StringBuilder sql = new StringBuilder("SELECT ");
         boolean first = true;
-        for (String groupColumn : analysis.groupByColumns()) {
+        for (int outputIndex = 0; outputIndex < analysis.outputColumnNames().size(); outputIndex++) {
+            String outputColumn = analysis.outputColumnNames().get(outputIndex);
             if (!first) {
                 sql.append(", ");
             }
-            sql.append(quote(groupColumn));
-            first = false;
-        }
-        for (AggregateSpec aggregate : analysis.aggregates()) {
-            if (aggregate.part() == AggregateSpec.AggregatePart.AVG_COUNT) {
-                continue;
-            }
-            if (!first) {
-                sql.append(", ");
-            }
-            if (aggregate.part() == AggregateSpec.AggregatePart.AVG_SUM) {
-                sql.append(avgMergeExpression(aggregate, nextAvgCount(analysis, aggregate)));
+            if (analysis.groupByColumns().contains(outputColumn)) {
+                sql.append(quote(outputColumn));
             } else {
-                sql.append(mergeExpression(aggregate));
+                AggregateSpec aggregate = aggregateForOutput(analysis, outputColumn);
+                if (aggregate.part() == AggregateSpec.AggregatePart.AVG_SUM) {
+                    sql.append(avgMergeExpression(aggregate, nextAvgCount(analysis, aggregate)));
+                } else {
+                    sql.append(mergeExpression(aggregate));
+                }
+                sql.append(" AS ").append(quote(resolveOutputAlias(outputAliases, outputIndex, outputColumn)));
             }
-            sql.append(" AS ").append(quote(aggregate.outputName()));
             first = false;
         }
         sql.append(" FROM ").append(TEMP_TABLE);
@@ -49,7 +52,20 @@ public final class MergeSqlBuilder {
                 sql.append(quote(analysis.groupByColumns().get(i)));
             }
         }
+        appendOrderByAndLimit(sql, topK, false);
         return sql.toString();
+    }
+
+    private static AggregateSpec aggregateForOutput(QueryAnalysis analysis, String outputColumn) {
+        for (AggregateSpec aggregate : analysis.aggregates()) {
+            if (aggregate.part() == AggregateSpec.AggregatePart.AVG_COUNT) {
+                continue;
+            }
+            if (aggregate.outputName().equals(outputColumn)) {
+                return aggregate;
+            }
+        }
+        throw new IllegalStateException("Missing aggregate metadata for output column: " + outputColumn);
     }
 
     public static String buildPartialAggMerge(QueryAnalysis analysis) {
@@ -84,6 +100,11 @@ public final class MergeSqlBuilder {
             first = false;
         }
         sql.append(" FROM ").append(TEMP_TABLE);
+        appendOrderByAndLimit(sql, topK, true);
+        return sql.toString();
+    }
+
+    private static void appendOrderByAndLimit(StringBuilder sql, TopKSpec topK, boolean castOrderColumns) {
         if (topK.hasOrderBy()) {
             sql.append(" ORDER BY ");
             for (int i = 0; i < topK.orderBy().size(); i++) {
@@ -91,7 +112,11 @@ public final class MergeSqlBuilder {
                     sql.append(", ");
                 }
                 OrderByClause clause = topK.orderBy().get(i);
-                sql.append("CAST(").append(quote(clause.column())).append(" AS DOUBLE)");
+                if (castOrderColumns) {
+                    sql.append("CAST(").append(quote(clause.column())).append(" AS DOUBLE)");
+                } else {
+                    sql.append(quote(clause.column()));
+                }
                 if (clause.descending()) {
                     sql.append(" DESC");
                 }
@@ -100,7 +125,6 @@ public final class MergeSqlBuilder {
         if (topK.hasLimit()) {
             sql.append(" LIMIT ").append(topK.limit());
         }
-        return sql.toString();
     }
 
     public static List<String> tempTableColumns(QueryAnalysis analysis) {
@@ -140,6 +164,13 @@ public final class MergeSqlBuilder {
     private static String avgMergeExpression(AggregateSpec sumPart, AggregateSpec countPart) {
         return "CAST(SUM(" + quote(sumPart.mergeColumnName()) + ") AS DOUBLE) / NULLIF(SUM("
                 + quote(countPart.mergeColumnName()) + "), 0)";
+    }
+
+    private static String resolveOutputAlias(List<String> outputAliases, int outputIndex, String defaultName) {
+        if (outputAliases != null && outputIndex < outputAliases.size()) {
+            return outputAliases.get(outputIndex);
+        }
+        return defaultName;
     }
 
     private static String quote(String identifier) {

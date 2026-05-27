@@ -28,6 +28,24 @@ class MergeSqlBuilderTest {
     }
 
     @Test
+    void buildsGroupByMergeSqlWithOrderBy() {
+        QueryAnalysis analysis = new QueryAnalysis(
+                List.of("c_count"),
+                List.of(new AggregateSpec("custdist", "__dc_agg_0", AggregateFunction.COUNT, null)),
+                List.of("c_count", "custdist"));
+        TopKSpec topK = new TopKSpec(
+                List.of(
+                        new io.duckcluster.common.model.OrderByClause("custdist", true),
+                        new io.duckcluster.common.model.OrderByClause("c_count", true)),
+                -1);
+
+        String sql = MergeSqlBuilder.buildGroupByMerge(analysis, topK);
+
+        assertTrue(sql.contains("SUM(\"__dc_agg_0\") AS \"custdist\""));
+        assertTrue(sql.contains("ORDER BY \"custdist\" DESC, \"c_count\" DESC"));
+    }
+
+    @Test
     void buildsPartialAggregateMergeSql() {
         QueryAnalysis analysis = new QueryAnalysis(
                 List.of(),
