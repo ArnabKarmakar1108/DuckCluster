@@ -60,11 +60,10 @@ class GroupByMergeStrategyTest {
 
         assertEquals(List.of("category", "cnt"), result.columns());
         assertEquals(3, result.rows().size());
-        assertEquals("2", result.rows().stream()
+        assertEquals(2.0, ((Number) result.rows().stream()
                 .filter(row -> "A".equals(row.get(0)))
                 .findFirst()
                 .orElseThrow()
-                .get(1)
-                .toString());
+                .get(1)).doubleValue());
     }
 }

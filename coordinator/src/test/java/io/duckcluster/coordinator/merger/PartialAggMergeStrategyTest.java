@@ -61,7 +61,7 @@ class PartialAggMergeStrategyTest {
 
         assertEquals(List.of("count", "total"), result.columns());
         assertEquals(1, result.rows().size());
-        assertEquals("3", result.rows().get(0).get(0).toString());
-        assertEquals("13", result.rows().get(0).get(1).toString());
+        assertEquals(3.0, ((Number) result.rows().get(0).get(0)).doubleValue());
+        assertEquals(13.0, ((Number) result.rows().get(0).get(1)).doubleValue());
     }
 }

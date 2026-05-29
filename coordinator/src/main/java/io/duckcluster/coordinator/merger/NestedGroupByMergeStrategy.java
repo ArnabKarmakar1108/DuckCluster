@@ -9,17 +9,22 @@ import io.duckcluster.common.planner.MergeSqlBuilder;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-public final class GroupByMergeStrategy implements MergeStrategy {
+public final class NestedGroupByMergeStrategy implements MergeStrategy {
     @Override
     public MergeStrategyType type() {
-        return MergeStrategyType.GROUP_BY_MERGE;
+        return MergeStrategyType.NESTED_GROUP_BY_MERGE;
     }
 
     @Override
     public QueryResult merge(MergeContext context) {
-        String mergeSql = MergeSqlBuilder.buildGroupByMerge(
-                context.plan().analysis(), context.plan().topK());
-        return DuckDbMergeSupport.mergeWithSql(context, stats(context), mergeSql);
+        if (!context.plan().hasNestedDerivedTable()) {
+            throw new IllegalStateException("NESTED_GROUP_BY_MERGE requires nested derived table metadata");
+        }
+        var nested = context.plan().nestedDerivedTable();
+        String phase1Sql = MergeSqlBuilder.buildGroupByMerge(
+                context.plan().analysis(), io.duckcluster.common.model.TopKSpec.none(), nested.derivedColumnNames());
+        String phase2Sql = CoordinatorOuterSqlGenerator.generate(nested);
+        return DuckDbMergeSupport.mergeNestedGroupBy(context, stats(context), phase1Sql, phase2Sql, nested);
     }
 
     private static QueryResult.QueryStats stats(MergeContext context) {
@@ -28,7 +33,7 @@ public final class GroupByMergeStrategy implements MergeStrategy {
             workerDurationsMs.put(fragment.workerId(), fragment.durationMs());
         }
         return new QueryResult.QueryStats(
-                MergeStrategyType.GROUP_BY_MERGE,
+                MergeStrategyType.NESTED_GROUP_BY_MERGE,
                 workerDurationsMs.size(),
                 context.fragmentResults().size(),
                 context.durationMs(),
