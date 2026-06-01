@@ -568,7 +568,10 @@ Queries with `ORDER BY` and/or `LIMIT` (and no `GROUP BY`/bare aggregates) use `
 | `CONCATENATE` | Simple `SELECT` | Row append |
 | `PARTIAL_AGG` | Aggregates without `GROUP BY` | Sum/count/min/max merge |
 | `GROUP_BY_MERGE` | `GROUP BY` + aggregates | Re-group and merge partials |
+| `NESTED_GROUP_BY_MERGE` | Derived table with inner `GROUP BY` | Two-phase: merge inner groups, then outer agg on coordinator |
 | `TOP_K` | `ORDER BY` / `LIMIT` | Global sort + limit |
+
+See [DESIGN-planner.md](DESIGN-planner.md) for planner rationale.
 
 ---
 
@@ -590,3 +593,15 @@ Queries with `ORDER BY` and/or `LIMIT` (and no `GROUP BY`/bare aggregates) use `
 | `DUCKCLUSTER_WATCHER_INTERVAL_MS` | `2000` | Worker | File watcher poll rate |
 | `DUCKCLUSTER_CACHE_MAX_SHARDS` | `5` | Worker | TempShardCache LRU capacity |
 | `DUCKCLUSTER_FRAGMENT_WAIT_MS` | `60000` | Coordinator | Max wait for owner/cache worker or worker capacity slot |
+
+---
+
+## 11. Query planner
+
+Planner-specific decisions (Calcite scope, merge strategies, derived tables, nested `GROUP BY`,
+TPC-H query status) live in **[DESIGN-planner.md](DESIGN-planner.md)**. That document is the
+canonical place to update when planner behavior changes.
+
+High-level summary: Calcite is used today as **parser + AST + SQL printer**; shard routing,
+fragment rewrite, and coordinator merge are **custom logic** on `SqlNode`, not `RelNode`
+optimizer rules.
