@@ -42,7 +42,7 @@ class MergeSqlBuilderTest {
         String sql = MergeSqlBuilder.buildGroupByMerge(analysis, topK);
 
         assertTrue(sql.contains("SUM(\"__dc_agg_0\") AS \"custdist\""));
-        assertTrue(sql.contains("ORDER BY \"custdist\" DESC, \"c_count\" DESC"));
+        assertTrue(sql.contains("ORDER BY SUM(\"__dc_agg_0\") DESC, \"c_count\" DESC"));
     }
 
     @Test
@@ -97,7 +97,7 @@ class MergeSqlBuilderTest {
         String sql = MergeSqlBuilder.buildTopKMerge(analysis, topK);
 
         assertEquals(
-                "SELECT \"id\", \"value\" FROM __merge_temp ORDER BY CAST(\"value\" AS DOUBLE) DESC LIMIT 5",
+                "SELECT \"id\", \"value\" FROM __merge_temp ORDER BY \"value\" DESC LIMIT 5",
                 sql);
     }
 }

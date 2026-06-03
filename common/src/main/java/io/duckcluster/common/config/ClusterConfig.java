@@ -18,6 +18,40 @@ public final class ClusterConfig {
     private final long watcherIntervalMs;
     private final int cacheMaxShards;
     private final long fragmentWaitMs;
+    private final boolean logFragmentSql;
+
+    public ClusterConfig(
+            String coordinatorHost,
+            int coordinatorGrpcPort,
+            int coordinatorHttpPort,
+            Duration heartbeatInterval,
+            int heartbeatMissThreshold,
+            int shardCount,
+            String dataDir,
+            int poolSize,
+            long poolWaitMs,
+            int replicationFactor,
+            int vnodesPerWorker,
+            long watcherIntervalMs,
+            int cacheMaxShards,
+            long fragmentWaitMs,
+            boolean logFragmentSql) {
+        this.coordinatorHost = Objects.requireNonNull(coordinatorHost, "coordinatorHost");
+        this.coordinatorGrpcPort = coordinatorGrpcPort;
+        this.coordinatorHttpPort = coordinatorHttpPort;
+        this.heartbeatInterval = Objects.requireNonNull(heartbeatInterval, "heartbeatInterval");
+        this.heartbeatMissThreshold = heartbeatMissThreshold;
+        this.shardCount = shardCount;
+        this.dataDir = Objects.requireNonNull(dataDir, "dataDir");
+        this.poolSize = poolSize;
+        this.poolWaitMs = poolWaitMs;
+        this.replicationFactor = replicationFactor;
+        this.vnodesPerWorker = vnodesPerWorker;
+        this.watcherIntervalMs = watcherIntervalMs;
+        this.cacheMaxShards = cacheMaxShards;
+        this.fragmentWaitMs = fragmentWaitMs;
+        this.logFragmentSql = logFragmentSql;
+    }
 
     public ClusterConfig(
             String coordinatorHost,
@@ -34,20 +68,9 @@ public final class ClusterConfig {
             long watcherIntervalMs,
             int cacheMaxShards,
             long fragmentWaitMs) {
-        this.coordinatorHost = Objects.requireNonNull(coordinatorHost, "coordinatorHost");
-        this.coordinatorGrpcPort = coordinatorGrpcPort;
-        this.coordinatorHttpPort = coordinatorHttpPort;
-        this.heartbeatInterval = Objects.requireNonNull(heartbeatInterval, "heartbeatInterval");
-        this.heartbeatMissThreshold = heartbeatMissThreshold;
-        this.shardCount = shardCount;
-        this.dataDir = Objects.requireNonNull(dataDir, "dataDir");
-        this.poolSize = poolSize;
-        this.poolWaitMs = poolWaitMs;
-        this.replicationFactor = replicationFactor;
-        this.vnodesPerWorker = vnodesPerWorker;
-        this.watcherIntervalMs = watcherIntervalMs;
-        this.cacheMaxShards = cacheMaxShards;
-        this.fragmentWaitMs = fragmentWaitMs;
+        this(coordinatorHost, coordinatorGrpcPort, coordinatorHttpPort, heartbeatInterval, heartbeatMissThreshold,
+                shardCount, dataDir, poolSize, poolWaitMs, replicationFactor, vnodesPerWorker, watcherIntervalMs,
+                cacheMaxShards, fragmentWaitMs, false);
     }
 
     public static ClusterConfig fromEnvironment() {
@@ -66,7 +89,8 @@ public final class ClusterConfig {
                 parseInt("DUCKCLUSTER_VNODES_PER_WORKER", 100),
                 parseLong("DUCKCLUSTER_WATCHER_INTERVAL_MS", 2000),
                 parseInt("DUCKCLUSTER_CACHE_MAX_SHARDS", 5),
-                parseLong("DUCKCLUSTER_FRAGMENT_WAIT_MS", 60_000));
+                parseLong("DUCKCLUSTER_FRAGMENT_WAIT_MS", 60_000),
+                parseBoolean("DUCKCLUSTER_LOG_FRAGMENT_SQL", false));
     }
 
     public String coordinatorHost() {
@@ -123,6 +147,18 @@ public final class ClusterConfig {
 
     public long fragmentWaitMs() {
         return fragmentWaitMs;
+    }
+
+    public boolean logFragmentSql() {
+        return logFragmentSql;
+    }
+
+    private static boolean parseBoolean(String key, boolean defaultValue) {
+        String value = System.getenv(key);
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+        return Boolean.parseBoolean(value);
     }
 
     private static String getenv(String key, String defaultValue) {

@@ -15,6 +15,7 @@ public final class MergeStrategyRegistry {
         register(new PartialAggMergeStrategy());
         register(new GroupByMergeStrategy());
         register(new NestedGroupByMergeStrategy());
+        register(new WithCteMergeStrategy());
         register(new TopKMergeStrategy());
     }
 

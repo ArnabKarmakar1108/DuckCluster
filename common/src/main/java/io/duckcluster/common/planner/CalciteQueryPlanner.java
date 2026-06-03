@@ -10,14 +10,17 @@ import io.duckcluster.common.model.QueryAnalysis;
 import io.duckcluster.common.model.TableShardConfig;
 import io.duckcluster.common.model.TopKSpec;
 import org.apache.calcite.config.Lex;
+import org.apache.calcite.avatica.util.Quoting;
 import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlJoin;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlNode;
+import io.duckcluster.common.model.WithCteSpec;
 import org.apache.calcite.sql.SqlOrderBy;
 import org.apache.calcite.sql.SqlSelect;
+import org.apache.calcite.sql.SqlWith;
 import org.apache.calcite.sql.parser.SqlParseException;
 import org.apache.calcite.sql.parser.SqlParser;
 import org.apache.calcite.sql.util.SqlShuttle;
@@ -32,13 +35,18 @@ import java.util.Optional;
 import java.util.Set;
 
 public final class CalciteQueryPlanner implements QueryPlanner {
-    private static final SqlParser.Config PARSER_CONFIG = SqlParser.config()
+    static final SqlParser.Config PARSER_CONFIG = SqlParser.config()
             .withLex(Lex.JAVA)
+            .withQuoting(Quoting.DOUBLE_QUOTE)
             .withConformance(SqlConformanceEnum.PRAGMATIC_2003);
 
     @Override
     public PlannedQuery plan(String sql, ClusterCatalog catalog) {
         SqlNode parsed = parse(sql);
+        SqlWith with = extractWith(parsed);
+        if (with != null) {
+            return planWithCte(sql, parsed, with, catalog);
+        }
         SqlSelect select = asSelect(parsed);
 
         Optional<NestedDerivedTableDetector.Match> nested = NestedDerivedTableDetector.detect(select, parsed);
@@ -50,25 +58,82 @@ public final class CalciteQueryPlanner implements QueryPlanner {
         int shardCount = classification.shardCount();
 
         MergeStrategyType mergeStrategy = detectMergeStrategy(parsed);
-        TopKSpec topK = TopKExtractor.extract(parsed);
         QueryAnalysis analysis = QueryAnalysisExtractor.withMergeColumnNames(
                 QueryAnalysisExtractor.extract(select, mergeStrategy));
+        TopKSpec topK = TopKResolver.resolve(TopKExtractor.extract(parsed, select), analysis);
 
         String drivingTable = classification.drivingTable();
         Map<String, Integer> broadcastShardCounts = new HashMap<>();
         for (BroadcastTable bt : classification.broadcastTables()) {
             broadcastShardCounts.put(bt.tableName().toLowerCase(), bt.shardCount());
         }
+        Map<String, Integer> catalogTableShardCounts = catalogTableShardCounts(catalog);
+        List<BroadcastTable> subqueryBroadcasts = subqueryBroadcastTables(
+                select, catalog, classification.broadcastTables(), drivingTable);
+        List<String> correlatedCoPartition = correlatedCoPartitionTables(
+                select, catalog, classification.broadcastTables(), subqueryBroadcasts, drivingTable);
 
         List<FragmentSpec> fragments = new ArrayList<>(shardCount);
         for (int shardId = 0; shardId < shardCount; shardId++) {
             String fragmentSql = FragmentSqlGenerator.generate(
-                    select, shardId, analysis, drivingTable, broadcastShardCounts, topK);
+                    select, shardId, analysis, drivingTable, broadcastShardCounts,
+                    catalogTableShardCounts, topK);
             fragments.add(new FragmentSpec(shardId, shardId, fragmentSql, mergeStrategy));
         }
 
         return new PlannedQuery(sql, List.of(drivingTable), classification.broadcastTables(),
-                fragments, mergeStrategy, analysis, List.of(), topK);
+                fragments, mergeStrategy, analysis, List.of(), topK, null, null, subqueryBroadcasts,
+                correlatedCoPartition);
+    }
+
+    private PlannedQuery planWithCte(String sql, SqlNode parsed, SqlWith with, ClusterCatalog catalog) {
+        SqlSelect cteSelect = WithClauseExpander.firstCteSelect(with);
+        if (cteSelect.getGroup() == null || cteSelect.getGroup().isEmpty()) {
+            throw new IllegalArgumentException("WITH CTE body must include GROUP BY for distributed planning");
+        }
+
+        String cteName = WithClauseExpander.firstCteName(with);
+        SqlNode outerNode = outerQueryNode(parsed, with);
+        SqlSelect outerSelect = asSelect(outerNode);
+
+        TableClassification classification = classifyTables(cteSelect, catalog);
+        int shardCount = classification.shardCount();
+
+        QueryAnalysis innerAnalysis = QueryAnalysisExtractor.withMergeColumnNames(
+                QueryAnalysisExtractor.extract(cteSelect, MergeStrategyType.GROUP_BY_MERGE));
+        TopKSpec outerTopK = TopKResolver.resolve(
+                TopKExtractor.extract(outerNode, outerSelect),
+                QueryAnalysisExtractor.withMergeColumnNames(
+                        QueryAnalysisExtractor.extract(outerSelect, MergeStrategyType.GROUP_BY_MERGE)));
+
+        String drivingTable = classification.drivingTable();
+        Map<String, Integer> broadcastShardCounts = new HashMap<>();
+        for (BroadcastTable bt : classification.broadcastTables()) {
+            broadcastShardCounts.put(bt.tableName().toLowerCase(), bt.shardCount());
+        }
+        Map<String, Integer> catalogTableShardCounts = catalogTableShardCounts(catalog);
+
+        List<String> coordinatorTables = WithClauseExpander.coordinatorDimensionTables(
+                outerSelect, WithClauseExpander.cteNames(with), catalog);
+        String outerSql = WithCteOuterSqlGenerator.generate(outerNode, cteName);
+        WithCteSpec withCteSpec = new WithCteSpec(
+                innerAnalysis,
+                innerAnalysis.outputColumnNames(),
+                outerSql,
+                coordinatorTables,
+                outerTopK);
+
+        List<FragmentSpec> fragments = new ArrayList<>(shardCount);
+        for (int shardId = 0; shardId < shardCount; shardId++) {
+            String fragmentSql = FragmentSqlGenerator.generate(
+                    cteSelect, shardId, innerAnalysis, drivingTable, broadcastShardCounts,
+                    catalogTableShardCounts, TopKSpec.none());
+            fragments.add(new FragmentSpec(shardId, shardId, fragmentSql, MergeStrategyType.WITH_CTE_MERGE));
+        }
+
+        return new PlannedQuery(sql, List.of(drivingTable), classification.broadcastTables(),
+                fragments, MergeStrategyType.WITH_CTE_MERGE, innerAnalysis, List.of(), TopKSpec.none(),
+                null, withCteSpec, List.of(), List.of());
     }
 
     private PlannedQuery planNestedDerivedTable(
@@ -91,20 +156,28 @@ public final class CalciteQueryPlanner implements QueryPlanner {
         for (BroadcastTable bt : classification.broadcastTables()) {
             broadcastShardCounts.put(bt.tableName().toLowerCase(), bt.shardCount());
         }
+        Map<String, Integer> catalogTableShardCounts = catalogTableShardCounts(catalog);
 
         MergeStrategyType mergeStrategy = MergeStrategyType.NESTED_GROUP_BY_MERGE;
         NestedDerivedTableSpec nestedSpec = new NestedDerivedTableSpec(
                 outerAnalysis, derivedColumnNames(nested, innerAnalysis), nested.outerTopK());
 
+        List<BroadcastTable> subqueryBroadcasts = subqueryBroadcastTables(
+                innerSelect, catalog, classification.broadcastTables(), drivingTable);
+        List<String> correlatedCoPartition = correlatedCoPartitionTables(
+                innerSelect, catalog, classification.broadcastTables(), subqueryBroadcasts, drivingTable);
+
         List<FragmentSpec> fragments = new ArrayList<>(shardCount);
         for (int shardId = 0; shardId < shardCount; shardId++) {
             String fragmentSql = FragmentSqlGenerator.generate(
-                    innerSelect, shardId, innerAnalysis, drivingTable, broadcastShardCounts, TopKSpec.none());
+                    innerSelect, shardId, innerAnalysis, drivingTable, broadcastShardCounts,
+                    catalogTableShardCounts, TopKSpec.none());
             fragments.add(new FragmentSpec(shardId, shardId, fragmentSql, mergeStrategy));
         }
 
         return new PlannedQuery(sql, List.of(drivingTable), classification.broadcastTables(),
-                fragments, mergeStrategy, innerAnalysis, List.of(), TopKSpec.none(), nestedSpec);
+                fragments, mergeStrategy, innerAnalysis, List.of(), TopKSpec.none(),
+                nestedSpec, null, subqueryBroadcasts, correlatedCoPartition);
     }
 
     private static List<String> derivedColumnNames(
@@ -116,7 +189,7 @@ public final class CalciteQueryPlanner implements QueryPlanner {
     }
 
     public SqlNode parse(String sql) {
-        SqlParser parser = SqlParser.create(stripTrailingSemicolon(sql), PARSER_CONFIG);
+        SqlParser parser = SqlParser.create(stripTrailingSemicolon(SqlNormalizer.normalize(sql)), PARSER_CONFIG);
         try {
             return parser.parseStmt();
         } catch (SqlParseException e) {
@@ -203,7 +276,32 @@ public final class CalciteQueryPlanner implements QueryPlanner {
         }
     }
 
+    private static SqlNode outerQueryNode(SqlNode parsed, SqlWith with) {
+        if (parsed instanceof SqlOrderBy orderBy && orderBy.query instanceof SqlWith) {
+            return new SqlOrderBy(
+                    orderBy.getParserPosition(),
+                    with.body,
+                    orderBy.orderList,
+                    orderBy.offset,
+                    orderBy.fetch);
+        }
+        return with.body;
+    }
+
+    private static SqlWith extractWith(SqlNode parsed) {
+        if (parsed instanceof SqlWith with) {
+            return with;
+        }
+        if (parsed instanceof SqlOrderBy orderBy && orderBy.query instanceof SqlWith with) {
+            return with;
+        }
+        return null;
+    }
+
     private static SqlSelect asSelect(SqlNode parsed) {
+        if (parsed instanceof SqlWith with) {
+            return asSelect(with.body);
+        }
         if (parsed instanceof SqlOrderBy orderBy) {
             if (orderBy.query instanceof SqlSelect select) {
                 return select;
@@ -249,4 +347,52 @@ public final class CalciteQueryPlanner implements QueryPlanner {
     }
 
     record TableClassification(String drivingTable, List<BroadcastTable> broadcastTables, int shardCount) {}
+
+    private static Map<String, Integer> catalogTableShardCounts(ClusterCatalog catalog) {
+        Map<String, Integer> counts = new HashMap<>();
+        for (String tableName : catalog.getShardedTableNames()) {
+            counts.put(tableName.toLowerCase(), catalog.table(tableName).shardCount());
+        }
+        return counts;
+    }
+
+    private static List<BroadcastTable> subqueryBroadcastTables(
+            SqlSelect select,
+            ClusterCatalog catalog,
+            List<BroadcastTable> mainBroadcastTables,
+            String drivingTable) {
+        Set<String> alreadyBroadcast = new LinkedHashSet<>();
+        for (BroadcastTable broadcastTable : mainBroadcastTables) {
+            alreadyBroadcast.add(broadcastTable.tableName().toLowerCase());
+        }
+        List<BroadcastTable> subqueryBroadcasts = new ArrayList<>();
+        for (String tableName : SubqueryAnalyzer.uncorrelatedMultiShardTables(select, catalog, drivingTable)) {
+            if (!alreadyBroadcast.contains(tableName)) {
+                subqueryBroadcasts.add(new BroadcastTable(tableName, catalog.table(tableName).shardCount()));
+            }
+        }
+        return subqueryBroadcasts;
+    }
+
+    private static List<String> correlatedCoPartitionTables(
+            SqlSelect select,
+            ClusterCatalog catalog,
+            List<BroadcastTable> mainBroadcastTables,
+            List<BroadcastTable> subqueryBroadcastTables,
+            String drivingTable) {
+        Set<String> alreadyCovered = new LinkedHashSet<>();
+        for (BroadcastTable broadcastTable : mainBroadcastTables) {
+            alreadyCovered.add(broadcastTable.tableName().toLowerCase());
+        }
+        for (BroadcastTable broadcastTable : subqueryBroadcastTables) {
+            alreadyCovered.add(broadcastTable.tableName().toLowerCase());
+        }
+        List<String> tables = new ArrayList<>();
+        for (String tableName : SubqueryAnalyzer.correlatedCoPartitionTables(select, catalog, drivingTable)) {
+            if (!alreadyCovered.contains(tableName)) {
+                tables.add(tableName);
+            }
+        }
+        return tables;
+    }
 }

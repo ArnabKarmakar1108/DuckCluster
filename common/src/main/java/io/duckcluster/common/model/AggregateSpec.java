@@ -43,6 +43,7 @@ public record AggregateSpec(
     public enum AggregatePart {
         WHOLE,
         AVG_SUM,
-        AVG_COUNT
+        AVG_COUNT,
+        DISTINCT_COUNT
     }
 }

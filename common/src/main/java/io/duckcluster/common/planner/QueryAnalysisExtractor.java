@@ -2,6 +2,7 @@ package io.duckcluster.common.planner;
 
 import io.duckcluster.common.model.AggregateFunction;
 import io.duckcluster.common.model.AggregateSpec;
+import io.duckcluster.common.model.ComputedOutputSpec;
 import io.duckcluster.common.model.MergeStrategyType;
 import io.duckcluster.common.model.QueryAnalysis;
 import org.apache.calcite.sql.SqlBasicCall;
@@ -32,6 +33,7 @@ public final class QueryAnalysisExtractor {
         List<String> groupByColumns = extractGroupByColumns(select);
         List<AggregateSpec> aggregates = new ArrayList<>();
         List<String> outputColumnNames = new ArrayList<>();
+        List<ComputedOutputSpec> computedOutputs = new ArrayList<>();
 
         int aggregateIndex = 0;
         for (SqlNode item : select.getSelectList()) {
@@ -39,13 +41,18 @@ public final class QueryAnalysisExtractor {
                 List<AggregateSpec> specs = toAggregateSpecs(item, aggregateIndex++);
                 aggregates.addAll(specs);
                 outputColumnNames.add(specs.get(0).outputName());
+            } else if (NestedAggregateExtractor.containsNestedAggregate(item)) {
+                NestedAggregateExtractor.Analysis nested = NestedAggregateExtractor.analyze(item, aggregateIndex);
+                aggregates.addAll(nested.aggregates());
+                outputColumnNames.add(nested.outputName());
+                computedOutputs.add(nested.computedOutput());
+                aggregateIndex = nested.nextAggregateIndex();
             } else if (mergeStrategy == MergeStrategyType.GROUP_BY_MERGE) {
-                String columnName = columnName(item);
-                outputColumnNames.add(columnName);
+                outputColumnNames.add(selectOutputName(item));
             }
         }
 
-        return new QueryAnalysis(groupByColumns, aggregates, outputColumnNames);
+        return new QueryAnalysis(groupByColumns, aggregates, outputColumnNames, computedOutputs);
     }
 
     public static QueryAnalysis withMergeColumnNames(QueryAnalysis analysis) {
@@ -71,6 +78,16 @@ public final class QueryAnalysisExtractor {
                         AggregateSpec.AggregatePart.AVG_COUNT));
                 mergeIndex++;
                 i += 2;
+            } else if (aggregate.part() == AggregateSpec.AggregatePart.DISTINCT_COUNT) {
+                rewritten.add(new AggregateSpec(
+                        aggregate.outputName(),
+                        distinctMergeColumnName(mergeIndex),
+                        aggregate.function(),
+                        aggregate.inputColumn(),
+                        aggregate.inputExpression(),
+                        AggregateSpec.AggregatePart.DISTINCT_COUNT));
+                mergeIndex++;
+                i++;
             } else {
                 rewritten.add(new AggregateSpec(
                         aggregate.outputName(),
@@ -83,11 +100,15 @@ public final class QueryAnalysisExtractor {
                 i++;
             }
         }
-        return new QueryAnalysis(analysis.groupByColumns(), rewritten, analysis.outputColumnNames());
+        return new QueryAnalysis(analysis.groupByColumns(), rewritten, analysis.outputColumnNames(), analysis.computedOutputs());
     }
 
     static String mergeColumnName(int index) {
         return "__dc_agg_" + index;
+    }
+
+    static String distinctMergeColumnName(int index) {
+        return "__dc_distinct_" + index;
     }
 
     private static List<String> extractGroupByColumns(SqlSelect select) {
@@ -123,6 +144,15 @@ public final class QueryAnalysisExtractor {
                             operand.inputExpression(),
                             AggregateSpec.AggregatePart.AVG_COUNT));
         }
+        if (function == AggregateFunction.COUNT && AggregateSqlSupport.isCountDistinct(call)) {
+            return List.of(new AggregateSpec(
+                    outputName,
+                    mergeColumnName(index),
+                    function,
+                    operand.inputColumn(),
+                    operand.inputExpression(),
+                    AggregateSpec.AggregatePart.DISTINCT_COUNT));
+        }
         return List.of(new AggregateSpec(
                 outputName,
                 mergeColumnName(index),
@@ -156,7 +186,7 @@ public final class QueryAnalysisExtractor {
             return "count";
         }
         if (operand.inputColumn() != null) {
-            return function.name().toLowerCase() + "_" + operand.inputColumn();
+            return function.name().toLowerCase() + "(" + operand.inputColumn() + ")";
         }
         return function.name().toLowerCase() + "_" + index;
     }

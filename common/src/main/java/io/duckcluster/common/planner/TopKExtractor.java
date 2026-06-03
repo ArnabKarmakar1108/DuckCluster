@@ -8,6 +8,7 @@ import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNumericLiteral;
 import org.apache.calcite.sql.SqlOrderBy;
+import org.apache.calcite.sql.SqlSelect;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -16,6 +17,10 @@ public final class TopKExtractor {
     private TopKExtractor() {}
 
     public static TopKSpec extract(SqlNode parsed) {
+        return extract(parsed, null);
+    }
+
+    public static TopKSpec extract(SqlNode parsed, SqlSelect select) {
         if (!(parsed instanceof SqlOrderBy orderBy)) {
             return TopKSpec.none();
         }
@@ -23,23 +28,31 @@ public final class TopKExtractor {
         List<OrderByClause> clauses = new ArrayList<>();
         if (orderBy.orderList != null) {
             for (SqlNode item : orderBy.orderList) {
-                clauses.add(parseOrderByItem(item));
+                clauses.add(parseOrderByItem(item, select));
             }
         }
         return new TopKSpec(clauses, parseLimit(orderBy.fetch));
     }
 
-    private static OrderByClause parseOrderByItem(SqlNode node) {
+    private static OrderByClause parseOrderByItem(SqlNode node, SqlSelect select) {
         if (node instanceof SqlBasicCall call && call.getKind() == SqlKind.DESCENDING) {
-            return new OrderByClause(columnName(call.operand(0)), true);
+            return new OrderByClause(resolveName(call.operand(0), select), true);
         }
         if (node instanceof SqlIdentifier identifier) {
-            return new OrderByClause(columnName(identifier), false);
+            return new OrderByClause(resolveName(identifier, select), false);
         }
         if (node instanceof SqlBasicCall call) {
-            return new OrderByClause(columnName(call.operand(0)), false);
+            return new OrderByClause(resolveName(call.operand(0), select), false);
         }
         throw new IllegalArgumentException("Unsupported ORDER BY expression: " + node);
+    }
+
+    private static String resolveName(SqlNode node, SqlSelect select) {
+        String name = columnName(node);
+        if (select != null && select.getSelectList() != null) {
+            return TopKResolver.resolveFromSelectList(name, select.getSelectList());
+        }
+        return name;
     }
 
     private static int parseLimit(SqlNode fetch) {

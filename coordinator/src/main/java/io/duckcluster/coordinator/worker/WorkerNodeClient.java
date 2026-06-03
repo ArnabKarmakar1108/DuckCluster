@@ -156,6 +156,7 @@ public final class WorkerNodeClient {
             case PARTIAL_AGG -> MergeHint.PARTIAL_AGG;
             case GROUP_BY_MERGE -> MergeHint.GROUP_BY;
             case NESTED_GROUP_BY_MERGE -> MergeHint.GROUP_BY;
+            case WITH_CTE_MERGE -> MergeHint.GROUP_BY;
             case TOP_K -> MergeHint.TOP_K;
         };
     }

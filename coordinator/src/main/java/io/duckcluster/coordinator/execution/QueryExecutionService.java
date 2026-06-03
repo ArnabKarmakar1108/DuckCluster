@@ -8,6 +8,7 @@ import io.duckcluster.common.merger.RowBatchData;
 import io.duckcluster.common.model.BroadcastTable;
 import io.duckcluster.common.model.ClusterCatalog;
 import io.duckcluster.common.model.FragmentSpec;
+import io.duckcluster.common.model.MergeStrategyType;
 import io.duckcluster.common.model.PlannedQuery;
 import io.duckcluster.common.model.QueryResult;
 import io.duckcluster.common.planner.QueryPlanner;
@@ -45,6 +46,7 @@ public final class QueryExecutionService {
     private final ShardCatalog shardCatalog;
     private final WorkerFragmentTracker fragmentTracker;
     private final long fragmentWaitMs;
+    private final boolean logFragmentSql;
     private final ExecutorService fragmentExecutor;
 
     public QueryExecutionService(
@@ -55,7 +57,8 @@ public final class QueryExecutionService {
             MergeStrategyRegistry mergeStrategyRegistry,
             ShardCatalog shardCatalog,
             ClusterConfig config) {
-        this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog, config.fragmentWaitMs());
+        this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog,
+                config.fragmentWaitMs(), config.logFragmentSql());
     }
 
     QueryExecutionService(
@@ -66,6 +69,18 @@ public final class QueryExecutionService {
             MergeStrategyRegistry mergeStrategyRegistry,
             ShardCatalog shardCatalog,
             long fragmentWaitMs) {
+        this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog, fragmentWaitMs, false);
+    }
+
+    QueryExecutionService(
+            QueryPlanner planner,
+            ClusterCatalog catalog,
+            WorkerRegistry registry,
+            WorkerNodeClient workerClient,
+            MergeStrategyRegistry mergeStrategyRegistry,
+            ShardCatalog shardCatalog,
+            long fragmentWaitMs,
+            boolean logFragmentSql) {
         this.planner = planner;
         this.catalog = catalog;
         this.registry = registry;
@@ -74,6 +89,7 @@ public final class QueryExecutionService {
         this.shardCatalog = shardCatalog;
         this.fragmentTracker = new WorkerFragmentTracker(registry);
         this.fragmentWaitMs = fragmentWaitMs;
+        this.logFragmentSql = logFragmentSql;
         this.fragmentExecutor = Executors.newCachedThreadPool(r -> {
             Thread t = new Thread(r);
             t.setDaemon(true);
@@ -100,13 +116,15 @@ public final class QueryExecutionService {
         Map<Integer, String> fragmentTargets = resolveFragmentTargets(plan);
         LOG.debug("Query [{}] targets resolved: {}", queryId, fragmentTargets);
 
-        if (!plan.broadcastTables().isEmpty()) {
+        if (!plan.broadcastTables().isEmpty() || !plan.subqueryBroadcastTables().isEmpty()) {
             Set<String> targetWorkerIds = new HashSet<>(fragmentTargets.values());
             long prefetchStart = System.currentTimeMillis();
-            LOG.info("Query [{}] prefetching {} broadcast shards to {} workers",
-                    queryId, plan.broadcastTables().stream().mapToInt(BroadcastTable::shardCount).sum(),
-                    targetWorkerIds.size());
+            int prefetchShards = plan.broadcastTables().stream().mapToInt(BroadcastTable::shardCount).sum()
+                    + plan.subqueryBroadcastTables().stream().mapToInt(BroadcastTable::shardCount).sum();
+            LOG.info("Query [{}] prefetching {} broadcast/subquery shards to {} workers",
+                    queryId, prefetchShards, targetWorkerIds.size());
             prefetchBroadcastShards(plan.broadcastTables(), targetWorkerIds);
+            prefetchBroadcastShards(plan.subqueryBroadcastTables(), targetWorkerIds);
             LOG.info("Query [{}] prefetch complete ({}ms)", queryId, System.currentTimeMillis() - prefetchStart);
         } else {
             long prefetchStart = System.currentTimeMillis();
@@ -117,6 +135,10 @@ public final class QueryExecutionService {
 
         List<CompletableFuture<ExecutionOutcome>> futures = new ArrayList<>(plan.fragments().size());
         for (FragmentSpec fragment : plan.fragments()) {
+            if (logFragmentSql) {
+                LOG.info("Query [{}] fragment {} shard {} SQL: {}",
+                        queryId, fragment.fragmentId(), fragment.shardId(), fragment.sql());
+            }
             String preferredWorkerId = fragmentTargets.get(fragment.shardId());
             futures.add(CompletableFuture.supplyAsync(
                     () -> executeFragmentWithRetry(queryId, plan, fragment, preferredWorkerId),
@@ -141,7 +163,8 @@ public final class QueryExecutionService {
         }
 
         long durationMs = System.currentTimeMillis() - startMs;
-        MergeContext context = new MergeContext(queryId, plan, fragmentResults, durationMs);
+        Map<String, RowBatchData> coordinatorTables = fetchCoordinatorTables(queryId, plan);
+        MergeContext context = new MergeContext(queryId, plan, fragmentResults, durationMs, coordinatorTables);
         QueryResult merged = mergeStrategy.merge(context);
         LOG.info("Query [{}] complete: {}ms, {} fragments, {} workers",
                 queryId, durationMs, plan.fragments().size(), workerDurationsMs.size());
@@ -385,6 +408,18 @@ public final class QueryExecutionService {
                 }
             }
         }
+        for (BroadcastTable broadcastTable : plan.subqueryBroadcastTables()) {
+            for (int shardId = 0; shardId < broadcastTable.shardCount(); shardId++) {
+                if (!workerHasShard(workerId, broadcastTable.tableName(), shardId)) {
+                    prefetchShard(target, broadcastTable.tableName(), shardId);
+                }
+            }
+        }
+        for (String tableName : plan.correlatedCoPartitionTables()) {
+            if (!workerHasShard(workerId, tableName, drivingShardId)) {
+                prefetchShard(target, tableName, drivingShardId);
+            }
+        }
     }
 
     private ExecutionOutcome tryExecuteOnWorker(String queryId, FragmentSpec fragment, String targetWorkerId) {
@@ -401,6 +436,29 @@ public final class QueryExecutionService {
         }
     }
 
+
+    private Map<String, RowBatchData> fetchCoordinatorTables(String queryId, PlannedQuery plan) {
+        if (!plan.hasWithCte()) {
+            return Map.of();
+        }
+        Map<String, RowBatchData> tables = new LinkedHashMap<>();
+        for (String tableName : plan.withCte().coordinatorDimensionTables()) {
+            String workerId = resolveRegisteredCandidate(tableName, 0);
+            if (workerId == null) {
+                workerId = pickFallbackWorker();
+            }
+            WorkerRegistry.WorkerRecord worker = registry.getWorker(workerId)
+                    .orElseThrow(() -> new IllegalStateException("No worker available for coordinator table " + tableName));
+            String sql = "SELECT * FROM \"" + tableName + "_shard0\".\"" + tableName + "\"";
+            FragmentSpec fragment = new FragmentSpec(-1, 0, sql, MergeStrategyType.CONCATENATE);
+            List<RowBatchData> batches = workerClient.executeFragment(worker, queryId + "-coord-" + tableName, fragment);
+            if (batches.isEmpty()) {
+                throw new IllegalStateException("Coordinator table fetch returned no rows for " + tableName);
+            }
+            tables.put(tableName, batches.get(0));
+        }
+        return tables;
+    }
 
     private record ExecutionOutcome(String workerId, long durationMs, List<RowBatchData> batches) {}
 

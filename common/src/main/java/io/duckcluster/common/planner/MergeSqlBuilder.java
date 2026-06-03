@@ -3,6 +3,7 @@ package io.duckcluster.common.planner;
 import io.duckcluster.common.model.AggregateFunction;
 import io.duckcluster.common.model.AggregateSpec;
 import io.duckcluster.common.model.OrderByClause;
+import io.duckcluster.common.model.ComputedOutputSpec;
 import io.duckcluster.common.model.QueryAnalysis;
 import io.duckcluster.common.model.TopKSpec;
 
@@ -31,6 +32,9 @@ public final class MergeSqlBuilder {
             }
             if (analysis.groupByColumns().contains(outputColumn)) {
                 sql.append(quote(outputColumn));
+            } else if (computedOutputForColumn(analysis, outputColumn) != null) {
+                sql.append(computedOutputForColumn(analysis, outputColumn).mergeExpressionSql());
+                sql.append(" AS ").append(quote(outputColumn));
             } else {
                 AggregateSpec aggregate = aggregateForOutput(analysis, outputColumn);
                 if (aggregate.part() == AggregateSpec.AggregatePart.AVG_SUM) {
@@ -52,8 +56,17 @@ public final class MergeSqlBuilder {
                 sql.append(quote(analysis.groupByColumns().get(i)));
             }
         }
-        appendOrderByAndLimit(sql, topK, false);
+        appendOrderByAndLimit(sql, topK, analysis, false);
         return sql.toString();
+    }
+
+    private static ComputedOutputSpec computedOutputForColumn(QueryAnalysis analysis, String outputColumn) {
+        for (ComputedOutputSpec computed : analysis.computedOutputs()) {
+            if (computed.outputName().equals(outputColumn)) {
+                return computed;
+            }
+        }
+        return null;
     }
 
     private static AggregateSpec aggregateForOutput(QueryAnalysis analysis, String outputColumn) {
@@ -69,6 +82,20 @@ public final class MergeSqlBuilder {
     }
 
     public static String buildPartialAggMerge(QueryAnalysis analysis) {
+        if (analysis.hasComputedOutputs()) {
+            StringBuilder sql = new StringBuilder("SELECT ");
+            boolean first = true;
+            for (ComputedOutputSpec computed : analysis.computedOutputs()) {
+                if (!first) {
+                    sql.append(", ");
+                }
+                sql.append(computed.mergeExpressionSql());
+                sql.append(" AS ").append(quote(computed.outputName()));
+                first = false;
+            }
+            return sql.append(" FROM ").append(TEMP_TABLE).toString();
+        }
+
         StringBuilder sql = new StringBuilder("SELECT ");
         boolean first = true;
         for (AggregateSpec aggregate : analysis.aggregates()) {
@@ -100,11 +127,11 @@ public final class MergeSqlBuilder {
             first = false;
         }
         sql.append(" FROM ").append(TEMP_TABLE);
-        appendOrderByAndLimit(sql, topK, true);
+        appendOrderByAndLimit(sql, topK, analysis, false);
         return sql.toString();
     }
 
-    private static void appendOrderByAndLimit(StringBuilder sql, TopKSpec topK, boolean castOrderColumns) {
+    private static void appendOrderByAndLimit(StringBuilder sql, TopKSpec topK, QueryAnalysis analysis, boolean unused) {
         if (topK.hasOrderBy()) {
             sql.append(" ORDER BY ");
             for (int i = 0; i < topK.orderBy().size(); i++) {
@@ -112,8 +139,8 @@ public final class MergeSqlBuilder {
                     sql.append(", ");
                 }
                 OrderByClause clause = topK.orderBy().get(i);
-                if (castOrderColumns) {
-                    sql.append("CAST(").append(quote(clause.column())).append(" AS DOUBLE)");
+                if (analysis != null && hasAggregatesOrComputed(analysis)) {
+                    sql.append(TopKResolver.mergeOrderExpression(clause, analysis));
                 } else {
                     sql.append(quote(clause.column()));
                 }
@@ -125,6 +152,10 @@ public final class MergeSqlBuilder {
         if (topK.hasLimit()) {
             sql.append(" LIMIT ").append(topK.limit());
         }
+    }
+
+    private static boolean hasAggregatesOrComputed(QueryAnalysis analysis) {
+        return !analysis.aggregates().isEmpty() || !analysis.computedOutputs().isEmpty();
     }
 
     public static List<String> tempTableColumns(QueryAnalysis analysis) {
@@ -141,6 +172,9 @@ public final class MergeSqlBuilder {
 
     private static String mergeExpression(AggregateSpec aggregate) {
         String column = quote(aggregate.mergeColumnName());
+        if (aggregate.part() == AggregateSpec.AggregatePart.DISTINCT_COUNT) {
+            return "COUNT(DISTINCT " + column + ")";
+        }
         return switch (aggregate.function()) {
             case COUNT, SUM -> "SUM(" + column + ")";
             case MIN -> "MIN(" + column + ")";

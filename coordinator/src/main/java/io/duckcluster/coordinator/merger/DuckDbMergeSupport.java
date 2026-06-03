@@ -42,6 +42,74 @@ final class DuckDbMergeSupport {
         }
     }
 
+    static QueryResult mergeWithCte(
+            MergeContext context,
+            QueryResult.QueryStats stats,
+            String phase1Sql,
+            String phase2Sql,
+            Map<String, RowBatchData> coordinatorTables) {
+        List<String> tempColumns = MergeSqlColumns.fromContext(context);
+        List<List<Object>> rows = collectRows(context, tempColumns);
+        try (Connection connection = DriverManager.getConnection("jdbc:duckdb:")) {
+            createTempTable(connection, context.plan().analysis(), rows);
+            List<String> phase1Columns;
+            List<List<Object>> phase1Rows;
+            try (Statement statement = connection.createStatement();
+                    ResultSet phase1Result = statement.executeQuery(phase1Sql)) {
+                phase1Columns = readColumnLabels(phase1Result);
+                phase1Rows = readRows(phase1Result);
+            } finally {
+                connection.createStatement().execute("DROP TABLE IF EXISTS " + TEMP_TABLE);
+            }
+
+            createNamedTempTable(
+                    connection,
+                    TEMP_TABLE,
+                    phase1Columns,
+                    phase1Rows,
+                    nestedDerivedColumnTypes(context.plan().analysis(), phase1Columns));
+
+            for (Map.Entry<String, RowBatchData> entry : coordinatorTables.entrySet()) {
+                RowBatchData batch = entry.getValue();
+                createNamedTempTable(
+                        connection,
+                        entry.getKey(),
+                        batch.columnNames(),
+                        batchRows(batch),
+                        varcharColumnTypes(batch.columnNames().size()));
+            }
+
+            try (Statement statement = connection.createStatement();
+                    ResultSet phase2Result = statement.executeQuery(phase2Sql)) {
+                return toQueryResult(context.queryId(), phase2Result, stats);
+            } finally {
+                connection.createStatement().execute("DROP TABLE IF EXISTS " + TEMP_TABLE);
+                for (String tableName : coordinatorTables.keySet()) {
+                    connection.createStatement().execute("DROP TABLE IF EXISTS " + tableName);
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException(
+                    "Failed to merge WITH CTE results in coordinator DuckDB: " + e.getMessage(), e);
+        }
+    }
+
+    private static List<List<Object>> batchRows(RowBatchData batch) {
+        List<List<Object>> rows = new ArrayList<>();
+        for (List<String> row : batch.rows()) {
+            rows.add(new ArrayList<>(row));
+        }
+        return rows;
+    }
+
+    private static List<String> varcharColumnTypes(int columnCount) {
+        List<String> types = new ArrayList<>(columnCount);
+        for (int i = 0; i < columnCount; i++) {
+            types.add("VARCHAR");
+        }
+        return types;
+    }
+
     static QueryResult mergeNestedGroupBy(
             MergeContext context,
             QueryResult.QueryStats stats,
@@ -242,6 +310,9 @@ final class DuckDbMergeSupport {
         }
         for (var aggregate : analysis.aggregates()) {
             if (aggregate.mergeColumnName().equals(column)) {
+                if (aggregate.part() == io.duckcluster.common.model.AggregateSpec.AggregatePart.DISTINCT_COUNT) {
+                    return "BIGINT";
+                }
                 return "DOUBLE";
             }
         }

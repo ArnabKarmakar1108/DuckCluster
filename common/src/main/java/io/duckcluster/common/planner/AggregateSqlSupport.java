@@ -3,7 +3,9 @@ package io.duckcluster.common.planner;
 import io.duckcluster.common.model.AggregateFunction;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.SqlSelectKeyword;
 
 public final class AggregateSqlSupport {
     private AggregateSqlSupport() {}
@@ -20,7 +22,9 @@ public final class AggregateSqlSupport {
     }
 
     public static AggregateFunction toAggregateFunction(SqlCall call) {
-        if (call.getKind() == SqlKind.COUNT || "COUNT".equalsIgnoreCase(call.getOperator().getName())) {
+        if (isCountDistinct(call)
+                || call.getKind() == SqlKind.COUNT
+                || "COUNT".equalsIgnoreCase(call.getOperator().getName())) {
             return AggregateFunction.COUNT;
         }
         if (call.getKind() == SqlKind.SUM || "SUM".equalsIgnoreCase(call.getOperator().getName())) {
@@ -36,6 +40,15 @@ public final class AggregateSqlSupport {
             return AggregateFunction.AVG;
         }
         throw new IllegalArgumentException("Unsupported aggregate: " + call);
+    }
+
+    public static boolean isCountDistinct(SqlCall call) {
+        if (!"COUNT".equalsIgnoreCase(call.getOperator().getName())) {
+            return false;
+        }
+        SqlLiteral quantifier = call.getFunctionQuantifier();
+        return quantifier != null
+                && SqlSelectKeyword.DISTINCT == quantifier.symbolValue(SqlSelectKeyword.class);
     }
 
     private static boolean isKnownAggregateName(String name) {
