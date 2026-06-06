@@ -9,21 +9,46 @@ HARNESS_ROOT = Path(__file__).resolve().parent.parent
 QUERIES_DIR = HARNESS_ROOT / "queries" / "tpch"
 DEFAULT_SF = 0.01
 
-# Queries expected to pass end-to-end after Phase 1 (single-table lineitem).
-PHASE1_PASSING = ("q01", "q06")
-
-# Queries expected to pass end-to-end after Phase 2 (derived tables in FROM).
-# Q08 needs Phase 4 (multi-aggregate arithmetic in SELECT).
-PHASE2_PASSING = ("q07", "q09", "q13")
-
-# Combined passing set for correctness tests.
-# Phase 3: comma-joins, table aliases, qualified names.
-PHASE3_PASSING = ("q05", "q10", "q12")
-
-PASSING_QUERIES = PHASE1_PASSING + PHASE2_PASSING + PHASE3_PASSING
-
 # All 22 queries for planning/correctness tracking.
 ALL_QUERIES = tuple(f"q{i:02d}" for i in range(1, 23))
+
+# Expression aggregates on lineitem (SUM of expressions, CASE).
+EXPRESSION_AGGREGATE_PASSING = ("q01", "q06")
+
+# Derived tables in FROM (inline views). Q08 needs nested aggregate arithmetic.
+DERIVED_TABLE_FROM_PASSING = ("q07", "q09", "q13")
+
+# Comma-joins, table aliases, qualified names.
+COMMA_JOIN_ALIAS_PASSING = ("q05", "q10", "q12")
+
+# Arithmetic over nested aggregates in SELECT.
+NESTED_AGGREGATE_ARITHMETIC_PASSING = ("q08", "q14")
+
+# Reserved SQL aliases (value).
+RESERVED_ALIAS_PASSING = ("q11",)
+
+# COUNT(DISTINCT ...) global merge.
+COUNT_DISTINCT_PASSING = ("q16",)
+
+# Uncorrelated IN/NOT IN/EXISTS with global subquery semantics.
+UNCORRELATED_SUBQUERY_PASSING = ("q18",)
+
+# Correlated EXISTS/NOT EXISTS with co-located shard rewrite.
+COLOCATED_EXISTS_PASSING = ("q04", "q21")
+
+# Correlated scalar subqueries and derived-table predicate rewrite.
+CORRELATED_SCALAR_SUBQUERY_PASSING = ("q02", "q17", "q20", "q22")
+
+# WITH/CTE coordinator two-step merge.
+WITH_CTE_MERGE_PASSING = ("q15",)
+
+# TOP_K ORDER BY on aggregate aliases after joins.
+TOPK_AGGREGATE_ALIAS_PASSING = ("q03", "q19")
+
+# Full end-to-end gate: fragment validation, worker execution, merge.
+FULL_CORRECTNESS_PASSING = ALL_QUERIES
+
+PASSING_QUERIES = ALL_QUERIES
 
 
 def tpch_data_dir(repo_root: Path, scale_factor: float = DEFAULT_SF) -> Path:

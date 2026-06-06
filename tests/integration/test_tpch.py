@@ -8,14 +8,23 @@ import pytest
 
 from duckcluster.baseline import expected_for_tpch
 from duckcluster.cluster import ClusterConfig, ClusterManager
-from duckcluster.compare import assert_result_matches, assert_tpch_result_matches
+from duckcluster.compare import assert_tpch_result_matches
 from duckcluster.query import QueryClient
 from duckcluster.tpch import (
     ALL_QUERIES,
+    COLOCATED_EXISTS_PASSING,
+    COMMA_JOIN_ALIAS_PASSING,
+    CORRELATED_SCALAR_SUBQUERY_PASSING,
+    COUNT_DISTINCT_PASSING,
+    DERIVED_TABLE_FROM_PASSING,
+    EXPRESSION_AGGREGATE_PASSING,
+    FULL_CORRECTNESS_PASSING,
+    NESTED_AGGREGATE_ARITHMETIC_PASSING,
     PASSING_QUERIES,
-    PHASE1_PASSING,
-    PHASE2_PASSING,
-    PHASE3_PASSING,
+    RESERVED_ALIAS_PASSING,
+    TOPK_AGGREGATE_ALIAS_PASSING,
+    UNCORRELATED_SUBQUERY_PASSING,
+    WITH_CTE_MERGE_PASSING,
     ensure_tpch_data,
     load_tpch_sql,
 )
@@ -69,7 +78,7 @@ def test_tpch_correctness(
     tpch_query_client: QueryClient,
     tpch_baseline_db: Path,
 ) -> None:
-    """Passing TPC-H queries must match single-node baseline on SF0.01."""
+    """All TPC-H queries must match single-node baseline on SF0.01."""
     sql = load_tpch_sql(query_id)
     expected = expected_for_tpch(tpch_baseline_db, sql)
     actual = tpch_query_client.query(sql)
@@ -77,13 +86,13 @@ def test_tpch_correctness(
 
 
 @pytest.mark.tpch
-@pytest.mark.parametrize("query_id", PHASE1_PASSING)
-def test_tpch_phase1_correctness(
+@pytest.mark.parametrize("query_id", EXPRESSION_AGGREGATE_PASSING)
+def test_tpch_expression_aggregate_correctness(
     query_id: str,
     tpch_query_client: QueryClient,
     tpch_baseline_db: Path,
 ) -> None:
-    """Backward-compatible alias for Phase 1 passing queries."""
+    """Queries with expression aggregates on lineitem."""
     sql = load_tpch_sql(query_id)
     expected = expected_for_tpch(tpch_baseline_db, sql)
     actual = tpch_query_client.query(sql)
@@ -91,13 +100,13 @@ def test_tpch_phase1_correctness(
 
 
 @pytest.mark.tpch
-@pytest.mark.parametrize("query_id", PHASE2_PASSING)
-def test_tpch_phase2_correctness(
+@pytest.mark.parametrize("query_id", DERIVED_TABLE_FROM_PASSING)
+def test_tpch_derived_table_from_correctness(
     query_id: str,
     tpch_query_client: QueryClient,
     tpch_baseline_db: Path,
 ) -> None:
-    """Phase 2 queries with derived tables in FROM."""
+    """Queries with derived tables in FROM."""
     sql = load_tpch_sql(query_id)
     expected = expected_for_tpch(tpch_baseline_db, sql)
     actual = tpch_query_client.query(sql)
@@ -105,13 +114,139 @@ def test_tpch_phase2_correctness(
 
 
 @pytest.mark.tpch
-@pytest.mark.parametrize("query_id", PHASE3_PASSING)
-def test_tpch_phase3_correctness(
+@pytest.mark.parametrize("query_id", COMMA_JOIN_ALIAS_PASSING)
+def test_tpch_comma_join_alias_correctness(
     query_id: str,
     tpch_query_client: QueryClient,
     tpch_baseline_db: Path,
 ) -> None:
-    """Phase 3 queries with comma-joins and table aliases."""
+    """Queries with comma-joins and table aliases."""
+    sql = load_tpch_sql(query_id)
+    expected = expected_for_tpch(tpch_baseline_db, sql)
+    actual = tpch_query_client.query(sql)
+    assert_tpch_result_matches(actual, expected)
+
+
+@pytest.mark.tpch
+@pytest.mark.parametrize("query_id", NESTED_AGGREGATE_ARITHMETIC_PASSING)
+def test_tpch_nested_aggregate_arithmetic_correctness(
+    query_id: str,
+    tpch_query_client: QueryClient,
+    tpch_baseline_db: Path,
+) -> None:
+    """Queries with arithmetic over nested aggregates."""
+    sql = load_tpch_sql(query_id)
+    expected = expected_for_tpch(tpch_baseline_db, sql)
+    actual = tpch_query_client.query(sql)
+    assert_tpch_result_matches(actual, expected)
+
+
+@pytest.mark.tpch
+@pytest.mark.parametrize("query_id", RESERVED_ALIAS_PASSING)
+def test_tpch_reserved_alias_correctness(
+    query_id: str,
+    tpch_query_client: QueryClient,
+    tpch_baseline_db: Path,
+) -> None:
+    """Queries with reserved-word aliases."""
+    sql = load_tpch_sql(query_id)
+    expected = expected_for_tpch(tpch_baseline_db, sql)
+    actual = tpch_query_client.query(sql)
+    assert_tpch_result_matches(actual, expected)
+
+
+@pytest.mark.tpch
+@pytest.mark.parametrize("query_id", COUNT_DISTINCT_PASSING)
+def test_tpch_count_distinct_correctness(
+    query_id: str,
+    tpch_query_client: QueryClient,
+    tpch_baseline_db: Path,
+) -> None:
+    """Queries with COUNT(DISTINCT ...) global merge."""
+    sql = load_tpch_sql(query_id)
+    expected = expected_for_tpch(tpch_baseline_db, sql)
+    actual = tpch_query_client.query(sql)
+    assert_tpch_result_matches(actual, expected)
+
+
+@pytest.mark.tpch
+@pytest.mark.parametrize("query_id", UNCORRELATED_SUBQUERY_PASSING)
+def test_tpch_uncorrelated_subquery_correctness(
+    query_id: str,
+    tpch_query_client: QueryClient,
+    tpch_baseline_db: Path,
+) -> None:
+    """Queries with uncorrelated predicate subqueries."""
+    sql = load_tpch_sql(query_id)
+    expected = expected_for_tpch(tpch_baseline_db, sql)
+    actual = tpch_query_client.query(sql)
+    assert_tpch_result_matches(actual, expected)
+
+
+@pytest.mark.tpch
+@pytest.mark.parametrize("query_id", COLOCATED_EXISTS_PASSING)
+def test_tpch_colocated_exists_correctness(
+    query_id: str,
+    tpch_query_client: QueryClient,
+    tpch_baseline_db: Path,
+) -> None:
+    """Queries with correlated EXISTS/NOT EXISTS and co-located shards."""
+    sql = load_tpch_sql(query_id)
+    expected = expected_for_tpch(tpch_baseline_db, sql)
+    actual = tpch_query_client.query(sql)
+    assert_tpch_result_matches(actual, expected)
+
+
+@pytest.mark.tpch
+@pytest.mark.parametrize("query_id", CORRELATED_SCALAR_SUBQUERY_PASSING)
+def test_tpch_correlated_scalar_subquery_correctness(
+    query_id: str,
+    tpch_query_client: QueryClient,
+    tpch_baseline_db: Path,
+) -> None:
+    """Queries with correlated scalar subqueries and derived-table predicates."""
+    sql = load_tpch_sql(query_id)
+    expected = expected_for_tpch(tpch_baseline_db, sql)
+    actual = tpch_query_client.query(sql)
+    assert_tpch_result_matches(actual, expected)
+
+
+@pytest.mark.tpch
+@pytest.mark.parametrize("query_id", WITH_CTE_MERGE_PASSING)
+def test_tpch_with_cte_merge_correctness(
+    query_id: str,
+    tpch_query_client: QueryClient,
+    tpch_baseline_db: Path,
+) -> None:
+    """Queries with WITH/CTE coordinator two-step merge."""
+    sql = load_tpch_sql(query_id)
+    expected = expected_for_tpch(tpch_baseline_db, sql)
+    actual = tpch_query_client.query(sql)
+    assert_tpch_result_matches(actual, expected)
+
+
+@pytest.mark.tpch
+@pytest.mark.parametrize("query_id", TOPK_AGGREGATE_ALIAS_PASSING)
+def test_tpch_topk_aggregate_alias_correctness(
+    query_id: str,
+    tpch_query_client: QueryClient,
+    tpch_baseline_db: Path,
+) -> None:
+    """Queries with TOP_K ORDER BY on aggregate aliases."""
+    sql = load_tpch_sql(query_id)
+    expected = expected_for_tpch(tpch_baseline_db, sql)
+    actual = tpch_query_client.query(sql)
+    assert_tpch_result_matches(actual, expected)
+
+
+@pytest.mark.tpch
+@pytest.mark.parametrize("query_id", FULL_CORRECTNESS_PASSING)
+def test_tpch_full_correctness(
+    query_id: str,
+    tpch_query_client: QueryClient,
+    tpch_baseline_db: Path,
+) -> None:
+    """Full 22-query gate: planning, fragment execution, and merge succeed."""
     sql = load_tpch_sql(query_id)
     expected = expected_for_tpch(tpch_baseline_db, sql)
     actual = tpch_query_client.query(sql)
@@ -127,21 +262,3 @@ def test_tpch_query_files_load(query_id: str) -> None:
     assert stripped.startswith("SELECT") or stripped.startswith("WITH"), (
         f"{query_id} must be a SELECT or WITH query"
     )
-
-
-@pytest.mark.tpch
-@pytest.mark.xfail(reason="Pending later planner phases", strict=False)
-@pytest.mark.parametrize(
-    "query_id",
-    [q for q in ALL_QUERIES if q not in PASSING_QUERIES],
-)
-def test_tpch_full_correctness_pending(
-    query_id: str,
-    tpch_query_client: QueryClient,
-    tpch_baseline_db: Path,
-) -> None:
-    """Track remaining queries; remove xfail as planner phases land."""
-    sql = load_tpch_sql(query_id)
-    expected = expected_for_tpch(tpch_baseline_db, sql)
-    actual = tpch_query_client.query(sql)
-    assert_tpch_result_matches(actual, expected)
