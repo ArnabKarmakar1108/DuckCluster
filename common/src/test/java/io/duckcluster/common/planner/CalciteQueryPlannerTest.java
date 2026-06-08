@@ -117,9 +117,8 @@ class CalciteQueryPlannerTest {
 
         String sql0 = planned.fragments().get(0).sql();
         assertTrue(sql0.contains("\"lineitem_shard0\".\"lineitem\""), "Driving table shard-qualified: " + sql0);
-        assertTrue(sql0.contains("UNION ALL"), "Broadcast table uses UNION ALL: " + sql0);
-        assertTrue(sql0.contains("\"customer_shard0\".\"customer\""), "Broadcast shard 0: " + sql0);
-        assertTrue(sql0.contains("\"customer_shard1\".\"customer\""), "Broadcast shard 1: " + sql0);
+        assertTrue(sql0.contains("__dc_bcast_customer"), "Broadcast table materialized: " + sql0);
+        assertTrue(!sql0.contains("UNION ALL"), "Broadcast avoids per-fragment UNION ALL: " + sql0);
         assertTrue(sql0.contains("GROUP BY"), "Preserves GROUP BY: " + sql0);
     }
 
@@ -141,9 +140,8 @@ class CalciteQueryPlannerTest {
 
         String sql0 = planned.fragments().get(0).sql();
         assertTrue(sql0.contains("\"orders_shard0\".\"orders\""), "Driving table: " + sql0);
-        assertTrue(sql0.contains("UNION ALL"), "Lineitem is broadcast: " + sql0);
-        assertTrue(sql0.contains("\"lineitem_shard0\".\"lineitem\""), "Lineitem shard 0: " + sql0);
-        assertTrue(sql0.contains("\"lineitem_shard3\".\"lineitem\""), "Lineitem shard 3: " + sql0);
+        assertTrue(sql0.contains("__dc_bcast_lineitem"), "Lineitem is materialized broadcast: " + sql0);
+        assertTrue(!sql0.contains("UNION ALL"), "Broadcast avoids per-fragment UNION ALL: " + sql0);
     }
 
     @Test

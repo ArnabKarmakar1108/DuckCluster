@@ -13,6 +13,14 @@ class TpchTopKPhase8Test {
     private final io.duckcluster.common.model.ClusterCatalog tpch = TpchCatalog.create();
 
     @Test
+    void q03FragmentSqlOversamplesTopKPerShard() throws Exception {
+        PlannedQuery planned = planner.plan(load("q03.sql"), tpch);
+        String fragmentSql = planned.fragments().get(0).sql();
+        assertTrue(fragmentSql.contains("ORDER BY \"__dc_agg_0\" DESC"));
+        assertTrue(fragmentSql.contains("LIMIT 60"));
+    }
+
+    @Test
     void q03MergeOrdersByAggregateExpression() throws Exception {
         PlannedQuery planned = planner.plan(load("q03.sql"), tpch);
         String mergeSql = MergeSqlBuilder.buildGroupByMerge(planned.analysis(), planned.topK());

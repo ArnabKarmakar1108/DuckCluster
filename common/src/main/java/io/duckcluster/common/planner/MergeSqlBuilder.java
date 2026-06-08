@@ -22,6 +22,35 @@ public final class MergeSqlBuilder {
         return buildGroupByMerge(analysis, topK, null);
     }
 
+    /** Intermediate hierarchical merge — keeps merge column names for another merge pass. */
+    public static String buildGroupByIntermediateMerge(QueryAnalysis analysis) {
+        StringBuilder sql = new StringBuilder("SELECT ");
+        boolean first = true;
+        for (String groupColumn : analysis.groupByColumns()) {
+            if (!first) {
+                sql.append(", ");
+            }
+            sql.append(quote(groupColumn));
+            first = false;
+        }
+        for (AggregateSpec aggregate : analysis.aggregates()) {
+            sql.append(", ");
+            sql.append(mergeExpression(aggregate));
+            sql.append(" AS ").append(quote(aggregate.mergeColumnName()));
+        }
+        sql.append(" FROM ").append(TEMP_TABLE);
+        if (!analysis.groupByColumns().isEmpty()) {
+            sql.append(" GROUP BY ");
+            for (int i = 0; i < analysis.groupByColumns().size(); i++) {
+                if (i > 0) {
+                    sql.append(", ");
+                }
+                sql.append(quote(analysis.groupByColumns().get(i)));
+            }
+        }
+        return sql.toString();
+    }
+
     public static String buildGroupByMerge(QueryAnalysis analysis, TopKSpec topK, List<String> outputAliases) {
         StringBuilder sql = new StringBuilder("SELECT ");
         boolean first = true;

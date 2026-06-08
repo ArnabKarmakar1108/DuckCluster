@@ -35,6 +35,24 @@ final class TopKResolver {
         return resolve(raw, analysis);
     }
 
+    static String fragmentOrderExpression(OrderByClause clause, QueryAnalysis analysis) {
+        String column = clause.column();
+        for (AggregateSpec aggregate : analysis.aggregates()) {
+            if (aggregate.part() == AggregateSpec.AggregatePart.AVG_COUNT) {
+                continue;
+            }
+            if (aggregate.outputName().equals(column)) {
+                return quote(aggregate.mergeColumnName());
+            }
+        }
+        for (ComputedOutputSpec computed : analysis.computedOutputs()) {
+            if (computed.outputName().equals(column)) {
+                return quote(column);
+            }
+        }
+        return quote(column);
+    }
+
     static String mergeOrderExpression(OrderByClause clause, QueryAnalysis analysis) {
         String column = clause.column();
         for (AggregateSpec aggregate : analysis.aggregates()) {

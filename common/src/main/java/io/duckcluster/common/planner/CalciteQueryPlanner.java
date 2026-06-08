@@ -28,10 +28,12 @@ import org.apache.calcite.sql.validate.SqlConformanceEnum;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.Set;
 
 public final class CalciteQueryPlanner implements QueryPlanner {
@@ -72,12 +74,15 @@ public final class CalciteQueryPlanner implements QueryPlanner {
                 select, catalog, classification.broadcastTables(), drivingTable);
         List<String> correlatedCoPartition = correlatedCoPartitionTables(
                 select, catalog, classification.broadcastTables(), subqueryBroadcasts, drivingTable);
+        Set<String> materializedBroadcastTables = materializedBroadcastTables(
+                classification.broadcastTables(), subqueryBroadcasts);
 
         List<FragmentSpec> fragments = new ArrayList<>(shardCount);
         for (int shardId = 0; shardId < shardCount; shardId++) {
+        TopKSpec fragmentTopK = MergePushdownPlanner.fragmentTopK(analysis, topK, shardCount);
             String fragmentSql = FragmentSqlGenerator.generate(
                     select, shardId, analysis, drivingTable, broadcastShardCounts,
-                    catalogTableShardCounts, topK);
+                    catalogTableShardCounts, fragmentTopK, materializedBroadcastTables);
             fragments.add(new FragmentSpec(shardId, shardId, fragmentSql, mergeStrategy));
         }
 
@@ -124,10 +129,11 @@ public final class CalciteQueryPlanner implements QueryPlanner {
                 outerTopK);
 
         List<FragmentSpec> fragments = new ArrayList<>(shardCount);
+        Set<String> materializedBroadcastTables = materializedBroadcastTables(classification.broadcastTables());
         for (int shardId = 0; shardId < shardCount; shardId++) {
             String fragmentSql = FragmentSqlGenerator.generate(
                     cteSelect, shardId, innerAnalysis, drivingTable, broadcastShardCounts,
-                    catalogTableShardCounts, TopKSpec.none());
+                    catalogTableShardCounts, TopKSpec.none(), materializedBroadcastTables);
             fragments.add(new FragmentSpec(shardId, shardId, fragmentSql, MergeStrategyType.WITH_CTE_MERGE));
         }
 
@@ -166,12 +172,14 @@ public final class CalciteQueryPlanner implements QueryPlanner {
                 innerSelect, catalog, classification.broadcastTables(), drivingTable);
         List<String> correlatedCoPartition = correlatedCoPartitionTables(
                 innerSelect, catalog, classification.broadcastTables(), subqueryBroadcasts, drivingTable);
+        Set<String> materializedBroadcastTables = materializedBroadcastTables(
+                classification.broadcastTables(), subqueryBroadcasts);
 
         List<FragmentSpec> fragments = new ArrayList<>(shardCount);
         for (int shardId = 0; shardId < shardCount; shardId++) {
             String fragmentSql = FragmentSqlGenerator.generate(
                     innerSelect, shardId, innerAnalysis, drivingTable, broadcastShardCounts,
-                    catalogTableShardCounts, TopKSpec.none());
+                    catalogTableShardCounts, TopKSpec.none(), materializedBroadcastTables);
             fragments.add(new FragmentSpec(shardId, shardId, fragmentSql, mergeStrategy));
         }
 
@@ -391,6 +399,19 @@ public final class CalciteQueryPlanner implements QueryPlanner {
         for (String tableName : SubqueryAnalyzer.correlatedCoPartitionTables(select, catalog, drivingTable)) {
             if (!alreadyCovered.contains(tableName)) {
                 tables.add(tableName);
+            }
+        }
+        return tables;
+    }
+
+    @SafeVarargs
+    private static Set<String> materializedBroadcastTables(List<BroadcastTable>... broadcastLists) {
+        Set<String> tables = new HashSet<>();
+        for (List<BroadcastTable> broadcastTables : broadcastLists) {
+            for (BroadcastTable broadcastTable : broadcastTables) {
+                if (broadcastTable.shardCount() > 1) {
+                    tables.add(broadcastTable.tableName().toLowerCase());
+                }
             }
         }
         return tables;

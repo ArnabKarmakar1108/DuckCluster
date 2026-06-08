@@ -87,17 +87,28 @@ class MergeSqlBuilderTest {
     }
 
     @Test
-    void buildsTopKMergeSql() {
+    void intermediateMergeKeepsDecomposedAvgParts() {
         QueryAnalysis analysis = new QueryAnalysis(
-                List.of(),
-                List.of(),
-                List.of("id", "value"));
-        TopKSpec topK = new TopKSpec(List.of(new io.duckcluster.common.model.OrderByClause("value", true)), 5);
+                List.of("category"),
+                List.of(
+                        new AggregateSpec(
+                                "avg_score",
+                                "__dc_agg_0_sum",
+                                AggregateFunction.SUM,
+                                "score",
+                                AggregateSpec.AggregatePart.AVG_SUM),
+                        new AggregateSpec(
+                                "avg_score",
+                                "__dc_agg_0_cnt",
+                                AggregateFunction.COUNT,
+                                "score",
+                                AggregateSpec.AggregatePart.AVG_COUNT)),
+                List.of("category", "avg_score"));
 
-        String sql = MergeSqlBuilder.buildTopKMerge(analysis, topK);
+        String sql = MergeSqlBuilder.buildGroupByIntermediateMerge(analysis);
 
-        assertEquals(
-                "SELECT \"id\", \"value\" FROM __merge_temp ORDER BY \"value\" DESC LIMIT 5",
-                sql);
+        assertTrue(sql.contains("SUM(\"__dc_agg_0_sum\") AS \"__dc_agg_0_sum\""));
+        assertTrue(sql.contains("SUM(\"__dc_agg_0_cnt\") AS \"__dc_agg_0_cnt\""));
+        assertTrue(!sql.contains("NULLIF"));
     }
 }

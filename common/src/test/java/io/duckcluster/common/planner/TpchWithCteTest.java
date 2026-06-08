@@ -31,7 +31,7 @@ class TpchWithCteTest {
     void q20CorrelatedScalarUsesGlobalLineitemUnion() throws Exception {
         PlannedQuery planned = planner.plan(load("q20.sql"), tpch);
         String fragmentSql = planned.fragments().get(0).sql();
-        assertTrue(fragmentSql.contains("UNION ALL"));
+        assertTrue(fragmentSql.contains("__dc_bcast_lineitem"));
         assertTrue(planned.subqueryBroadcastTables().stream()
                 .anyMatch(table -> table.tableName().equals("lineitem")));
     }
@@ -41,7 +41,7 @@ class TpchWithCteTest {
         PlannedQuery planned = planner.plan(load("q22.sql"), tpch);
         String fragmentSql = planned.fragments().get(0).sql();
         assertTrue(fragmentSql.contains("customer_shard0"));
-        assertTrue(fragmentSql.contains("UNION ALL"));
+        assertTrue(fragmentSql.contains("__dc_bcast_orders"));
         assertTrue(planned.subqueryBroadcastTables().stream()
                 .anyMatch(table -> table.tableName().equals("orders")));
     }

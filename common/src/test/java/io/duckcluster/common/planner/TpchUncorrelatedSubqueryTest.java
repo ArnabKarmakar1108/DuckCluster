@@ -26,9 +26,8 @@ class TpchUncorrelatedSubqueryTest {
     void plansQ18WithGlobalLineitemUnionInSubquery() throws Exception {
         PlannedQuery planned = planner.plan(loadQuery("Q18.sql"), tpchCatalog);
         String fragmentSql = planned.fragments().get(0).sql();
-        assertTrue(fragmentSql.contains("UNION ALL"), fragmentSql);
-        assertTrue(fragmentSql.contains("lineitem_shard0"), fragmentSql);
-        assertTrue(fragmentSql.contains("lineitem_shard5"), fragmentSql);
+        assertTrue(fragmentSql.contains("__dc_bcast_lineitem"), fragmentSql);
+        assertTrue(!fragmentSql.contains("UNION ALL"), fragmentSql);
     }
 
     @Test

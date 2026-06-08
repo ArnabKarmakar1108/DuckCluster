@@ -77,7 +77,7 @@ class TpchImplicitJoinTest {
                 catalog);
 
         String fragmentSql = planned.fragments().get(0).sql();
-        assertTrue(fragmentSql.contains("UNION ALL"), fragmentSql);
+        assertTrue(fragmentSql.contains("__dc_bcast_customer"), fragmentSql);
         assertTrue(fragmentSql.contains(" AS \"c\"") || fragmentSql.contains(" AS \"l\""), fragmentSql);
     }
 
