@@ -3,6 +3,7 @@ package io.duckcluster.worker;
 import io.duckcluster.common.config.ClusterConfig;
 import io.duckcluster.proto.v1.ShardOwnership;
 import io.duckcluster.worker.client.CoordinatorClient;
+import io.duckcluster.worker.duckdb.BroadcastMaterializer;
 import io.duckcluster.worker.duckdb.DuckDBConnectionPool;
 import io.duckcluster.worker.duckdb.FragmentExecutor;
 import io.duckcluster.worker.duckdb.ShardFileWatcher;
@@ -47,6 +48,7 @@ public final class WorkerMain {
 
         DuckDBConnectionPool pool = new DuckDBConnectionPool(dbPath, config.poolSize(), config.poolWaitMs());
         FragmentExecutor fragmentExecutor = new FragmentExecutor(pool);
+        BroadcastMaterializer broadcastMaterializer = new BroadcastMaterializer(pool);
         CoordinatorClient coordinatorClient = new CoordinatorClient(config);
 
         Path cacheDir = dataDir.resolve(".cache");
@@ -54,7 +56,7 @@ public final class WorkerMain {
                 shardManager, coordinatorClient, workerId, cacheDir, config.cacheMaxShards());
 
         WorkerGrpcServer workerServer = new WorkerGrpcServer(
-                workerId, host, port, fragmentExecutor, shardManager, tempShardCache);
+                workerId, host, port, fragmentExecutor, shardManager, tempShardCache, broadcastMaterializer);
 
         ShardFileWatcher watcher = new ShardFileWatcher(
                 dataDir, shardManager, coordinatorClient, workerId, config.watcherIntervalMs());

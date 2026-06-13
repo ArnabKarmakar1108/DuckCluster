@@ -60,6 +60,42 @@ public final class WorkerNodeClient {
         }
     }
 
+    public void beginShardPin(WorkerRegistry.WorkerRecord worker) {
+        ManagedChannel channel = channelPool.getChannel(worker);
+        WorkerServiceGrpc.newBlockingStub(channel).beginShardPin(
+                io.duckcluster.proto.v1.BeginShardPinRequest.getDefaultInstance());
+    }
+
+    public void endShardPin(WorkerRegistry.WorkerRecord worker) {
+        ManagedChannel channel = channelPool.getChannel(worker);
+        WorkerServiceGrpc.newBlockingStub(channel).endShardPin(
+                io.duckcluster.proto.v1.EndShardPinRequest.getDefaultInstance());
+    }
+
+    public void materializeBroadcast(
+            WorkerRegistry.WorkerRecord worker, String queryId, String tableName, int shardCount) {
+        ManagedChannel channel = channelPool.getChannel(worker);
+        io.duckcluster.proto.v1.MaterializeBroadcastResponse response =
+                WorkerServiceGrpc.newBlockingStub(channel).materializeBroadcast(
+                        io.duckcluster.proto.v1.MaterializeBroadcastRequest.newBuilder()
+                                .setQueryId(queryId)
+                                .setTableName(tableName)
+                                .setShardCount(shardCount)
+                                .build());
+        if (!response.getAccepted()) {
+            throw new IllegalStateException(
+                    "Worker " + worker.workerId() + " rejected broadcast materialization for " + tableName);
+        }
+    }
+
+    public void clearBroadcastTables(WorkerRegistry.WorkerRecord worker, String queryId) {
+        ManagedChannel channel = channelPool.getChannel(worker);
+        WorkerServiceGrpc.newBlockingStub(channel).clearBroadcastTables(
+                io.duckcluster.proto.v1.ClearBroadcastTablesRequest.newBuilder()
+                        .setQueryId(queryId)
+                        .build());
+    }
+
     public Iterator<ShardDataChunk> streamShardFrom(
             WorkerRegistry.WorkerRecord worker, String tableName, int shardId) {
         ManagedChannel channel = channelPool.getChannel(worker);

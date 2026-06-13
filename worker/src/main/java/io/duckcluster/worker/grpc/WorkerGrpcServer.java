@@ -9,6 +9,7 @@ import io.duckcluster.proto.v1.ReceiveShardResponse;
 import io.duckcluster.proto.v1.RowBatch;
 import io.duckcluster.proto.v1.ShardDataChunk;
 import io.duckcluster.proto.v1.WorkerServiceGrpc;
+import io.duckcluster.worker.duckdb.BroadcastMaterializer;
 import io.duckcluster.worker.duckdb.FragmentExecutor;
 import io.duckcluster.worker.duckdb.ShardFileMetadata;
 import io.duckcluster.worker.duckdb.ShardManager;
@@ -41,17 +42,19 @@ public final class WorkerGrpcServer {
     private final FragmentExecutor fragmentExecutor;
     private final ShardManager shardManager;
     private final TempShardCache tempShardCache;
+    private final BroadcastMaterializer broadcastMaterializer;
     private Server server;
 
     public WorkerGrpcServer(String workerId, String host, int port,
                             FragmentExecutor fragmentExecutor, ShardManager shardManager,
-                            TempShardCache tempShardCache) {
+                            TempShardCache tempShardCache, BroadcastMaterializer broadcastMaterializer) {
         this.workerId = workerId;
         this.host = host;
         this.port = port;
         this.fragmentExecutor = fragmentExecutor;
         this.shardManager = shardManager;
         this.tempShardCache = tempShardCache;
+        this.broadcastMaterializer = broadcastMaterializer;
     }
 
     public void start() throws IOException {
@@ -334,6 +337,65 @@ public final class WorkerGrpcServer {
                     }
                 }
             };
+        }
+
+        @Override
+        public void beginShardPin(
+                io.duckcluster.proto.v1.BeginShardPinRequest request,
+                StreamObserver<io.duckcluster.proto.v1.BeginShardPinResponse> responseObserver) {
+            tempShardCache.beginPinSession();
+            responseObserver.onNext(io.duckcluster.proto.v1.BeginShardPinResponse.newBuilder()
+                    .setAccepted(true)
+                    .build());
+            responseObserver.onCompleted();
+        }
+
+        @Override
+        public void endShardPin(
+                io.duckcluster.proto.v1.EndShardPinRequest request,
+                StreamObserver<io.duckcluster.proto.v1.EndShardPinResponse> responseObserver) {
+            tempShardCache.endPinSession();
+            responseObserver.onNext(io.duckcluster.proto.v1.EndShardPinResponse.newBuilder()
+                    .setAccepted(true)
+                    .build());
+            responseObserver.onCompleted();
+        }
+
+        @Override
+        public void materializeBroadcast(
+                io.duckcluster.proto.v1.MaterializeBroadcastRequest request,
+                StreamObserver<io.duckcluster.proto.v1.MaterializeBroadcastResponse> responseObserver) {
+            try {
+                String tempTable = broadcastMaterializer.materialize(
+                        request.getTableName(), request.getShardCount());
+                responseObserver.onNext(io.duckcluster.proto.v1.MaterializeBroadcastResponse.newBuilder()
+                        .setAccepted(true)
+                        .setTempTableName(tempTable)
+                        .build());
+                responseObserver.onCompleted();
+            } catch (Exception e) {
+                LOG.error("Failed to materialize broadcast {} for query {}",
+                        request.getTableName(), request.getQueryId(), e);
+                responseObserver.onError(Status.INTERNAL
+                        .withDescription(e.getMessage()).asRuntimeException());
+            }
+        }
+
+        @Override
+        public void clearBroadcastTables(
+                io.duckcluster.proto.v1.ClearBroadcastTablesRequest request,
+                StreamObserver<io.duckcluster.proto.v1.ClearBroadcastTablesResponse> responseObserver) {
+            try {
+                broadcastMaterializer.clearAll();
+                responseObserver.onNext(io.duckcluster.proto.v1.ClearBroadcastTablesResponse.newBuilder()
+                        .setAccepted(true)
+                        .build());
+                responseObserver.onCompleted();
+            } catch (Exception e) {
+                LOG.error("Failed to clear broadcast tables for query {}", request.getQueryId(), e);
+                responseObserver.onError(Status.INTERNAL
+                        .withDescription(e.getMessage()).asRuntimeException());
+            }
         }
     }
 }

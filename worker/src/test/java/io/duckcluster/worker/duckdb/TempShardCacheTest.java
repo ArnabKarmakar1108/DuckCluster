@@ -113,6 +113,22 @@ class TempShardCacheTest {
         assertFalse(Files.exists(cacheDir.resolve("events_shard1.duckdb")));
     }
 
+    @Test
+    void pinSession_preventsEvictionDuringBroadcastPrefetch() throws Exception {
+        cache.beginPinSession();
+        try {
+            cache.loadShard("orders", 0, createShardFile("orders", 0));
+            cache.loadShard("orders", 1, createShardFile("orders", 1));
+            cache.loadShard("orders", 2, createShardFile("orders", 2));
+            cache.loadShard("orders", 3, createShardFile("orders", 3));
+
+            assertTrue(cache.hasShard("orders", 0));
+            assertTrue(cache.hasShard("orders", 3));
+        } finally {
+            cache.endPinSession();
+        }
+    }
+
     private Path createShardFile(String table, int shardId) throws Exception {
         Path tmpFile = tempDir.resolve(table + "_shard" + shardId + "_tmp.duckdb");
         try (Connection conn = DriverManager.getConnection("jdbc:duckdb:" + tmpFile);

@@ -21,6 +21,10 @@ service WorkerService {
   rpc ReadShard(ReadShardRequest) returns (stream ShardDataChunk);
   rpc ReceiveShard(stream ShardDataChunk) returns (ReceiveShardResponse);
   rpc LoadTempData(stream ShardDataChunk) returns (LoadTempDataResponse);
+  rpc BeginShardPin(BeginShardPinRequest) returns (BeginShardPinResponse);
+  rpc EndShardPin(EndShardPinRequest) returns (EndShardPinResponse);
+  rpc MaterializeBroadcast(MaterializeBroadcastRequest) returns (MaterializeBroadcastResponse);
+  rpc ClearBroadcastTables(ClearBroadcastTablesRequest) returns (ClearBroadcastTablesResponse);
 }
 
 message RegisterWorkerRequest {
@@ -114,6 +118,37 @@ message ReceiveShardResponse {
 message LoadTempDataResponse {
   bool accepted = 1;
   string catalog_name = 2;
+}
+
+message BeginShardPinRequest {}
+
+message BeginShardPinResponse {
+  bool accepted = 1;
+}
+
+message EndShardPinRequest {}
+
+message EndShardPinResponse {
+  bool accepted = 1;
+}
+
+message MaterializeBroadcastRequest {
+  string query_id = 1;
+  string table_name = 2;
+  uint32 shard_count = 3;
+}
+
+message MaterializeBroadcastResponse {
+  bool accepted = 1;
+  string temp_table_name = 2;
+}
+
+message ClearBroadcastTablesRequest {
+  string query_id = 1;
+}
+
+message ClearBroadcastTablesResponse {
+  bool accepted = 1;
 }
 
 message UpdateShardCacheRequest {

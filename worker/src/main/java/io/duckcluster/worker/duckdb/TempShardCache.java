@@ -10,9 +10,12 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public final class TempShardCache implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(TempShardCache.class);
@@ -23,6 +26,8 @@ public final class TempShardCache implements AutoCloseable {
     private final Path cacheDir;
     private final int maxShards;
     private final LinkedHashMap<String, CacheEntry> entries;
+    private int pinSessionDepth;
+    private final Set<String> pinnedKeys = new HashSet<>();
 
     public TempShardCache(ShardManager shardManager, CoordinatorClient coordinatorClient,
                           String workerId, Path cacheDir, int maxShards) throws IOException {
@@ -35,19 +40,37 @@ public final class TempShardCache implements AutoCloseable {
         Files.createDirectories(cacheDir);
     }
 
+    /** Pins cached shards while broadcast tables are prefetched and a fragment executes. */
+    public synchronized void beginPinSession() {
+        pinSessionDepth++;
+        pinnedKeys.addAll(entries.keySet());
+    }
+
+    public synchronized void endPinSession() {
+        if (pinSessionDepth <= 0) {
+            return;
+        }
+        pinSessionDepth--;
+        if (pinSessionDepth == 0) {
+            pinnedKeys.clear();
+            trimToMax();
+        }
+    }
+
     public synchronized String loadShard(String tableName, int shardId, Path tmpFile) throws IOException, SQLException {
         String key = tableName + ":" + shardId;
         if (entries.containsKey(key)) {
             LOG.debug("Cache HIT: {}_shard{}", tableName, shardId);
             entries.get(key);
+            if (pinSessionDepth > 0) {
+                pinnedKeys.add(key);
+            }
             Files.deleteIfExists(tmpFile);
             return entries.get(key).catalogName();
         }
         LOG.debug("Cache MISS: {}_shard{}, loading...", tableName, shardId);
 
-        while (entries.size() >= maxShards) {
-            evictLRU();
-        }
+        makeRoom();
 
         String catalogName = tableName + "_shard" + shardId;
         Path targetPath = cacheDir.resolve(catalogName + ".duckdb");
@@ -57,6 +80,9 @@ public final class TempShardCache implements AutoCloseable {
         shardManager.attachCachedShard(meta);
 
         entries.put(key, new CacheEntry(catalogName, targetPath, tableName, shardId));
+        if (pinSessionDepth > 0) {
+            pinnedKeys.add(key);
+        }
         LOG.info("Cached shard: {} (cache size: {}/{})", catalogName, entries.size(), maxShards);
 
         notifyCoordinator();
@@ -75,9 +101,51 @@ public final class TempShardCache implements AutoCloseable {
         return new ArrayList<>(entries.values());
     }
 
-    private void evictLRU() {
+    private void makeRoom() {
+        while (entries.size() >= maxShards) {
+            if (pinSessionDepth > 0) {
+                if (!evictUnpinned()) {
+                    return;
+                }
+            } else if (!evictLRU()) {
+                return;
+            }
+        }
+    }
+
+    private void trimToMax() {
+        while (entries.size() > maxShards) {
+            if (!evictUnpinned() && !evictLRU()) {
+                return;
+            }
+        }
+    }
+
+    private boolean evictUnpinned() {
+        Iterator<Map.Entry<String, CacheEntry>> iterator = entries.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, CacheEntry> entry = iterator.next();
+            if (pinnedKeys.contains(entry.getKey())) {
+                continue;
+            }
+            evictEntry(entry.getKey(), entry.getValue());
+            iterator.remove();
+            return true;
+        }
+        return false;
+    }
+
+    private boolean evictLRU() {
+        if (entries.isEmpty()) {
+            return false;
+        }
         Map.Entry<String, CacheEntry> eldest = entries.entrySet().iterator().next();
-        CacheEntry entry = eldest.getValue();
+        evictEntry(eldest.getKey(), eldest.getValue());
+        entries.remove(eldest.getKey());
+        return true;
+    }
+
+    private void evictEntry(String key, CacheEntry entry) {
         try {
             ShardFileMetadata meta = new ShardFileMetadata(entry.tableName(), entry.shardId(), entry.filePath());
             shardManager.detachCachedShard(meta);
@@ -85,7 +153,7 @@ public final class TempShardCache implements AutoCloseable {
         } catch (SQLException | IOException e) {
             LOG.warn("Error evicting cached shard {}: {}", entry.catalogName(), e.getMessage());
         }
-        entries.remove(eldest.getKey());
+        pinnedKeys.remove(key);
         LOG.info("Evicted cached shard: {}", entry.catalogName());
         notifyCoordinator();
     }
@@ -110,6 +178,8 @@ public final class TempShardCache implements AutoCloseable {
             }
         }
         entries.clear();
+        pinnedKeys.clear();
+        pinSessionDepth = 0;
         LOG.info("TempShardCache closed");
     }
 
