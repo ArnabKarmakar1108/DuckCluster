@@ -4,8 +4,10 @@ import io.duckcluster.common.config.ClusterConfig;
 import io.duckcluster.common.model.QueryResult;
 import io.duckcluster.common.registry.WorkerRegistry;
 import io.duckcluster.coordinator.execution.QueryExecutionService;
+import io.duckcluster.coordinator.monitor.MonitorService;
 import io.javalin.Javalin;
 import io.javalin.http.HttpStatus;
+import io.javalin.http.staticfiles.Location;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -19,17 +21,29 @@ public final class CoordinatorHttpServer {
     private final ClusterConfig config;
     private final WorkerRegistry registry;
     private final QueryExecutionService queryExecutionService;
+    private final MonitorService monitorService;
     private Javalin app;
 
     public CoordinatorHttpServer(
-            ClusterConfig config, WorkerRegistry registry, QueryExecutionService queryExecutionService) {
+            ClusterConfig config,
+            WorkerRegistry registry,
+            QueryExecutionService queryExecutionService,
+            MonitorService monitorService) {
         this.config = config;
         this.registry = registry;
         this.queryExecutionService = queryExecutionService;
+        this.monitorService = monitorService;
     }
 
     public void start() {
-        app = Javalin.create(cfg -> cfg.showJavalinBanner = false)
+        app = Javalin.create(cfg -> {
+                    cfg.showJavalinBanner = false;
+                    cfg.staticFiles.add(staticFiles -> {
+                        staticFiles.hostedPath = "/dashboard";
+                        staticFiles.directory = "dashboard";
+                        staticFiles.location = Location.CLASSPATH;
+                    });
+                })
                 .post("/v1/query", ctx -> {
                     QueryRequest request = ctx.bodyAsClass(QueryRequest.class);
                     if (request.sql == null || request.sql.isBlank()) {
@@ -62,7 +76,11 @@ public final class CoordinatorHttpServer {
                             .toList();
                     ctx.json(Map.of("workers", workers));
                 })
-                .get("/", ctx -> ctx.result("DuckCluster coordinator"))
+                .get("/v1/monitor/summary", ctx -> ctx.json(monitorService.summary()))
+                .get("/v1/monitor/shards", ctx -> ctx.json(monitorService.shards()))
+                .get("/", ctx -> ctx.redirect("/dashboard/index.html"))
+                .get("/dashboard", ctx -> ctx.redirect("/dashboard/index.html"))
+                .get("/dashboard/", ctx -> ctx.redirect("/dashboard/index.html"))
                 .exception(IllegalArgumentException.class, (exception, ctx) -> {
                     ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", exception.getMessage()));
                 })
@@ -74,9 +92,14 @@ public final class CoordinatorHttpServer {
                     ctx.status(HttpStatus.INTERNAL_SERVER_ERROR)
                             .json(Map.of("error", exception.getMessage()));
                 })
-                .start(config.coordinatorHost(), config.coordinatorHttpPort());
+                .start(config.coordinatorHttpBindHost(), config.coordinatorHttpPort());
 
-        LOG.info("Coordinator HTTP listening on {}:{}", config.coordinatorHost(), config.coordinatorHttpPort());
+        LOG.info(
+                "Coordinator HTTP listening on {}:{} (workers connect via {}:{})",
+                config.coordinatorHttpBindHost(),
+                config.coordinatorHttpPort(),
+                config.coordinatorHost(),
+                config.coordinatorHttpPort());
     }
 
     public void stop() {

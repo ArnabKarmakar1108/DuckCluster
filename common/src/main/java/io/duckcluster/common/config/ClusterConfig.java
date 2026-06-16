@@ -7,6 +7,7 @@ public final class ClusterConfig {
     private final String coordinatorHost;
     private final int coordinatorGrpcPort;
     private final int coordinatorHttpPort;
+    private final String coordinatorHttpBindHost;
     private final Duration heartbeatInterval;
     private final int heartbeatMissThreshold;
     private final int shardCount;
@@ -24,6 +25,7 @@ public final class ClusterConfig {
             String coordinatorHost,
             int coordinatorGrpcPort,
             int coordinatorHttpPort,
+            String coordinatorHttpBindHost,
             Duration heartbeatInterval,
             int heartbeatMissThreshold,
             int shardCount,
@@ -39,6 +41,8 @@ public final class ClusterConfig {
         this.coordinatorHost = Objects.requireNonNull(coordinatorHost, "coordinatorHost");
         this.coordinatorGrpcPort = coordinatorGrpcPort;
         this.coordinatorHttpPort = coordinatorHttpPort;
+        this.coordinatorHttpBindHost =
+                Objects.requireNonNull(coordinatorHttpBindHost, "coordinatorHttpBindHost");
         this.heartbeatInterval = Objects.requireNonNull(heartbeatInterval, "heartbeatInterval");
         this.heartbeatMissThreshold = heartbeatMissThreshold;
         this.shardCount = shardCount;
@@ -68,7 +72,8 @@ public final class ClusterConfig {
             long watcherIntervalMs,
             int cacheMaxShards,
             long fragmentWaitMs) {
-        this(coordinatorHost, coordinatorGrpcPort, coordinatorHttpPort, heartbeatInterval, heartbeatMissThreshold,
+        this(coordinatorHost, coordinatorGrpcPort, coordinatorHttpPort, "0.0.0.0", heartbeatInterval,
+                heartbeatMissThreshold,
                 shardCount, dataDir, poolSize, poolWaitMs, replicationFactor, vnodesPerWorker, watcherIntervalMs,
                 cacheMaxShards, fragmentWaitMs, false);
     }
@@ -79,6 +84,7 @@ public final class ClusterConfig {
                 getenv("DUCKCLUSTER_COORDINATOR_HOST", "127.0.0.1"),
                 parseInt("DUCKCLUSTER_COORDINATOR_GRPC_PORT", 9090),
                 parseInt("DUCKCLUSTER_COORDINATOR_HTTP_PORT", 8080),
+                getenv("DUCKCLUSTER_COORDINATOR_HTTP_BIND_HOST", "0.0.0.0"),
                 Duration.ofSeconds(parseInt("DUCKCLUSTER_HEARTBEAT_INTERVAL_SEC", 5)),
                 parseInt("DUCKCLUSTER_HEARTBEAT_MISS_THRESHOLD", 3),
                 parseInt("DUCKCLUSTER_SHARD_COUNT", 3),
@@ -88,7 +94,7 @@ public final class ClusterConfig {
                 parseInt("DUCKCLUSTER_REPLICATION_FACTOR", 2),
                 parseInt("DUCKCLUSTER_VNODES_PER_WORKER", 100),
                 parseLong("DUCKCLUSTER_WATCHER_INTERVAL_MS", 2000),
-                parseInt("DUCKCLUSTER_CACHE_MAX_SHARDS", 5),
+                parseInt("DUCKCLUSTER_CACHE_MAX_SHARDS", 32),
                 parseLong("DUCKCLUSTER_FRAGMENT_WAIT_MS", 60_000),
                 parseBoolean("DUCKCLUSTER_LOG_FRAGMENT_SQL", false));
     }
@@ -103,6 +109,10 @@ public final class ClusterConfig {
 
     public int coordinatorHttpPort() {
         return coordinatorHttpPort;
+    }
+
+    public String coordinatorHttpBindHost() {
+        return coordinatorHttpBindHost;
     }
 
     public Duration heartbeatInterval() {

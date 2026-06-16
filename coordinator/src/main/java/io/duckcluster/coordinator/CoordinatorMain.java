@@ -10,7 +10,10 @@ import io.duckcluster.coordinator.execution.QueryExecutionService;
 import io.duckcluster.coordinator.grpc.CoordinatorGrpcServer;
 import io.duckcluster.coordinator.health.HeartbeatMonitor;
 import io.duckcluster.coordinator.http.CoordinatorHttpServer;
+import io.duckcluster.coordinator.merger.CoordinatorMergeRuntime;
 import io.duckcluster.coordinator.merger.MergeStrategyRegistry;
+import io.duckcluster.coordinator.monitor.MonitorService;
+import io.duckcluster.coordinator.monitor.QueryActivityTracker;
 import io.duckcluster.coordinator.replication.ShardReplicator;
 import io.duckcluster.coordinator.worker.WorkerChannelPool;
 import io.duckcluster.coordinator.worker.WorkerNodeClient;
@@ -30,6 +33,7 @@ public final class CoordinatorMain {
         WorkerChannelPool channelPool = new WorkerChannelPool();
         WorkerNodeClient workerClient = new WorkerNodeClient(channelPool);
 
+        QueryActivityTracker activityTracker = new QueryActivityTracker();
         QueryExecutionService queryExecutionService = new QueryExecutionService(
                 new CalciteQueryPlanner(),
                 catalog,
@@ -37,7 +41,11 @@ public final class CoordinatorMain {
                 workerClient,
                 new MergeStrategyRegistry(),
                 shardCatalog,
-                config);
+                config,
+                activityTracker);
+
+        MonitorService monitorService = new MonitorService(
+                config, registry, shardCatalog, catalog, activityTracker, queryExecutionService);
 
         ShardReplicator shardReplicator = new ShardReplicator(shardCatalog, registry, workerClient);
         HeartbeatMonitor heartbeatMonitor = new HeartbeatMonitor(
@@ -46,7 +54,8 @@ public final class CoordinatorMain {
 
         CoordinatorGrpcServer grpcServer = new CoordinatorGrpcServer(
                 config, registry, shardCatalog, shardReplicator, channelPool);
-        CoordinatorHttpServer httpServer = new CoordinatorHttpServer(config, registry, queryExecutionService);
+        CoordinatorHttpServer httpServer = new CoordinatorHttpServer(
+                config, registry, queryExecutionService, monitorService);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Shutting down coordinator");
@@ -55,6 +64,7 @@ public final class CoordinatorMain {
             httpServer.stop();
             grpcServer.stop();
             channelPool.close();
+            CoordinatorMergeRuntime.shutdown();
         }));
 
         grpcServer.start();

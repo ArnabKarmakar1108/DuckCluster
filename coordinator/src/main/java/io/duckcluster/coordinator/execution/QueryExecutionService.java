@@ -15,13 +15,16 @@ import io.duckcluster.common.planner.QueryPlanner;
 import io.duckcluster.common.registry.WorkerRegistry;
 import io.duckcluster.coordinator.catalog.ShardCatalog;
 import io.duckcluster.coordinator.merger.MergeStrategyRegistry;
+import io.duckcluster.coordinator.monitor.QueryActivityTracker;
 import io.duckcluster.coordinator.worker.WorkerNodeClient;
 import io.duckcluster.proto.v1.ShardDataChunk;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.LinkedHashSet;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -48,6 +51,7 @@ public final class QueryExecutionService {
     private final long fragmentWaitMs;
     private final boolean logFragmentSql;
     private final ExecutorService fragmentExecutor;
+    private final QueryActivityTracker activityTracker;
 
     public QueryExecutionService(
             QueryPlanner planner,
@@ -58,7 +62,20 @@ public final class QueryExecutionService {
             ShardCatalog shardCatalog,
             ClusterConfig config) {
         this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog,
-                config.fragmentWaitMs(), config.logFragmentSql());
+                config.fragmentWaitMs(), config.logFragmentSql(), null);
+    }
+
+    public QueryExecutionService(
+            QueryPlanner planner,
+            ClusterCatalog catalog,
+            WorkerRegistry registry,
+            WorkerNodeClient workerClient,
+            MergeStrategyRegistry mergeStrategyRegistry,
+            ShardCatalog shardCatalog,
+            ClusterConfig config,
+            QueryActivityTracker activityTracker) {
+        this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog,
+                config.fragmentWaitMs(), config.logFragmentSql(), activityTracker);
     }
 
     QueryExecutionService(
@@ -69,7 +86,7 @@ public final class QueryExecutionService {
             MergeStrategyRegistry mergeStrategyRegistry,
             ShardCatalog shardCatalog,
             long fragmentWaitMs) {
-        this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog, fragmentWaitMs, false);
+        this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog, fragmentWaitMs, false, null);
     }
 
     QueryExecutionService(
@@ -81,6 +98,20 @@ public final class QueryExecutionService {
             ShardCatalog shardCatalog,
             long fragmentWaitMs,
             boolean logFragmentSql) {
+        this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog,
+                fragmentWaitMs, logFragmentSql, null);
+    }
+
+    QueryExecutionService(
+            QueryPlanner planner,
+            ClusterCatalog catalog,
+            WorkerRegistry registry,
+            WorkerNodeClient workerClient,
+            MergeStrategyRegistry mergeStrategyRegistry,
+            ShardCatalog shardCatalog,
+            long fragmentWaitMs,
+            boolean logFragmentSql,
+            QueryActivityTracker activityTracker) {
         this.planner = planner;
         this.catalog = catalog;
         this.registry = registry;
@@ -90,6 +121,7 @@ public final class QueryExecutionService {
         this.fragmentTracker = new WorkerFragmentTracker(registry);
         this.fragmentWaitMs = fragmentWaitMs;
         this.logFragmentSql = logFragmentSql;
+        this.activityTracker = activityTracker;
         this.fragmentExecutor = Executors.newCachedThreadPool(r -> {
             Thread t = new Thread(r);
             t.setDaemon(true);
@@ -97,26 +129,38 @@ public final class QueryExecutionService {
         });
     }
 
+    public double workerLoad(String workerId) {
+        return registry.getWorker(workerId)
+                .map(worker -> (double) fragmentTracker.inFlightCount(workerId)
+                        / Math.max(1, worker.numThreads()))
+                .orElse(0.0);
+    }
+
     public QueryResult execute(String sql) {
         long startMs = System.currentTimeMillis();
         String queryId = UUID.randomUUID().toString();
         LOG.info("Query [{}] received: {}", queryId, sql);
+        trackStart(queryId, sql);
 
-        PlannedQuery plan = planner.plan(sql, catalog);
-        LOG.info("Query [{}] planned: table={}, fragments={}, broadcast={}, strategy={}",
-                queryId, plan.tableName(), plan.fragments().size(),
-                plan.broadcastTables().size(), plan.mergeStrategy());
+        try {
+            trackPhase(queryId, QueryActivityTracker.Phase.PLAN);
+            PlannedQuery plan = planner.plan(sql, catalog);
+            trackFragmentsTotal(queryId, plan.fragments().size());
+            LOG.info("Query [{}] planned: table={}, fragments={}, broadcast={}, strategy={}",
+                    queryId, plan.tableName(), plan.fragments().size(),
+                    plan.broadcastTables().size(), plan.mergeStrategy());
 
-        if (registry.workerCount() == 0) {
-            throw new IllegalStateException("No workers registered");
-        }
+            if (registry.workerCount() == 0) {
+                throw new IllegalStateException("No workers registered");
+            }
 
-        MergeStrategy mergeStrategy = mergeStrategyRegistry.get(plan.mergeStrategy());
+            MergeStrategy mergeStrategy = mergeStrategyRegistry.get(plan.mergeStrategy());
 
-        Map<Integer, String> fragmentTargets = resolveFragmentTargets(plan);
-        LOG.debug("Query [{}] targets resolved: {}", queryId, fragmentTargets);
+            Map<Integer, String> fragmentTargets = resolveFragmentTargets(plan);
+            LOG.debug("Query [{}] targets resolved: {}", queryId, fragmentTargets);
 
-        if (!plan.broadcastTables().isEmpty() || !plan.subqueryBroadcastTables().isEmpty()) {
+            trackPhase(queryId, QueryActivityTracker.Phase.PREFETCH);
+            if (!plan.broadcastTables().isEmpty() || !plan.subqueryBroadcastTables().isEmpty()) {
             Set<String> targetWorkerIds = new HashSet<>(fragmentTargets.values());
             long prefetchStart = System.currentTimeMillis();
             int prefetchShards = plan.broadcastTables().stream().mapToInt(BroadcastTable::shardCount).sum()
@@ -133,42 +177,92 @@ public final class QueryExecutionService {
                     queryId, System.currentTimeMillis() - prefetchStart);
         }
 
-        List<CompletableFuture<ExecutionOutcome>> futures = new ArrayList<>(plan.fragments().size());
-        for (FragmentSpec fragment : plan.fragments()) {
-            if (logFragmentSql) {
-                LOG.info("Query [{}] fragment {} shard {} SQL: {}",
-                        queryId, fragment.fragmentId(), fragment.shardId(), fragment.sql());
+        Set<String> preparedWorkers = prepareWorkersForQuery(queryId, plan, fragmentTargets);
+        try {
+            trackPhase(queryId, QueryActivityTracker.Phase.FRAGMENTS);
+            List<CompletableFuture<ExecutionOutcome>> futures = new ArrayList<>(plan.fragments().size());
+            for (FragmentSpec fragment : plan.fragments()) {
+                if (logFragmentSql) {
+                    LOG.info("Query [{}] fragment {} shard {} SQL: {}",
+                            queryId, fragment.fragmentId(), fragment.shardId(), fragment.sql());
+                }
+                String preferredWorkerId = fragmentTargets.get(fragment.shardId());
+                futures.add(CompletableFuture.supplyAsync(
+                        () -> executeFragmentWithRetry(queryId, plan, fragment, preferredWorkerId, preparedWorkers),
+                        fragmentExecutor));
             }
-            String preferredWorkerId = fragmentTargets.get(fragment.shardId());
-            futures.add(CompletableFuture.supplyAsync(
-                    () -> executeFragmentWithRetry(queryId, plan, fragment, preferredWorkerId),
-                    fragmentExecutor));
+
+            List<FragmentResult> fragmentResults = new ArrayList<>(plan.fragments().size());
+            Map<String, Long> workerDurationsMs = new LinkedHashMap<>();
+
+            for (int i = 0; i < futures.size(); i++) {
+                FragmentSpec fragment = plan.fragments().get(i);
+                ExecutionOutcome outcome = futures.get(i).join();
+                workerDurationsMs.merge(outcome.workerId, outcome.durationMs, Long::sum);
+                fragmentResults.add(new FragmentResult(
+                        fragment.fragmentId(),
+                        fragment.shardId(),
+                        outcome.workerId,
+                        outcome.durationMs,
+                        outcome.batches));
+                LOG.debug("Query [{}] fragment {} completed on {} ({}ms)",
+                        queryId, fragment.fragmentId(), outcome.workerId, outcome.durationMs);
+                trackFragmentDone(queryId);
+            }
+
+            long durationMs = System.currentTimeMillis() - startMs;
+            Map<String, RowBatchData> coordinatorTables = fetchCoordinatorTables(queryId, plan);
+            MergeContext context = new MergeContext(queryId, plan, fragmentResults, durationMs, coordinatorTables);
+            trackPhase(queryId, QueryActivityTracker.Phase.MERGE);
+            QueryResult merged = mergeStrategy.merge(context);
+            LOG.info("Query [{}] complete: {}ms, {} fragments, {} workers",
+                    queryId, durationMs, plan.fragments().size(), workerDurationsMs.size());
+            QueryResult timed = withTiming(merged, durationMs, workerDurationsMs);
+            trackComplete(queryId, timed);
+            return timed;
+        } finally {
+            releasePreparedWorkers(queryId, preparedWorkers);
         }
-
-        List<FragmentResult> fragmentResults = new ArrayList<>(plan.fragments().size());
-        Map<String, Long> workerDurationsMs = new LinkedHashMap<>();
-
-        for (int i = 0; i < futures.size(); i++) {
-            FragmentSpec fragment = plan.fragments().get(i);
-            ExecutionOutcome outcome = futures.get(i).join();
-            workerDurationsMs.merge(outcome.workerId, outcome.durationMs, Long::sum);
-            fragmentResults.add(new FragmentResult(
-                    fragment.fragmentId(),
-                    fragment.shardId(),
-                    outcome.workerId,
-                    outcome.durationMs,
-                    outcome.batches));
-            LOG.debug("Query [{}] fragment {} completed on {} ({}ms)",
-                    queryId, fragment.fragmentId(), outcome.workerId, outcome.durationMs);
+        } catch (RuntimeException e) {
+            trackFail(queryId, e.getMessage(), System.currentTimeMillis() - startMs);
+            throw e;
         }
+    }
 
-        long durationMs = System.currentTimeMillis() - startMs;
-        Map<String, RowBatchData> coordinatorTables = fetchCoordinatorTables(queryId, plan);
-        MergeContext context = new MergeContext(queryId, plan, fragmentResults, durationMs, coordinatorTables);
-        QueryResult merged = mergeStrategy.merge(context);
-        LOG.info("Query [{}] complete: {}ms, {} fragments, {} workers",
-                queryId, durationMs, plan.fragments().size(), workerDurationsMs.size());
-        return withTiming(merged, durationMs, workerDurationsMs);
+    private void trackStart(String queryId, String sql) {
+        if (activityTracker != null) {
+            activityTracker.start(queryId, sql);
+        }
+    }
+
+    private void trackPhase(String queryId, QueryActivityTracker.Phase phase) {
+        if (activityTracker != null) {
+            activityTracker.setPhase(queryId, phase);
+        }
+    }
+
+    private void trackFragmentsTotal(String queryId, int total) {
+        if (activityTracker != null) {
+            activityTracker.setFragmentsTotal(queryId, total);
+        }
+    }
+
+    private void trackFragmentDone(String queryId) {
+        if (activityTracker != null) {
+            activityTracker.fragmentDone(queryId);
+        }
+    }
+
+    private void trackComplete(String queryId, QueryResult result) {
+        if (activityTracker != null) {
+            activityTracker.complete(queryId, result);
+        }
+    }
+
+    private void trackFail(String queryId, String error, long durationMs) {
+        if (activityTracker != null) {
+            activityTracker.fail(queryId, error, durationMs);
+        }
     }
 
     private Map<Integer, String> resolveFragmentTargets(PlannedQuery plan) {
@@ -330,7 +424,8 @@ public final class QueryExecutionService {
     }
 
     private ExecutionOutcome executeFragmentWithRetry(
-            String queryId, PlannedQuery plan, FragmentSpec fragment, String preferredWorkerId) {
+            String queryId, PlannedQuery plan, FragmentSpec fragment, String preferredWorkerId,
+            Set<String> preparedWorkers) {
         List<String> candidates = buildExecutionCandidates(plan, fragment.shardId(), preferredWorkerId);
         FragmentExecutionException lastRetryable = null;
 
@@ -338,8 +433,9 @@ public final class QueryExecutionService {
             if (registry.getWorker(workerId).isEmpty()) {
                 continue;
             }
-            ensureShardsLocal(plan, workerId, fragment.shardId());
             try {
+                ensureWorkerPrepared(
+                        queryId, plan, workerId, List.of(fragment.shardId()), preparedWorkers);
                 return tryExecuteOnWorker(queryId, fragment, workerId);
             } catch (FragmentExecutionException e) {
                 if (e.retryable()) {
@@ -420,6 +516,76 @@ public final class QueryExecutionService {
                 prefetchShard(target, tableName, drivingShardId);
             }
         }
+    }
+
+    private Set<String> prepareWorkersForQuery(
+            String queryId, PlannedQuery plan, Map<Integer, String> fragmentTargets) {
+        Map<String, List<Integer>> shardIdsByWorker = new LinkedHashMap<>();
+        for (FragmentSpec fragment : plan.fragments()) {
+            String workerId = fragmentTargets.get(fragment.shardId());
+            shardIdsByWorker.computeIfAbsent(workerId, ignored -> new ArrayList<>())
+                    .add(fragment.shardId());
+        }
+
+        Set<String> preparedWorkers = Collections.synchronizedSet(new LinkedHashSet<>());
+        for (Map.Entry<String, List<Integer>> entry : shardIdsByWorker.entrySet()) {
+            ensureWorkerPrepared(queryId, plan, entry.getKey(), entry.getValue(), preparedWorkers);
+        }
+        return preparedWorkers;
+    }
+
+    private void ensureWorkerPrepared(
+            String queryId,
+            PlannedQuery plan,
+            String workerId,
+            Collection<Integer> shardIds,
+            Set<String> preparedWorkers) {
+        if (preparedWorkers.contains(workerId)) {
+            return;
+        }
+        synchronized (preparedWorkers) {
+            if (preparedWorkers.contains(workerId)) {
+                return;
+            }
+            WorkerRegistry.WorkerRecord worker = registry.getWorker(workerId)
+                    .orElseThrow(() -> new IllegalStateException("Worker " + workerId + " not available"));
+            workerClient.beginShardPin(worker);
+            for (int shardId : shardIds) {
+                ensureShardsLocal(plan, workerId, shardId);
+            }
+            for (BroadcastTable broadcastTable : broadcastTablesToMaterialize(plan)) {
+                workerClient.materializeBroadcast(
+                        worker, queryId, broadcastTable.tableName(), broadcastTable.shardCount());
+            }
+            preparedWorkers.add(workerId);
+        }
+    }
+
+    private void releasePreparedWorkers(String queryId, Set<String> preparedWorkers) {
+        for (String workerId : preparedWorkers) {
+            Optional<WorkerRegistry.WorkerRecord> workerOpt = registry.getWorker(workerId);
+            if (workerOpt.isEmpty()) {
+                continue;
+            }
+            WorkerRegistry.WorkerRecord worker = workerOpt.get();
+            workerClient.clearBroadcastTables(worker, queryId);
+            workerClient.endShardPin(worker);
+        }
+    }
+
+    private static List<BroadcastTable> broadcastTablesToMaterialize(PlannedQuery plan) {
+        Map<String, BroadcastTable> tables = new LinkedHashMap<>();
+        for (BroadcastTable broadcastTable : plan.broadcastTables()) {
+            if (broadcastTable.shardCount() > 1) {
+                tables.putIfAbsent(broadcastTable.tableName().toLowerCase(), broadcastTable);
+            }
+        }
+        for (BroadcastTable broadcastTable : plan.subqueryBroadcastTables()) {
+            if (broadcastTable.shardCount() > 1) {
+                tables.putIfAbsent(broadcastTable.tableName().toLowerCase(), broadcastTable);
+            }
+        }
+        return List.copyOf(tables.values());
     }
 
     private ExecutionOutcome tryExecuteOnWorker(String queryId, FragmentSpec fragment, String targetWorkerId) {
