@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DuckCluster Monitor</title>
+  <link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+  <header class="top-bar">
+    <div class="brand">
+      <img class="brand-icon" src="neon-duck.jpg" alt="" width="40" height="40">
+      <div>
+        <h1>DuckCluster Monitor</h1>
+        <p class="subtitle">Read-only cluster health &amp; query activity</p>
+      </div>
+    </div>
+    <div class="status-pills">
+      <span id="cluster-status" class="pill pill-unknown">—</span>
+      <span id="worker-ratio" class="pill pill-muted">— workers</span>
+      <span id="refresh-age" class="pill pill-muted">—</span>
+    </div>
+  </header>
+
+  <div id="error-banner" class="error-banner hidden" role="alert"></div>
+
+  <main class="layout">
+    <section class="panel cluster-panel">
+      <h2>Cluster topology</h2>
+      <div class="cluster-graphics">
+        <div class="topology-wrap">
+          <svg id="topology-svg" viewBox="0 0 420 320" aria-label="Coordinator and worker topology"></svg>
+        </div>
+        <div class="cluster-side">
+          <div class="gauge-card">
+            <h3>Worker health</h3>
+            <svg id="health-donut" viewBox="0 0 120 120" class="health-donut"></svg>
+            <p id="health-caption" class="gauge-caption">—</p>
+          </div>
+          <div class="gauge-card">
+            <h3>Worker load</h3>
+            <div id="load-bars" class="load-bars"></div>
+          </div>
+          <div class="coordinator-card">
+            <h3>Coordinator</h3>
+            <dl id="coordinator-info" class="coord-dl"></dl>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Workers</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Address</th>
+              <th>Status</th>
+              <th>Heartbeat</th>
+              <th>Load</th>
+              <th>Threads</th>
+            </tr>
+          </thead>
+          <tbody id="workers-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="split-panels">
+      <section class="panel">
+        <h2>Active queries <span id="active-count" class="count-badge">0</span></h2>
+        <div id="active-queries" class="query-list empty-state">No queries running</div>
+      </section>
+      <section class="panel">
+        <h2>Recent queries</h2>
+        <div id="recent-queries" class="query-list empty-state">No completed queries yet</div>
+        <button id="recent-toggle" type="button" class="text-btn hidden">Show more</button>
+      </section>
+    </div>
+
+    <section class="panel">
+      <h2>Shard coverage <span id="shard-stale" class="shard-stale hidden">stale</span></h2>
+      <div id="shard-summary" class="shard-summary empty-state">Loading shard catalog…</div>
+      <details class="shard-details" id="shard-details">
+        <summary>Per-shard owners &amp; cache</summary>
+        <div id="shard-detail" class="shard-detail"></div>
+      </details>
+    </section>
+  </main>
+
+  <footer class="footer">
+    Polls every 3s · No query submission from this UI
+  </footer>
+
+  <script src="dashboard.js"></script>
+</body>
+</html>
