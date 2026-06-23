@@ -17,6 +17,7 @@
         <module>common</module>
         <module>coordinator</module>
         <module>worker</module>
+        <module>benchmark</module>
     </modules>
 
     <properties>
