@@ -27,6 +27,25 @@ DIMENSION_TABLES = [
 ]
 
 
+def balanced_assignments(
+    worker_ids: list[str],
+    table: str,
+    shard_count: int,
+    replication_factor: int,
+) -> dict[str, list[str]]:
+    """Round-robin primary placement with rotated replicas for even per-worker load."""
+    worker_count = len(worker_ids)
+    table_manifest: dict[str, list[str]] = {}
+    for shard_id in range(shard_count):
+        owners: list[str] = []
+        for replica in range(replication_factor):
+            owner = worker_ids[(shard_id + replica) % worker_count]
+            if owner not in owners:
+                owners.append(owner)
+        table_manifest[f"{table}_shard{shard_id}"] = owners
+    return table_manifest
+
+
 def ring_assignments(
     repo_root: Path,
     worker_ids: list[str],
@@ -136,6 +155,15 @@ def distribute_shard(
         shutil.copy2(shard_path, target_dir / shard_path.name)
 
 
+def distribute_to_all_workers(
+    shard_path: Path,
+    worker_dir_map: dict[str, Path],
+) -> list[str]:
+    owners = list(worker_dir_map.keys())
+    distribute_shard(shard_path, owners, worker_dir_map)
+    return owners
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate TPC-H benchmark datasets")
     parser.add_argument("scale_factor", type=float, help="TPC-H scale factor (e.g. 1, 10)")
@@ -143,6 +171,12 @@ def main() -> int:
     parser.add_argument("output_dir", type=Path, help="Output directory for generated data")
     parser.add_argument("--workers", default="worker-1,worker-2,worker-3")
     parser.add_argument("--rf", type=int, default=2)
+    parser.add_argument(
+        "--placement",
+        choices=("ring", "balanced"),
+        default="balanced",
+        help="Shard-to-worker assignment: balanced (round-robin, default) or ring (consistent hash)",
+    )
     parser.add_argument("--root", type=Path)
     args = parser.parse_args()
 
@@ -174,10 +208,13 @@ def main() -> int:
 
     manifest: dict[str, dict[str, list[str]]] = {}
 
-    print(f"Step 3: Partitioning fact tables into {args.shard_count} shards...")
+    print(f"Step 3: Partitioning fact tables into {args.shard_count} shards ({args.placement} placement)...")
     for table, key in PARTITIONED_TABLES.items():
         table_manifest: dict[str, list[str]] = {}
-        assignments = ring_assignments(root, worker_ids, table, args.shard_count, args.rf)
+        if args.placement == "balanced":
+            assignments = balanced_assignments(worker_ids, table, args.shard_count, args.rf)
+        else:
+            assignments = ring_assignments(root, worker_ids, table, args.shard_count, args.rf)
         for shard_id in range(args.shard_count):
             shard_path = build_partitioned_shard(
                 source_db,
@@ -197,12 +234,11 @@ def main() -> int:
             distribute_shard(shard_path, owners, worker_dir_map)
         manifest[table] = table_manifest
 
-    print("Step 4: Replicating dimension tables (1 shard each)...")
+    print("Step 4: Replicating dimension tables to all workers...")
     for table in DIMENSION_TABLES:
-        assignments = ring_assignments(root, worker_ids, table, 1, args.rf)
         shard_path = build_dimension_shard(source_db, staging / table, table)
         shard_key = f"{table}_shard0"
-        owners = assignments[shard_key]
+        owners = distribute_to_all_workers(shard_path, worker_dir_map)
         manifest[table] = {shard_key: owners}
         row_count = duckdb.connect(str(shard_path), read_only=True).execute(
             f"SELECT count(*) FROM {table}"
@@ -215,6 +251,7 @@ def main() -> int:
         "shard_count": args.shard_count,
         "workers": worker_ids,
         "replication_factor": args.rf,
+        "placement": args.placement,
         "baseline": str(baseline_db),
         "manifest": manifest,
     }
