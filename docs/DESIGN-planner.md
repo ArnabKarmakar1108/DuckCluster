@@ -4,8 +4,7 @@ This document records **why** the DuckCluster planner works the way it does and 
 implemented** to reach full TPC-H correctness on SF0.01. It is meant to be committed and updated
 as planner behavior evolves.
 
-For the implementation checklist and query-by-query tracking, see `PLAN-tpch-planner-hardening.md`
-(local only). For system-wide architecture, see [ARCHITECTURE.md](ARCHITECTURE.md).
+For system-wide design decisions, see [DESIGN-DECISIONS.md](DESIGN-DECISIONS.md).
 
 ---
 
@@ -32,7 +31,7 @@ Calcite is effectively a **parser + AST toolkit + SQL printer** in the current c
 | Cost-based join ordering | Not used |
 | Automatic distributed plan generation | Not used |
 
-`ARCHITECTURE.md` describes a future state ("parse → validate → relational plan → SQL generation").
+The original design envisioned a future state ("parse → validate → relational plan → SQL generation").
 The TPC-H hardening work implemented **parse → hand-rolled analysis → manual rewrite → merge**.
 
 ### Why this feels complex
