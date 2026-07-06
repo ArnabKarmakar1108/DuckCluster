@@ -1,10 +1,13 @@
-# DuckCluster
+<h1 align="left">
+  <img src="coordinator/src/main/resources/dashboard/neon-duck.jpg" alt="DuckCluster" width="44" height="44" style="vertical-align: middle; margin-right: 0.4em; border-radius: 6px;">
+  DuckCluster
+</h1>
 
 A **distributed SQL query coordinator** for analytical workloads. Clients submit SQL over a REST API; DuckCluster plans the query with Apache Calcite, executes shard-local fragments on **DuckDB worker nodes**, streams partial results over gRPC, and merges them into a final answer.
 
 Built in Java 17 as a multi-module Maven project.
 
-For design details, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/DESIGN-DECISIONS.md`](docs/DESIGN-DECISIONS.md).
+For design details, see `[docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md)` and `[docs/DESIGN-planner.md](docs/DESIGN-planner.md)`.
 
 ---
 
@@ -35,16 +38,22 @@ Coordinator merges partial results (embedded DuckDB)
 
 **Merge strategies:**
 
-| Strategy | Use case | Worker | Coordinator |
-|----------|----------|--------|-------------|
-| `CONCATENATE` | `SELECT *`, filters | Return matching rows | Append batches |
-| `PARTIAL_AGG` | `SELECT COUNT(*), SUM(x)` | Partial aggregates | Re-aggregate in DuckDB |
-| `GROUP_BY_MERGE` | `SELECT k, COUNT(*) … GROUP BY k` | Partial grouped rows | Final `GROUP BY` in DuckDB |
-| `TOP_K` | `ORDER BY … LIMIT n` | Local top-K per shard | Global sort + limit |
+
+| Strategy         | Use case                          | Worker                | Coordinator                |
+| ---------------- | --------------------------------- | --------------------- | -------------------------- |
+| `CONCATENATE`    | `SELECT *`, filters               | Return matching rows  | Append batches             |
+| `PARTIAL_AGG`    | `SELECT COUNT(*), SUM(x)`         | Partial aggregates    | Re-aggregate in DuckDB     |
+| `GROUP_BY_MERGE` | `SELECT k, COUNT(*) … GROUP BY k` | Partial grouped rows  | Final `GROUP BY` in DuckDB |
+| `TOP_K`          | `ORDER BY … LIMIT n`              | Local top-K per shard | Global sort + limit        |
+
 
 ---
 
+
+
 ## Quick start
+
+
 
 ### Prerequisites
 
@@ -54,11 +63,15 @@ Coordinator merges partial results (embedded DuckDB)
 - `curl` (and optionally `python3` for pretty JSON)
 - `duckdb` CLI recommended for `start-cluster.sh` (Python `duckdb` package is enough for integration tests)
 
+
+
 ### Build
 
 ```bash
 mvn clean package
 ```
+
+
 
 ### Run a local cluster
 
@@ -74,6 +87,8 @@ The default source file is `tests/integration/data/demo-events.csv` (10 rows). O
 DUCKCLUSTER_DEMO_CSV=/path/to/events.csv ./scripts/start-cluster.sh
 ```
 
+
+
 ### Submit a query
 
 ```bash
@@ -88,12 +103,28 @@ curl -s -X POST http://127.0.0.1:8080/v1/query \
   -d '{"sql":"SELECT category, COUNT(*) AS cnt FROM events GROUP BY category"}' | python3 -m json.tool
 ```
 
+
+
 ### Cluster health
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/cluster/health
 curl -s http://127.0.0.1:8080/v1/cluster/workers
 ```
+
+### Monitoring dashboard
+
+After `start-cluster.sh`, open the read-only UI at `http://127.0.0.1:8080/dashboard/index.html` (root `/` redirects there).
+
+**Demo video:** [docs/media/DuckCluster-demo.mp4](docs/media/DuckCluster-demo.mp4)
+
+| Cluster topology | Recent queries | Shard catalog |
+| --- | --- | --- |
+| ![Healthy cluster topology](docs/media/green-topology.png) | ![Recent queries panel](docs/media/queries.png) | ![Shard catalog panel](docs/media/shard-catalog.png) |
+
+Live status: workers, in-flight queries, recent query history, and shard placement per table.
+
+
 
 ### Integration tests
 
@@ -137,17 +168,21 @@ Unit tests only:
 mvn test
 ```
 
-See [`tests/integration/README.md`](tests/integration/README.md) for harness layout and scenario details.
+See `[tests/integration/README.md](tests/integration/README.md)` for harness layout and scenario details.
 
 ---
 
+
+
 ## REST API
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/query` | Execute SQL synchronously |
-| `GET` | `/v1/cluster/health` | Cluster liveness summary |
-| `GET` | `/v1/cluster/workers` | Registered workers and heartbeat status |
+
+| Method | Path                  | Description                             |
+| ------ | --------------------- | --------------------------------------- |
+| `POST` | `/v1/query`           | Execute SQL synchronously               |
+| `GET`  | `/v1/cluster/health`  | Cluster liveness summary                |
+| `GET`  | `/v1/cluster/workers` | Registered workers and heartbeat status |
+
 
 **Query request**
 
@@ -174,26 +209,33 @@ See [`tests/integration/README.md`](tests/integration/README.md) for harness lay
 
 ---
 
+
+
 ## Configuration
 
 Environment variables (defaults shown):
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DUCKCLUSTER_COORDINATOR_HOST` | `127.0.0.1` | Coordinator bind/connect host |
-| `DUCKCLUSTER_COORDINATOR_HTTP_PORT` | `8080` | REST API port |
-| `DUCKCLUSTER_COORDINATOR_GRPC_PORT` | `9090` | Worker registration / heartbeat port |
-| `DUCKCLUSTER_HEARTBEAT_INTERVAL_SEC` | `5` | Heartbeat period (seconds) |
-| `DUCKCLUSTER_HEARTBEAT_MISS_THRESHOLD` | `3` | Missed beats before worker removed |
-| `DUCKCLUSTER_SHARD_COUNT` | `3` | Logical shard count for demo catalog |
-| `DUCKCLUSTER_DATA_DIR` | `./data` | Worker data directory for shard files |
-| `DUCKCLUSTER_POOL_SIZE` | `max(2, min(4, CPUs-1))` | DuckDB connections per worker |
-| `DUCKCLUSTER_POOL_WAIT_MS` | `200` | Max wait for a free connection (ms) |
-| `DUCKCLUSTER_REPLICATION_FACTOR` | `2` | Shard copies across workers |
-| `DUCKCLUSTER_VNODES_PER_WORKER` | `100` | Virtual nodes in hash ring |
-| `DUCKCLUSTER_WATCHER_INTERVAL_MS` | `2000` | Shard file polling interval (ms) |
+
+| Variable                               | Default                  | Description                           |
+| -------------------------------------- | ------------------------ | ------------------------------------- |
+| `DUCKCLUSTER_COORDINATOR_HOST`         | `127.0.0.1`              | Coordinator address workers/clients use for gRPC |
+| `DUCKCLUSTER_COORDINATOR_HTTP_BIND_HOST` | `0.0.0.0`              | HTTP/dashboard bind address (use `127.0.0.1` to block remote access) |
+| `DUCKCLUSTER_COORDINATOR_HTTP_PORT`    | `8080`                   | REST API + dashboard port             |
+| `DUCKCLUSTER_COORDINATOR_GRPC_PORT`    | `9090`                   | Worker registration / heartbeat port  |
+| `DUCKCLUSTER_HEARTBEAT_INTERVAL_SEC`   | `5`                      | Heartbeat period (seconds)            |
+| `DUCKCLUSTER_HEARTBEAT_MISS_THRESHOLD` | `3`                      | Missed beats before worker removed    |
+| `DUCKCLUSTER_SHARD_COUNT`              | `3`                      | Logical shard count for demo catalog  |
+| `DUCKCLUSTER_DATA_DIR`                 | `./data`                 | Worker data directory for shard files |
+| `DUCKCLUSTER_POOL_SIZE`                | `max(2, min(4, CPUs-1))` | DuckDB connections per worker         |
+| `DUCKCLUSTER_POOL_WAIT_MS`             | `200`                    | Max wait for a free connection (ms)   |
+| `DUCKCLUSTER_REPLICATION_FACTOR`       | `2`                      | Shard copies across workers           |
+| `DUCKCLUSTER_VNODES_PER_WORKER`        | `100`                    | Virtual nodes in hash ring            |
+| `DUCKCLUSTER_WATCHER_INTERVAL_MS`      | `2000`                   | Shard file polling interval (ms)      |
+
 
 ---
+
+
 
 ## Project layout
 
@@ -206,8 +248,11 @@ DuckCluster/
 ├── scripts/         # start-cluster.sh, split-and-distribute.sh, test helpers
 ├── tests/integration/  # Pytest harness + bundled sample CSV
 └── docs/
-    ├── ARCHITECTURE.md
-    └── DESIGN-DECISIONS.md
+    ├── DESIGN-DECISIONS.md
+    ├── DESIGN-planner.md
+    ├── BENCHMARK.md
+    ├── media/           # Dashboard screenshots + demo video
+    └── plots/           # Benchmark charts (generated by scripts/benchmark-plots.py)
 ```
 
 **Run manually**
@@ -222,29 +267,100 @@ java -jar worker/target/duckcluster-worker-0.1.0-SNAPSHOT.jar worker-1 127.0.0.1
 
 ---
 
+
+
 ## Technology stack
 
-| Layer | Choice |
-|-------|--------|
-| Language / build | Java 17, Maven |
-| REST | Javalin 6.x |
-| SQL planning | Apache Calcite 1.41 (`DuckDBSqlDialect`) |
-| Worker OLAP | DuckDB JDBC |
-| RPC | gRPC + Protobuf |
-| Merge engine | Embedded DuckDB on coordinator |
-| Tests | JUnit 5 (unit), pytest (integration) |
+
+| Layer            | Choice                                   |
+| ---------------- | ---------------------------------------- |
+| Language / build | Java 17, Maven                           |
+| REST             | Javalin 6.x                              |
+| SQL planning     | Apache Calcite 1.41 (`DuckDBSqlDialect`) |
+| Worker OLAP      | DuckDB JDBC                              |
+| RPC              | gRPC + Protobuf                          |
+| Merge engine     | Embedded DuckDB on coordinator           |
+| Tests            | JUnit 5 (unit), pytest (integration)     |
+
 
 ---
 
-## Upcoming
 
-| Phase | Focus |
-|-------|--------|
-| **G** | Benchmarking harness — TPC-H at multiple scale factors, compare against single-node DuckDB |
-| **H** | HTML dashboard, SSE event stream, broader integration tests |
-| **I** | Apache Arrow transfer, Docker Compose, load-aware scheduler |
+
+## Benchmark — TPC-H vs single-node DuckDB
+
+Full TPC-H (22 queries) benchmarked at **SF0.01–SF40** on identical hardware (single Linux VM, 3 workers + coordinator vs single-node DuckDB baseline). All 22 queries pass correctness verification. TPC-DS is out of scope for now (planner not ready).
+
+**Key results (SF40, ~56 GB, concurrency=1):**
+
+- **7/22 queries outperform single-node DuckDB** — despite DuckCluster running 4 processes vs 1
+- **Q01/Q04: DC 60% faster** (0.40×) — parallel lineitem / orders scan
+- **Q06: DC 39% faster** (0.61×) — embarrassingly parallel aggregation
+- **Suite overhead converging**: 66× (SF0.01) → 7.2× (SF1) → **2.5× (SF40)**
+- **Sub-linear DC scaling**: 1.57× latency for 2× data (single-node: 2.36×)
+
+![Benchmark hero — suite convergence, DC wins, SF40 leaders](docs/plots/benchmark-hero.png)
+
+**More charts** (click to expand)
+
+<details>
+<summary>Crossover heatmap — green = DuckCluster faster, indigo = single-node faster</summary>
+
+![Crossover heatmap](docs/plots/crossover-heatmap.png)
+
+</details>
+
+<details>
+<summary>Scaling — suite time SF10→SF40</summary>
+
+![Scaling curves](docs/plots/scaling-curves.png)
+
+</details>
+
+<details>
+<summary>SF40 — all 22 queries (dumbbell chart)</summary>
+
+![SF40 per-query dumbbell](docs/plots/sf40-diverging.png)
+
+</details>
+
+<details>
+<summary>Four-panel summary</summary>
+
+![Benchmark summary](docs/plots/benchmark-summary.png)
+
+</details>
+
+
+
+**Crossover progression (DC/SN ratio):**
+
+
+| Query | SF0.01 | SF1   | SF10 | SF20  | SF40      |
+| ----- | ------ | ----- | ---- | ----- | --------- |
+| Q01   | 20.2×  | 7.5×  | 1.3× | 0.69× | **0.40×** |
+| Q04   | 31.0×  | 14.1× | 3.2× | 0.74× | **0.40×** |
+| Q06   | 77.5×  | 15.6× | 1.2× | 1.1×  | **0.61×** |
+
+
+Join-heavy queries (Q03/Q07/Q08/Q09/Q18) remain 3–5× slower — broadcast cost per fragment (see Roadmap).
+
+Regenerate plots: `python3 scripts/benchmark-plots.py` (requires matplotlib). Full numbers: [`docs/BENCHMARK.md`](docs/BENCHMARK.md). Optimization history: [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md)
 
 ---
+
+
+
+## Roadmap
+
+- **Dashboard** — read-only monitoring UI at `/dashboard/` ([demo video](docs/media/DuckCluster-demo.mp4), [screenshots](#monitoring-dashboard))
+- **CLI** — `duckcluster query` / `status` / `workers` over REST ([plan](docs/PLAN-cli.md))
+- **Broadcast materialization** — worker-side `__dc_bcast_*` tables (landed; formal re-benchmark pending) — see [OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md)
+- **Apache Arrow transfer** — typed columns / Arrow IPC between workers and coordinator for zero-copy merge
+
+---
+
+
 
 ## Demo data
 
@@ -253,6 +369,8 @@ java -jar worker/target/duckcluster-worker-0.1.0-SNAPSHOT.jar worker-1 127.0.0.1
 per-worker `.duckdb` shard files; workers discover and ATTACH them via `ShardFileWatcher`.
 
 ---
+
+
 
 ## Development
 
@@ -270,6 +388,8 @@ mvn clean package -DskipTests
 **SQL parsing notes:** Calcite treats some identifiers as reserved words (`value`, `count`). Use unambiguous column names (e.g. `score` instead of `value`) or quote identifiers where needed.
 
 ---
+
+
 
 ## License
 
