@@ -7,6 +7,7 @@ import io.duckcluster.common.model.QueryResult;
 import io.duckcluster.common.planner.MergeSqlBuilder;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 public final class TopKMergeStrategy implements MergeStrategy {
@@ -17,7 +18,9 @@ public final class TopKMergeStrategy implements MergeStrategy {
 
     @Override
     public QueryResult merge(MergeContext context) {
-        String mergeSql = MergeSqlBuilder.buildTopKMerge(context.plan().analysis(), context.plan().topK());
+        List<String> outputColumns = MergeSqlColumns.outputColumns(context);
+        String mergeSql = MergeSqlBuilder.buildTopKMerge(
+                context.plan().analysis(), context.plan().topK(), outputColumns);
         return DuckDbMergeSupport.mergeWithSql(context, stats(context), mergeSql);
     }
 

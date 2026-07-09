@@ -192,6 +192,9 @@ public final class QueryAnalysisExtractor {
     }
 
     private static String selectOutputName(SqlNode item) {
+        if (item instanceof SqlIdentifier identifier && identifier.isStar()) {
+            return "*";
+        }
         if (item instanceof SqlBasicCall call && call.getOperator().getKind() == SqlKind.AS) {
             SqlNode aliasNode = call.operand(1);
             if (aliasNode instanceof SqlIdentifier alias) {

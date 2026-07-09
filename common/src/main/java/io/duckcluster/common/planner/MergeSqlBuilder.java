@@ -146,9 +146,13 @@ public final class MergeSqlBuilder {
     }
 
     public static String buildTopKMerge(QueryAnalysis analysis, TopKSpec topK) {
+        return buildTopKMerge(analysis, topK, analysis.outputColumnNames());
+    }
+
+    public static String buildTopKMerge(QueryAnalysis analysis, TopKSpec topK, List<String> outputColumns) {
         StringBuilder sql = new StringBuilder("SELECT ");
         boolean first = true;
-        for (String column : analysis.outputColumnNames()) {
+        for (String column : outputColumns) {
             if (!first) {
                 sql.append(", ");
             }

@@ -3,7 +3,9 @@ package io.duckcluster.coordinator.merger;
 import io.duckcluster.common.merger.FragmentResult;
 import io.duckcluster.common.merger.MergeContext;
 import io.duckcluster.common.merger.RowBatchData;
+import io.duckcluster.common.model.MergeStrategyType;
 import io.duckcluster.common.model.NestedDerivedTableSpec;
+import io.duckcluster.common.model.OrderByClause;
 import io.duckcluster.common.model.QueryAnalysis;
 import io.duckcluster.common.model.QueryResult;
 import io.duckcluster.common.model.TopKSpec;
@@ -192,8 +194,8 @@ final class DuckDbMergeSupport {
     private static void createTempTableFromFragments(Connection connection, MergeContext context)
             throws SQLException {
         QueryAnalysis analysis = context.plan().analysis();
-        List<String> columns = MergeSqlBuilder.tempTableColumns(analysis);
-        List<String> columnTypes = columnTypesForAnalysis(analysis, columns);
+        List<String> columns = MergeSqlColumns.fromContext(context);
+        List<String> columnTypes = columnTypesForContext(context, columns);
         createEmptyTable(connection, TEMP_TABLE, columns, columnTypes);
         DuckDbBulkInserter.appendFragmentBatches(
                 connection, TEMP_TABLE, columns, columnTypes, context.fragmentResults(), analysis);
@@ -231,10 +233,13 @@ final class DuckDbMergeSupport {
         DuckDbBulkInserter.insertRows(connection, tableName, columns, rows, columnTypes);
     }
 
-    private static List<String> columnTypesForAnalysis(QueryAnalysis analysis, List<String> columns) {
+    private static List<String> columnTypesForContext(MergeContext context, List<String> columns) {
+        QueryAnalysis analysis = context.plan().analysis();
+        TopKSpec topK = context.plan().topK();
+        MergeStrategyType mergeStrategy = context.plan().mergeStrategy();
         List<String> types = new ArrayList<>(columns.size());
         for (String column : columns) {
-            types.add(columnType(analysis, column));
+            types.add(columnType(analysis, column, topK, mergeStrategy, context));
         }
         return types;
     }
@@ -259,7 +264,12 @@ final class DuckDbMergeSupport {
         return new QueryResult(queryId, columns, rows, stats);
     }
 
-    private static String columnType(QueryAnalysis analysis, String column) {
+    private static String columnType(
+            QueryAnalysis analysis,
+            String column,
+            TopKSpec topK,
+            MergeStrategyType mergeStrategy,
+            MergeContext context) {
         if (analysis.groupByColumns().contains(column)) {
             return "VARCHAR";
         }
@@ -271,7 +281,50 @@ final class DuckDbMergeSupport {
                 return "DOUBLE";
             }
         }
+        if (MergeStrategyType.TOP_K.equals(mergeStrategy) && topK.hasOrderBy()) {
+            for (OrderByClause clause : topK.orderBy()) {
+                if (clause.column().equals(column)) {
+                    return topKOrderByColumnType(context, column);
+                }
+            }
+        }
         return "VARCHAR";
+    }
+
+    private static String topKOrderByColumnType(MergeContext context, String column) {
+        boolean hasValues = false;
+        boolean allIntegers = true;
+        boolean allNumeric = true;
+        for (FragmentResult fragment : context.fragmentResults()) {
+            for (RowBatchData batch : fragment.batches()) {
+                int batchColumnIndex = batch.columnNames().indexOf(column);
+                if (batchColumnIndex < 0) {
+                    continue;
+                }
+                for (List<String> row : batch.rows()) {
+                    String value = row.get(batchColumnIndex);
+                    if (value == null || value.isEmpty()) {
+                        continue;
+                    }
+                    hasValues = true;
+                    if (value.matches("-?\\d+")) {
+                        continue;
+                    }
+                    allIntegers = false;
+                    if (value.matches("-?\\d+(\\.\\d+)?")) {
+                        continue;
+                    }
+                    allNumeric = false;
+                }
+            }
+        }
+        if (!hasValues || !allNumeric) {
+            return "VARCHAR";
+        }
+        if (allIntegers) {
+            return "BIGINT";
+        }
+        return "DOUBLE";
     }
 
     private static void dropTable(Connection connection, String tableName) throws SQLException {

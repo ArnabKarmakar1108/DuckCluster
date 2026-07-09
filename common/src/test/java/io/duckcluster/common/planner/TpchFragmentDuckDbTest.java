@@ -1,5 +1,6 @@
 package io.duckcluster.common.planner;
 
+import io.duckcluster.common.model.BroadcastTable;
 import io.duckcluster.common.model.FragmentSpec;
 import io.duckcluster.common.model.PlannedQuery;
 import org.junit.jupiter.api.Assumptions;
@@ -36,8 +37,46 @@ class TpchFragmentDuckDbTest {
         try (Connection connection = DriverManager.getConnection("jdbc:duckdb:");
                 Statement statement = connection.createStatement()) {
             attachAllWorkerShards(statement);
+            materializeBroadcastTables(statement, planned);
             statement.execute("SELECT * FROM (" + fragment.sql() + ") AS fragment_probe LIMIT 1");
         }
+    }
+
+    private static void materializeBroadcastTables(Statement statement, PlannedQuery planned) throws Exception {
+        Set<String> materialized = new HashSet<>();
+        for (BroadcastTable table : planned.broadcastTables()) {
+            materializeBroadcastTable(statement, table, materialized);
+        }
+        for (BroadcastTable table : planned.subqueryBroadcastTables()) {
+            materializeBroadcastTable(statement, table, materialized);
+        }
+    }
+
+    private static void materializeBroadcastTable(
+            Statement statement, BroadcastTable table, Set<String> materialized) throws Exception {
+        String tempTable = BroadcastSqlNames.tempTable(table.tableName());
+        if (!materialized.add(tempTable)) {
+            return;
+        }
+        statement.execute("DROP TABLE IF EXISTS \"" + tempTable + "\"");
+        statement.execute("CREATE TABLE \"" + tempTable + "\" AS (" + unionAllSql(table.tableName(), table.shardCount()) + ")");
+    }
+
+    private static String unionAllSql(String tableName, int shardCount) {
+        StringBuilder sql = new StringBuilder();
+        for (int shardId = 0; shardId < shardCount; shardId++) {
+            if (shardId > 0) {
+                sql.append(" UNION ALL ");
+            }
+            sql.append("SELECT * FROM \"")
+                    .append(tableName)
+                    .append("_shard")
+                    .append(shardId)
+                    .append("\".\"")
+                    .append(tableName)
+                    .append("\"");
+        }
+        return sql.toString();
     }
 
     private static void attachAllWorkerShards(Statement statement) throws Exception {
