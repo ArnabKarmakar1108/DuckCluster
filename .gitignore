@@ -12,6 +12,7 @@ docs/PROPOSAL-*.md
 /data/
 benchmark/data/
 benchmark/results/
+benchmark/dependency-reduced-pom.xml
 .venv/
 __pycache__/
 *.py[cod]
