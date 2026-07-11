@@ -16,6 +16,77 @@ import requests
 from duckcluster.demo import DEFAULT_DEMO_ROW_COUNT, write_demo_csv
 from duckcluster.shards import build_shard_db, ring_assignments
 
+# Ports used by integration tests. Released at session start so interrupted runs
+# do not leave coordinators that answer health checks but belong to another test.
+_INTEGRATION_TEST_BASE_PORTS: tuple[int, ...] = (
+    18080,
+    19090,
+    19101,
+    19102,
+    19103,
+    28080,
+    29090,
+    29101,
+    29102,
+    29103,
+    38080,
+    38180,
+    38201,
+    39090,
+    39101,
+    39102,
+    39103,
+    39190,
+    39201,
+    39202,
+    39203,
+    48080,
+    48180,
+    48280,
+    49090,
+    49101,
+    49102,
+    49190,
+    49201,
+    49202,
+    49203,
+    49290,
+    49301,
+    49302,
+    49303,
+    58080,
+    59090,
+    59101,
+    59102,
+    59103,
+    59104,
+    38580,
+    39590,
+    39601,
+    39602,
+    39603,
+)
+
+
+def _stress_test_ports() -> tuple[int, ...]:
+    ports: list[int] = []
+    for http_port in (38401, 38402, 38403, 38404):
+        ports.extend(
+            [
+                http_port,
+                http_port + 1010,
+                http_port + 1021,
+                http_port + 1022,
+                http_port + 1023,
+            ]
+        )
+    return tuple(ports)
+
+
+INTEGRATION_TEST_PORTS: tuple[int, ...] = tuple(
+    sorted(set(_INTEGRATION_TEST_BASE_PORTS + _stress_test_ports()))
+)
+
 
 @dataclass
 class ClusterConfig:
@@ -58,6 +129,7 @@ class ClusterManager:
 
     def start(self) -> None:
         self._build_jars()
+        self._release_ports()
         self._prepare_data()
         env = self._base_env()
         coordinator_jar = (
@@ -80,6 +152,38 @@ class ClusterManager:
             self._terminate(self._coordinator)
         self._workers.clear()
         self._coordinator = None
+        self._release_ports()
+
+    @staticmethod
+    def release_integration_test_ports() -> None:
+        for port in INTEGRATION_TEST_PORTS:
+            ClusterManager._kill_listeners_on_port(port)
+
+    def _release_ports(self) -> None:
+        ports = {
+            self.config.coordinator_http_port,
+            self.config.coordinator_grpc_port,
+            *self.config.worker_ports,
+        }
+        for port in ports:
+            ClusterManager._kill_listeners_on_port(port)
+
+    @staticmethod
+    def _kill_listeners_on_port(port: int) -> None:
+        probe = subprocess.run(
+            ["fuser", f"{port}/tcp"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if probe.returncode != 0:
+            return
+        subprocess.run(
+            ["fuser", "-k", f"{port}/tcp"],
+            capture_output=True,
+            check=False,
+        )
+        time.sleep(0.3)
 
     def kill_worker(self, worker_id: str) -> None:
         process = self._workers.get(worker_id)
@@ -312,6 +416,10 @@ class ClusterManager:
     def _wait_for_coordinator(self) -> None:
         deadline = time.time() + 45
         while time.time() < deadline:
+            if self._coordinator is not None and self._coordinator.poll() is not None:
+                raise RuntimeError(
+                    f"Coordinator process exited before becoming healthy ({self.config.http_base_url})"
+                )
             try:
                 response = requests.get(f"{self.config.http_base_url}/v1/cluster/health", timeout=1)
                 if response.status_code == 200:
@@ -326,6 +434,8 @@ class ClusterManager:
     def _wait_for_workers(self, expected: int, timeout_sec: float = 45) -> None:
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
+            if self._coordinator is not None and self._coordinator.poll() is not None:
+                raise RuntimeError("Coordinator process exited while waiting for workers")
             try:
                 response = requests.get(f"{self.config.http_base_url}/v1/cluster/workers", timeout=2)
                 response.raise_for_status()

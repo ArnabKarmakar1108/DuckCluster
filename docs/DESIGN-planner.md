@@ -511,30 +511,30 @@ during coordinator merge (NULL/type mismatches in temp-table inserts).
 
 All 22 TPC-H queries pass end-to-end on SF0.01 as of July 2026.
 
-| Query | End-to-end | Primary fix | Notes |
-|-------|------------|-------------|-------|
-| Q01 | ✅ | D4 | Expression `SUM` on `lineitem` |
-| Q02 | ✅ | D15 | Correlated scalar + TOP_K string `ORDER BY` |
-| Q03 | ✅ | D17 | TOP_K on aggregate alias `revenue` |
-| Q04 | ✅ | D14 | Correlated `EXISTS` on `orders`/`lineitem` |
-| Q05 | ✅ | D10 | Comma-join six tables |
-| Q06 | ✅ | D4 | Expression `SUM(CASE …)` |
-| Q07 | ✅ | D5 | Derived table in `FROM` |
-| Q08 | ✅ | D8 | Multi-aggregate arithmetic |
-| Q09 | ✅ | D5 | Derived table in `FROM` |
-| Q10 | ✅ | D10 | Comma-join + alias + column order |
-| Q11 | ✅ | D11 | Reserved alias `value` + HAVING subquery rewrite |
-| Q12 | ✅ | D10 | `orders, lineitem` comma-join |
-| Q13 | ✅ | D5 + D7 | Nested inner `GROUP BY` |
-| Q14 | ✅ | D8 | Nested aggregates in expression |
-| Q15 | ✅ | D16 | `WITH` CTE coordinator two-step merge |
-| Q16 | ✅ | D12 | `COUNT(DISTINCT …)` |
-| Q17 | ✅ | D15 | Correlated scalar on `lineitem` |
-| Q18 | ✅ | D13 | Uncorrelated `IN` + global `lineitem` subquery |
-| Q19 | ✅ | D4 + D17 | Partial agg expression on join |
-| Q20 | ✅ | D15 | Nested `IN` + global correlated scalar |
-| Q21 | ✅ | D14 | Correlated `EXISTS` + `NOT EXISTS` |
-| Q22 | ✅ | D15 | Derived table + scalar + `NOT EXISTS` |
+| Query  | Primary fix | Notes |
+|-------|-------------|-------|
+| Q01 | D4 | Expression `SUM` on `lineitem` |
+| Q02 | D15 | Correlated scalar + TOP_K string `ORDER BY` |
+| Q03 | D17 | TOP_K on aggregate alias `revenue` |
+| Q04 | D14 | Correlated `EXISTS` on `orders`/`lineitem` |
+| Q05 | D10 | Comma-join six tables |
+| Q06 | D4 | Expression `SUM(CASE …)` |
+| Q07 | D5 | Derived table in `FROM` |
+| Q08 | D8 | Multi-aggregate arithmetic |
+| Q09 | D5 | Derived table in `FROM` |
+| Q10 | D10 | Comma-join + alias + column order |
+| Q11 | D11 | Reserved alias `value` + HAVING subquery rewrite |
+| Q12 | D10 | `orders, lineitem` comma-join |
+| Q13 | D5 + D7 | Nested inner `GROUP BY` |
+| Q14 | D8 | Nested aggregates in expression |
+| Q15 | D16 | `WITH` CTE coordinator two-step merge |
+| Q16 | D12 | `COUNT(DISTINCT …)` |
+| Q17 | D15 | Correlated scalar on `lineitem` |
+| Q18 | D13 | Uncorrelated `IN` + global `lineitem` subquery |
+| Q19 | D4 + D17 | Partial agg expression on join |
+| Q20 | D15 | Nested `IN` + global correlated scalar |
+| Q21 | D14 | Correlated `EXISTS` + `NOT EXISTS` |
+| Q22 | D15 | Derived table + scalar + `NOT EXISTS` |
 
 ---
 

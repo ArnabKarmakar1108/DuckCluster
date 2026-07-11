@@ -1,13 +1,11 @@
-<h1 align="left">
-  <img src="coordinator/src/main/resources/dashboard/neon-duck.jpg" alt="DuckCluster" width="44" height="44" style="vertical-align: middle; margin-right: 0.4em; border-radius: 6px;">
+<h1>
+  <img src="coordinator/src/main/resources/dashboard/neon-duck.jpg" alt="DuckCluster" width="48" align="absmiddle" hspace="8">
   DuckCluster
 </h1>
 
 A **distributed SQL query coordinator** for analytical workloads. Clients submit SQL over a REST API; DuckCluster plans the query with Apache Calcite, executes shard-local fragments on **DuckDB worker nodes**, streams partial results over gRPC, and merges them into a final answer.
 
-Built in Java 17 as a multi-module Maven project.
-
-For design details, see `[docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md)` and `[docs/DESIGN-planner.md](docs/DESIGN-planner.md)`.
+For design details, see [DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) and [DESIGN-planner.md](docs/DESIGN-planner.md).
 
 ---
 
@@ -91,6 +89,62 @@ DUCKCLUSTER_DEMO_CSV=/path/to/events.csv ./scripts/start-cluster.sh
 
 ### Submit a query
 
+Start the cluster first (`./scripts/start-cluster.sh`), then use the CLI.
+
+#### Interactive shell
+
+```bash
+./scripts/duckcluster          # opens the shell (default when run on a TTY)
+./scripts/duckcluster shell    # same as above
+```
+
+Inside the shell:
+
+```
+duckcluster> \tables
+events
+duckcluster> SELECT * FROM events;
+duckcluster> SELECT category, COUNT(*) AS cnt FROM events GROUP BY category
+duckcluster> \status
+duckcluster> \q
+```
+
+- Type SQL and end with `;`, or press Enter on a **single-line** query (semicolon optional).
+- `ORDER BY` must come before `LIMIT`: `SELECT … ORDER BY id LIMIT 5`.
+- Up/down arrows recall previous queries exactly as typed (with `;` when you used one).
+- Meta-commands: `\tables` `\status` `\workers` `\help` `\q` (or `quit` / `exit`).
+
+#### One-shot query (no shell)
+
+```bash
+# Inline SQL
+./scripts/duckcluster query "SELECT category, COUNT(*) AS cnt FROM events GROUP BY category"
+
+# SQL from a file
+./scripts/duckcluster query -f path/to/query.sql
+
+# JSON for scripts / jq
+./scripts/duckcluster query "SELECT COUNT(*) FROM events" --format json
+
+# Stats on stderr (merge strategy, duration, workers)
+./scripts/duckcluster query "SELECT COUNT(*) FROM events" -v
+```
+
+#### Other commands
+
+```bash
+./scripts/duckcluster status     # cluster UP / worker count
+./scripts/duckcluster workers    # list workers
+```
+
+Install globally: `pip install -e cli/` — then use `duckcluster` instead of `./scripts/duckcluster`.
+
+Full reference and screenshot: **[`cli/README.md`](cli/README.md)**.
+
+The CLI prints results as a table (or JSON with `--format json`) and fails fast when the cluster is down, tables are missing from the shard catalog, or shards have no owners.
+
+Raw REST API (same backend):
+
 ```bash
 # Simple scan with filter pushdown
 curl -s -X POST http://127.0.0.1:8080/v1/query \
@@ -118,9 +172,14 @@ After `start-cluster.sh`, open the read-only UI at `http://127.0.0.1:8080/dashbo
 
 **Demo video:** [docs/media/DuckCluster-demo.mp4](docs/media/DuckCluster-demo.mp4)
 
-| Cluster topology | Recent queries | Shard catalog |
-| --- | --- | --- |
-| ![Healthy cluster topology](docs/media/green-topology.png) | ![Recent queries panel](docs/media/queries.png) | ![Shard catalog panel](docs/media/shard-catalog.png) |
+<p align="center"><b>Cluster topology</b><br>
+<img src="docs/media/green-topology.png" alt="Healthy cluster topology" width="720"></p>
+
+<p align="center"><b>Recent queries</b><br>
+<img src="docs/media/queries.png" alt="Recent queries panel" width="720"></p>
+
+<p align="center"><b>Shard catalog</b><br>
+<img src="docs/media/shard-catalog.png" alt="Shard catalog panel" width="720"></p>
 
 Live status: workers, in-flight queries, recent query history, and shard placement per table.
 
@@ -245,7 +304,8 @@ DuckCluster/
 ├── common/          # Models, config, Calcite planner, consistent hash ring
 ├── coordinator/     # REST API, query execution, shard catalog, replication
 ├── worker/          # gRPC server, DuckDB pool, shard manager, file watcher
-├── scripts/         # start-cluster.sh, split-and-distribute.sh, test helpers
+├── cli/             # duckcluster CLI (pip install -e cli/)
+├── scripts/         # start-cluster.sh, duckcluster, split-and-distribute.sh
 ├── tests/integration/  # Pytest harness + bundled sample CSV
 └── docs/
     ├── DESIGN-DECISIONS.md
@@ -353,8 +413,8 @@ Regenerate plots: `python3 scripts/benchmark-plots.py` (requires matplotlib). Fu
 
 ## Roadmap
 
-- **Dashboard** — read-only monitoring UI at `/dashboard/` ([demo video](docs/media/DuckCluster-demo.mp4), [screenshots](#monitoring-dashboard))
-- **CLI** — `duckcluster query` / `status` / `workers` over REST ([plan](docs/PLAN-cli.md))
+- **Dashboard** — read-only monitoring UI at `/dashboard/` ([demo video](docs/media/DuckCluster-demo.mp4), [screenshots](#monitoring-dashboard)); SSE drill-down pending ([plan](docs/PLAN-dashboard.md))
+- **CLI** — shipped: interactive shell + `query` / `status` / `workers` ([guide](cli/README.md), [plan](docs/PLAN-cli.md))
 - **Broadcast materialization** — worker-side `__dc_bcast_*` tables (landed; formal re-benchmark pending) — see [OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md)
 - **Apache Arrow transfer** — typed columns / Arrow IPC between workers and coordinator for zero-copy merge
 

@@ -17,9 +17,9 @@ def test_worker_failure_replica_takeover(harness_root: Path, with_cluster_config
     """Queries keep returning correct results after a worker is killed and removed from the cluster."""
     manager = ClusterManager(
         with_cluster_config(
-            coordinator_http_port=38080,
-            coordinator_grpc_port=39090,
-            worker_ports=(39101, 39102, 39103),
+            coordinator_http_port=38580,
+            coordinator_grpc_port=39590,
+            worker_ports=(39601, 39602, 39603),
             heartbeat_interval_sec=1,
             heartbeat_miss_threshold=2,
             watcher_interval_ms=500,

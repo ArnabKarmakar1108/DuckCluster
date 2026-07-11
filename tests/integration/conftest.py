@@ -32,7 +32,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _build_jars_once(repo_root: Path) -> None:
+def _cleanup_stale_test_clusters() -> None:
+    ClusterManager.release_integration_test_ports()
+    yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _build_jars_once(repo_root: Path, _cleanup_stale_test_clusters: None) -> None:
     subprocess.run(
         ["mvn", "-q", "package", "-DskipTests"],
         cwd=repo_root,
