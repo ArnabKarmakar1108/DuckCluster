@@ -5,6 +5,8 @@
 
 A **distributed SQL query coordinator** for analytical workloads. Clients submit SQL over a REST API; DuckCluster plans the query with Apache Calcite, executes shard-local fragments on **DuckDB worker nodes**, streams partial results over gRPC, and merges them into a final answer.
 
+**Read the full write-up on Medium:** [Building DuckCluster — distributed SQL on DuckDB](https://medium.com/@arnabk1108/building-duckcluster-distributed-sql-on-top-of-duckdb-e5dbae2f967d)
+
 For design details, see [DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) and [DESIGN-planner.md](docs/DESIGN-planner.md).
 
 ---
