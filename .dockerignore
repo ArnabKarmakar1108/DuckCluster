@@ -1,0 +1,12 @@
+.git/
+.idea/
+*.iml
+target/
+data/
+logs/
+.venv/
+**/__pycache__/
+.pytest_cache/
+benchmark/data/
+benchmark/results/
+docs/PROPOSAL-*.md

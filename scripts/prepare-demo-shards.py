@@ -24,16 +24,19 @@ def ring_assignments(
     replication_factor: int,
     vnodes: int = 100,
 ) -> dict[str, list[str]]:
-    subprocess.run(
-        ["mvn", "-q", "-pl", "common", "compile"],
-        cwd=repo_root,
-        check=True,
-    )
+    classes = repo_root / "common/target/classes"
+    ring_cli = classes / "io/duckcluster/common/routing/RingAssignerCli.class"
+    if not ring_cli.is_file():
+        subprocess.run(
+            ["mvn", "-q", "-pl", "common", "compile"],
+            cwd=repo_root,
+            check=True,
+        )
     completed = subprocess.run(
         [
             "java",
             "-cp",
-            str(repo_root / "common/target/classes"),
+            str(classes),
             "io.duckcluster.common.routing.RingAssignerCli",
             "--workers",
             ",".join(worker_ids),

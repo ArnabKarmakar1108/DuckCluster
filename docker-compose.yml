@@ -1,0 +1,95 @@
+name: duckcluster
+
+services:
+  datagen:
+    build: .
+    image: duckcluster:latest
+    command: ["/app/docker/prepare-data.sh"]
+    environment:
+      DUCKCLUSTER_SHARD_COUNT: "${DUCKCLUSTER_SHARD_COUNT:-6}"
+      DUCKCLUSTER_REPLICATION_FACTOR: "${DUCKCLUSTER_REPLICATION_FACTOR:-2}"
+      DUCKCLUSTER_DEMO_CSV: "${DUCKCLUSTER_DEMO_CSV:-}"
+    volumes:
+      - worker-1-data:/shards/worker-1
+      - worker-2-data:/shards/worker-2
+      - worker-3-data:/shards/worker-3
+
+  coordinator:
+    build: .
+    image: duckcluster:latest
+    command: ["java", "-jar", "/app/coordinator.jar"]
+    ports:
+      - "${DUCKCLUSTER_HTTP_PORT:-8080}:8080"
+      - "${DUCKCLUSTER_GRPC_PORT:-9090}:9090"
+    environment:
+      DUCKCLUSTER_COORDINATOR_HTTP_BIND_HOST: "0.0.0.0"
+      DUCKCLUSTER_SHARD_COUNT: "${DUCKCLUSTER_SHARD_COUNT:-6}"
+      DUCKCLUSTER_REPLICATION_FACTOR: "${DUCKCLUSTER_REPLICATION_FACTOR:-2}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/v1/cluster/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    depends_on:
+      datagen:
+        condition: service_completed_successfully
+
+  worker-1:
+    build: .
+    image: duckcluster:latest
+    command: ["java", "-jar", "/app/worker.jar", "worker-1", "worker-1", "9101"]
+    environment:
+      DUCKCLUSTER_COORDINATOR_HOST: coordinator
+      DUCKCLUSTER_COORDINATOR_GRPC_PORT: "9090"
+      DUCKCLUSTER_DATA_DIR: /data
+      DUCKCLUSTER_SHARD_COUNT: "${DUCKCLUSTER_SHARD_COUNT:-6}"
+      DUCKCLUSTER_REPLICATION_FACTOR: "${DUCKCLUSTER_REPLICATION_FACTOR:-2}"
+    volumes:
+      - worker-1-data:/data
+    depends_on:
+      datagen:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+
+  worker-2:
+    build: .
+    image: duckcluster:latest
+    command: ["java", "-jar", "/app/worker.jar", "worker-2", "worker-2", "9101"]
+    environment:
+      DUCKCLUSTER_COORDINATOR_HOST: coordinator
+      DUCKCLUSTER_COORDINATOR_GRPC_PORT: "9090"
+      DUCKCLUSTER_DATA_DIR: /data
+      DUCKCLUSTER_SHARD_COUNT: "${DUCKCLUSTER_SHARD_COUNT:-6}"
+      DUCKCLUSTER_REPLICATION_FACTOR: "${DUCKCLUSTER_REPLICATION_FACTOR:-2}"
+    volumes:
+      - worker-2-data:/data
+    depends_on:
+      datagen:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+
+  worker-3:
+    build: .
+    image: duckcluster:latest
+    command: ["java", "-jar", "/app/worker.jar", "worker-3", "worker-3", "9101"]
+    environment:
+      DUCKCLUSTER_COORDINATOR_HOST: coordinator
+      DUCKCLUSTER_COORDINATOR_GRPC_PORT: "9090"
+      DUCKCLUSTER_DATA_DIR: /data
+      DUCKCLUSTER_SHARD_COUNT: "${DUCKCLUSTER_SHARD_COUNT:-6}"
+      DUCKCLUSTER_REPLICATION_FACTOR: "${DUCKCLUSTER_REPLICATION_FACTOR:-2}"
+    volumes:
+      - worker-3-data:/data
+    depends_on:
+      datagen:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+
+volumes:
+  worker-1-data:
+  worker-2-data:
+  worker-3-data:
