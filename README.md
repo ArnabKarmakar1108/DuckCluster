@@ -73,6 +73,23 @@ mvn clean package
 
 
 
+### Run with Docker Compose
+
+Requires Docker Compose v2 (`docker compose`). On Ubuntu: `sudo apt install docker-compose-v2` if the command is missing.
+
+Start the coordinator and three workers in separate containers (demo shards are prepared automatically):
+
+```bash
+docker compose up --build
+```
+
+- Dashboard: `http://localhost:8080/dashboard/`
+- Stop and remove volumes: `docker compose down -v`
+
+Full reference: **[`docker/README.md`](docker/README.md)** (services, volumes, env vars, troubleshooting).
+
+Optional env vars: `DUCKCLUSTER_HTTP_PORT`, `DUCKCLUSTER_GRPC_PORT`, `DUCKCLUSTER_SHARD_COUNT`, `DUCKCLUSTER_REPLICATION_FACTOR`, `DUCKCLUSTER_DEMO_CSV`.
+
 ### Run a local cluster
 
 ```bash
@@ -91,7 +108,7 @@ DUCKCLUSTER_DEMO_CSV=/path/to/events.csv ./scripts/start-cluster.sh
 
 ### Submit a query
 
-Start the cluster first (`./scripts/start-cluster.sh`), then use the CLI.
+Start the cluster first (`./scripts/start-cluster.sh` or `docker compose up`), then use the CLI.
 
 #### Interactive shell
 
@@ -307,7 +324,10 @@ DuckCluster/
 ├── coordinator/     # REST API, query execution, shard catalog, replication
 ├── worker/          # gRPC server, DuckDB pool, shard manager, file watcher
 ├── cli/             # duckcluster CLI (pip install -e cli/)
+├── docker/          # Docker Compose docs + prepare-data.sh
 ├── scripts/         # start-cluster.sh, duckcluster, split-and-distribute.sh
+├── docker-compose.yml
+├── Dockerfile
 ├── tests/integration/  # Pytest harness + bundled sample CSV
 └── docs/
     ├── DESIGN-DECISIONS.md
