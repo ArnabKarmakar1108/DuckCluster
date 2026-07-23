@@ -14,24 +14,63 @@ For design details, see [DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) and [DES
 ## How it works
 
 ```
-Client SQL
-    │
-    ▼
-Coordinator (REST + Calcite planner)
-    ├─ Classify tables (driving vs broadcast), detect merge strategy
-    ├─ Generate N fragment SQL (qualified catalog.table names, UNION ALL for broadcast)
-    ├─ Resolve target workers (3-tier: ring owners → cached → remote read)
-    ├─ Prefetch broadcast shards to target workers (if JOIN)
-    └─ Dispatch fragments in parallel via persistent gRPC channels
-           │
-           ▼
-    Worker 0 … Worker N  (embedded DuckDB per node, all data local)
-           │
-           ▼
-Coordinator merges partial results (embedded DuckDB)
-           │
-           ▼
-    JSON response
+              +------------------------------------------+
+              |               Clients                    |
+              |  duckcluster CLI · curl · dashboard      |
+              +--------------------+---------------------+
+                                   | HTTP  /v1/query
+                                   v
+  +------------------------------------------------------------------------+
+  |                          COORDINATOR                                   |
+  |                                                                        |
+  |   REST + dashboard    Shard catalog (hash ring)    Worker registry     |
+  |        |                     |                          |              |
+  |        +---------------------+--------------------------+              |
+  |                              v                                         |
+  |      Calcite planner — classify driving vs broadcast tables            |
+  |      detect merge strategy (CONCAT / PARTIAL_AGG / GROUP_BY /          |
+  |        TOP_K / nested / CTE …) generate N fragment SQL.                |
+  |                                                                        |
+  |       JOINs: UNION ALL broadcast shard copies per fragment             |
+  |                                                                        |
+  |              per fragment (parallel):                                  |
+  |       pick worker  — ring owner -> local cache -> remote read          |
+  |       prefetch broadcast shards to target worker if needed             |
+  |          dispatch SQL over persistent gRPC channel                     |
+  +------------------------------------------------------------------------+
+                                    | gRPC
+        +---------------------------+-------------------------------+
+        v                           v                               v
+  +----------------+        +----------------+               +----------------+
+  | Worker 0       |        | Worker 1       |      ...      | Worker N       |
+  |----------------|        |----------------|               |----------------|
+  | gRPC server    |        | gRPC server    |               | gRPC server    |
+  | DuckDB pool    |        | DuckDB pool    |               | DuckDB pool    |
+  | ShardManager   |        | ShardManager   |               | ShardManager   |
+  +-------+--------+        +-------+--------+               +-------+--------+
+          |                         |                                |
+          v                         v                                v
+     worker.db                 worker.db                       worker.db
+     + ATTACHED shard files     + ATTACHED shard files          + ATTACHED shard files
+       events_shard0.duckdb      events_shard2.duckdb            orders_shard4.duckdb
+       events_shard1.duckdb      ...                               ...
+         +---------------------------+-------------------------------+
+                   +----------------------------------------+
+                   | partial result batches (protobuf rows) |
+                   +----------------------------------------+
+                                     v
+ +------------------------------------------------------------------------+
+ | Coordinator embedded DuckDB — merge partials per strategy              |
+ | bulk load -> CONCATENATE | re-aggregate | GROUP BY | TOP-K | ...       |
+ +------------------------------------+-----------------------------------+
+                                      v
+                                JSON response
+
+Offline data path (before queries):
+  split-and-distribute.sh / prepare-demo-shards.py
+    -> split source into <table>_shard{N}.duckdb files
+    -> copy replicas to worker data dirs (hash ring + RF)
+    -> workers scan + ATTACH on startup; coordinator tracks ownership
 ```
 
 **Sharding model:** data is pre-split into `.duckdb` shard files (e.g. `events_shard0.duckdb`) via `split-and-distribute.sh` and distributed to worker data directories independently per table. Workers auto-discover and ATTACH these files at startup. A consistent hash ring determines shard placement with configurable replication factor. Tables can have different shard counts and keys — the coordinator handles JOINs via broadcast shuffle at query time.
@@ -245,6 +284,8 @@ Unit tests only:
 ```bash
 mvn test
 ```
+
+**CI:** GitHub Actions runs `mvn test`, integration tests (excluding TPC-H), and TPC-H SF0.01 correctness on every push/PR — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 See `[tests/integration/README.md](tests/integration/README.md)` for harness layout and scenario details.
 
