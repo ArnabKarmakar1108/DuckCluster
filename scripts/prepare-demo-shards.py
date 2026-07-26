@@ -28,7 +28,7 @@ def ring_assignments(
     ring_cli = classes / "io/duckcluster/common/routing/RingAssignerCli.class"
     if not ring_cli.is_file():
         subprocess.run(
-            ["mvn", "-q", "-pl", "common", "compile"],
+            ["mvn", "-q", "-pl", "common", "-am", "compile"],
             cwd=repo_root,
             check=True,
         )

@@ -9,23 +9,33 @@ from pathlib import Path
 import duckdb
 
 
+def ensure_ring_assigner_classes(repo_root: Path) -> Path:
+    """Return common/target/classes, compiling only when RingAssignerCli is missing."""
+    classes = repo_root / "common/target/classes"
+    ring_cli = classes / "io/duckcluster/common/routing/RingAssignerCli.class"
+    if not ring_cli.is_file():
+        subprocess.run(
+            ["mvn", "-q", "-pl", "common", "-am", "compile"],
+            cwd=repo_root,
+            check=True,
+        )
+    return classes
+
+
 def ring_assignments(
     repo_root: Path,
     worker_ids: list[str],
     table: str,
     shard_count: int,
     replication_factor: int,
+    vnodes: int = 100,
 ) -> dict[str, list[str]]:
-    subprocess.run(
-        ["mvn", "-q", "-pl", "common", "compile"],
-        cwd=repo_root,
-        check=True,
-    )
+    classes = ensure_ring_assigner_classes(repo_root)
     completed = subprocess.run(
         [
             "java",
             "-cp",
-            str(repo_root / "common/target/classes"),
+            str(classes),
             "io.duckcluster.common.routing.RingAssignerCli",
             "--workers",
             ",".join(worker_ids),
@@ -35,6 +45,8 @@ def ring_assignments(
             str(shard_count),
             "--rf",
             str(replication_factor),
+            "--vnodes",
+            str(vnodes),
         ],
         check=True,
         capture_output=True,

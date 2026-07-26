@@ -5,21 +5,18 @@ from __future__ import annotations
 import json
 import subprocess
 from collections import Counter
-from pathlib import Path
+
+from duckcluster.shards import ensure_ring_assigner_classes
 
 
-def test_hash_ring_distribution_and_determinism(repo_root: Path) -> None:
+def test_hash_ring_distribution_and_determinism(repo_root) -> None:
     """Ring assignment is deterministic and spreads primary shard ownership evenly across workers."""
-    subprocess.run(
-        ["mvn", "-q", "-pl", "common", "compile"],
-        cwd=repo_root,
-        check=True,
-    )
+    classes = ensure_ring_assigner_classes(repo_root)
 
     command = [
         "java",
         "-cp",
-        str(repo_root / "common/target/classes"),
+        str(classes),
         "io.duckcluster.common.routing.RingAssignerCli",
         "--workers",
         "worker-1,worker-2,worker-3,worker-4,worker-5",
