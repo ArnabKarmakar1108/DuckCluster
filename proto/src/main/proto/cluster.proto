@@ -25,6 +25,7 @@ service WorkerService {
   rpc EndShardPin(EndShardPinRequest) returns (EndShardPinResponse);
   rpc MaterializeBroadcast(MaterializeBroadcastRequest) returns (MaterializeBroadcastResponse);
   rpc ClearBroadcastTables(ClearBroadcastTablesRequest) returns (ClearBroadcastTablesResponse);
+  rpc CancelQuery(CancelQueryRequest) returns (CancelQueryResponse);
 }
 
 message RegisterWorkerRequest {
@@ -35,10 +36,16 @@ message RegisterWorkerRequest {
   repeated ShardOwnership owned_shards = 5;
 }
 
+message ColumnSchema {
+  string name = 1;
+  string type = 2;
+}
+
 message ShardOwnership {
   string table_name = 1;
   uint32 shard_id = 2;
   uint64 row_count = 3;
+  repeated ColumnSchema columns = 4;
 }
 
 message UpdateShardRequest {
@@ -53,6 +60,7 @@ message UpdateShardResponse {
 message RegisterWorkerResponse {
   bool accepted = 1;
   string message = 2;
+  uint64 coordinator_boot_epoch = 3;
 }
 
 message HeartbeatRequest {
@@ -62,6 +70,7 @@ message HeartbeatRequest {
 
 message HeartbeatResponse {
   bool healthy = 1;
+  uint64 coordinator_boot_epoch = 2;
 }
 
 message PingRequest {}
@@ -93,9 +102,19 @@ message RowBatch {
   repeated Column column_values = 3;
 }
 
+enum SqlValueType {
+  SQL_VALUE_TYPE_UNSPECIFIED = 0;
+  SQL_VARCHAR = 1;
+  SQL_BIGINT = 2;
+  SQL_DOUBLE = 3;
+  SQL_BOOLEAN = 4;
+}
+
 message Column {
   string name = 1;
   repeated string values = 2;
+  SqlValueType type = 3;
+  repeated bool nulls = 4;
 }
 
 message ReadShardRequest {
@@ -108,6 +127,9 @@ message ShardDataChunk {
   uint32 shard_id = 2;
   bytes data = 3;
   bool is_last = 4;
+  string query_id = 5;
+  uint64 content_length = 6;
+  uint32 crc32 = 7;
 }
 
 message ReceiveShardResponse {
@@ -120,13 +142,18 @@ message LoadTempDataResponse {
   string catalog_name = 2;
 }
 
-message BeginShardPinRequest {}
+message BeginShardPinRequest {
+  string query_id = 1;
+  uint64 lease_ttl_sec = 2;
+}
 
 message BeginShardPinResponse {
   bool accepted = 1;
 }
 
-message EndShardPinRequest {}
+message EndShardPinRequest {
+  string query_id = 1;
+}
 
 message EndShardPinResponse {
   bool accepted = 1;
@@ -149,6 +176,15 @@ message ClearBroadcastTablesRequest {
 
 message ClearBroadcastTablesResponse {
   bool accepted = 1;
+}
+
+message CancelQueryRequest {
+  string query_id = 1;
+}
+
+message CancelQueryResponse {
+  bool accepted = 1;
+  uint32 cancelled_fragments = 2;
 }
 
 message UpdateShardCacheRequest {
