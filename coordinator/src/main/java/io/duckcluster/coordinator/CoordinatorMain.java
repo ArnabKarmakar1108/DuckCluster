@@ -6,6 +6,7 @@ import io.duckcluster.common.planner.CalciteQueryPlanner;
 import io.duckcluster.common.registry.WorkerRegistry;
 import io.duckcluster.common.routing.ConsistentHashRing;
 import io.duckcluster.coordinator.catalog.ShardCatalog;
+import io.duckcluster.coordinator.execution.AsyncQueryService;
 import io.duckcluster.coordinator.execution.QueryExecutionService;
 import io.duckcluster.coordinator.grpc.CoordinatorGrpcServer;
 import io.duckcluster.coordinator.health.HeartbeatMonitor;
@@ -47,6 +48,8 @@ public final class CoordinatorMain {
         MonitorService monitorService = new MonitorService(
                 config, registry, shardCatalog, catalog, activityTracker, queryExecutionService);
 
+        AsyncQueryService asyncQueryService = new AsyncQueryService(queryExecutionService, activityTracker, config);
+
         ShardReplicator shardReplicator = new ShardReplicator(shardCatalog, registry, workerClient);
         HeartbeatMonitor heartbeatMonitor = new HeartbeatMonitor(
                 registry, shardCatalog, shardReplicator, channelPool,
@@ -55,7 +58,7 @@ public final class CoordinatorMain {
         CoordinatorGrpcServer grpcServer = new CoordinatorGrpcServer(
                 config, registry, shardCatalog, shardReplicator, channelPool);
         CoordinatorHttpServer httpServer = new CoordinatorHttpServer(
-                config, registry, queryExecutionService, monitorService);
+                config, registry, queryExecutionService, asyncQueryService, monitorService);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Shutting down coordinator");

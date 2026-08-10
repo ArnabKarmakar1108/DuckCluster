@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 
+from duckcluster.async_query import execute_query
 from duckcluster.client import ClientConfig, ClusterError, ConnectionError, CoordinatorClient
 from duckcluster.format import (
     default_format,
@@ -50,6 +51,8 @@ def main(argv: list[str] | None = None) -> int:
                 fmt=fmt,
                 verbose=args.verbose,
                 skip_validate=args.skip_validate,
+                sync_mode=_sync_mode(args),
+                chunk_size=args.chunk_size,
             )
         if args.command == "query":
             return _run_query(client, args, fmt)
@@ -71,6 +74,13 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+def _sync_mode(args: argparse.Namespace) -> bool:
+    if getattr(args, "sync_mode", False):
+        return True
+    env = os.environ.get("DUCKCLUSTER_SYNC_QUERY", "").strip().lower()
+    return env in {"1", "true", "yes", "on"}
+
+
 def _run_query(client: CoordinatorClient, args: argparse.Namespace, fmt: str) -> int:
     try:
         sql = _read_sql(args)
@@ -85,7 +95,12 @@ def _run_query(client: CoordinatorClient, args: argparse.Namespace, fmt: str) ->
     if not args.skip_validate:
         validate_query_prerequisites(client, sql)
 
-    result = client.query(sql)
+    result = execute_query(
+        client,
+        sql,
+        sync=_sync_mode(args),
+        chunk_size=args.chunk_size,
+    )
     sys.stdout.write(format_query_result(result, fmt))
     if args.verbose:
         print(format_stats(result), file=sys.stderr)
@@ -159,6 +174,18 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print query stats to stderr",
     )
+    shell_parser.add_argument(
+        "--sync",
+        dest="sync_mode",
+        action="store_true",
+        help="Use blocking POST /v1/query instead of async submit/poll/chunk fetch",
+    )
+    shell_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=int(os.environ.get("DUCKCLUSTER_CHUNK_SIZE", "1000")),
+        help="Row chunk size for async queries (default 1000)",
+    )
 
     query_parser = subparsers.add_parser(
         "query",
@@ -177,6 +204,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help="Print query stats to stderr",
+    )
+    query_parser.add_argument(
+        "--sync",
+        dest="sync_mode",
+        action="store_true",
+        help="Use blocking POST /v1/query instead of async submit/poll/chunk fetch",
+    )
+    query_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=int(os.environ.get("DUCKCLUSTER_CHUNK_SIZE", "1000")),
+        help="Row chunk size for async queries (default 1000)",
     )
 
     subparsers.add_parser(

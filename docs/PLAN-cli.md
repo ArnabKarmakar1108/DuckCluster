@@ -12,7 +12,7 @@
 
 - [ ] Shell completion (bash/zsh)
 - [ ] `duckcluster query --explain` (needs plan-only REST endpoint)
-- [ ] Async / long-running query polling (needs async API)
+- [x] Async query submit + poll + chunked fetch (`--async`, `/v1/query/async`)
 
 ## Non-goals
 

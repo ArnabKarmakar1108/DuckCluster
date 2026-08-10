@@ -22,6 +22,10 @@ class ConnectionError(RuntimeError):
     """Could not reach the coordinator."""
 
 
+class QueryExpiredError(ClusterError):
+    """Async query result was evicted from the coordinator."""
+
+
 @dataclass(frozen=True)
 class ClientConfig:
     base_url: str
@@ -45,6 +49,19 @@ class CoordinatorClient:
     def query(self, sql: str) -> dict[str, Any]:
         return self._post("/v1/query", {"sql": sql})
 
+    def submit_query(self, sql: str) -> dict[str, Any]:
+        return self._post_accepted("/v1/query/async", {"sql": sql})
+
+    def query_status(self, query_id: str) -> dict[str, Any]:
+        return self._get(f"/v1/query/{query_id}")
+
+    def query_results(self, query_id: str, offset: int = 0, limit: int = 1000) -> dict[str, Any]:
+        return self._get(f"/v1/query/{query_id}/results?offset={offset}&limit={limit}")
+
+    @property
+    def timeout_sec(self) -> float:
+        return self._timeout_sec
+
     def _get(self, path: str) -> dict[str, Any]:
         request = urllib.request.Request(
             f"{self._base_url}{path}",
@@ -66,6 +83,39 @@ class CoordinatorClient:
         )
         return self._send(request)
 
+    def _post_accepted(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        payload = json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self._base_url}{path}",
+            data=payload,
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout_sec) as response:
+                raw = response.read().decode("utf-8")
+                if response.status not in (200, 202):
+                    raise ClusterError(response.status, raw or "unexpected response")
+                if not raw:
+                    return {}
+                return json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            message = exc.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(message)
+                if isinstance(parsed, dict) and "error" in parsed:
+                    message = str(parsed["error"])
+            except json.JSONDecodeError:
+                pass
+            if exc.code == 410:
+                raise QueryExpiredError(exc.code, message) from exc
+            raise ClusterError(exc.code, message) from exc
+        except urllib.error.URLError as exc:
+            raise ConnectionError(f"cannot reach coordinator at {self._base_url}: {exc.reason}") from exc
+
     def _send(self, request: urllib.request.Request) -> dict[str, Any]:
         try:
             with urllib.request.urlopen(request, timeout=self._timeout_sec) as response:
@@ -81,6 +131,8 @@ class CoordinatorClient:
                     message = str(parsed["error"])
             except json.JSONDecodeError:
                 pass
+            if exc.code == 410:
+                raise QueryExpiredError(exc.code, message) from exc
             raise ClusterError(exc.code, message) from exc
         except urllib.error.URLError as exc:
             raise ConnectionError(f"cannot reach coordinator at {self._base_url}: {exc.reason}") from exc

@@ -3,6 +3,9 @@ package io.duckcluster.coordinator.http;
 import io.duckcluster.common.config.ClusterConfig;
 import io.duckcluster.common.model.QueryResult;
 import io.duckcluster.common.registry.WorkerRegistry;
+import io.duckcluster.coordinator.execution.AsyncQueryExpiredException;
+import io.duckcluster.coordinator.execution.AsyncQueryJob;
+import io.duckcluster.coordinator.execution.AsyncQueryService;
 import io.duckcluster.coordinator.execution.QueryExecutionService;
 import io.duckcluster.coordinator.monitor.MonitorService;
 import io.javalin.Javalin;
@@ -21,6 +24,7 @@ public final class CoordinatorHttpServer {
     private final ClusterConfig config;
     private final WorkerRegistry registry;
     private final QueryExecutionService queryExecutionService;
+    private final AsyncQueryService asyncQueryService;
     private final MonitorService monitorService;
     private Javalin app;
 
@@ -28,10 +32,12 @@ public final class CoordinatorHttpServer {
             ClusterConfig config,
             WorkerRegistry registry,
             QueryExecutionService queryExecutionService,
+            AsyncQueryService asyncQueryService,
             MonitorService monitorService) {
         this.config = config;
         this.registry = registry;
         this.queryExecutionService = queryExecutionService;
+        this.asyncQueryService = asyncQueryService;
         this.monitorService = monitorService;
     }
 
@@ -51,7 +57,61 @@ public final class CoordinatorHttpServer {
                         return;
                     }
                     QueryResult result = queryExecutionService.execute(request.sql);
-                    ctx.json(toResponse(result));
+                    ctx.json(QueryResponseMapper.toFullResponse(result));
+                })
+                .post("/v1/query/async", ctx -> {
+                    QueryRequest request = ctx.bodyAsClass(QueryRequest.class);
+                    if (request.sql == null || request.sql.isBlank()) {
+                        ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", "sql is required"));
+                        return;
+                    }
+                    String queryId = asyncQueryService.submit(request.sql);
+                    Map<String, Object> body = new LinkedHashMap<>();
+                    body.put("queryId", queryId);
+                    body.put("status", AsyncQueryJob.Status.QUEUED.name());
+                    body.put("statusUrl", "/v1/query/" + queryId);
+                    body.put("resultsUrl", "/v1/query/" + queryId + "/results");
+                    ctx.status(HttpStatus.ACCEPTED).json(body);
+                })
+                .get("/v1/query/{queryId}", ctx -> {
+                    String queryId = ctx.pathParam("queryId");
+                    asyncQueryService.status(queryId).ifPresentOrElse(
+                            status -> {
+                                if (status.status() == AsyncQueryJob.Status.EXPIRED) {
+                                    ctx.status(HttpStatus.GONE)
+                                            .json(Map.of(
+                                                    "queryId", queryId,
+                                                    "status", AsyncQueryJob.Status.EXPIRED.name(),
+                                                    "error", "query result expired"));
+                                    return;
+                                }
+                                ctx.json(toStatusResponse(status));
+                            },
+                            () -> ctx.status(HttpStatus.NOT_FOUND).json(Map.of("error", "unknown query id")));
+                })
+                .get("/v1/query/{queryId}/results", ctx -> {
+                    String queryId = ctx.pathParam("queryId");
+                    int offset = parseIntQuery(ctx, "offset", 0);
+                    int limit = parseIntQuery(ctx, "limit", AsyncQueryService.DEFAULT_RESULT_LIMIT);
+                    try {
+                        AsyncQueryService.ResultChunk chunk = asyncQueryService.resultChunk(queryId, offset, limit);
+                        ctx.json(QueryResponseMapper.toResultChunk(
+                                chunk.result(),
+                                chunk.offset(),
+                                chunk.limit(),
+                                chunk.rows(),
+                                chunk.nextOffset()));
+                    } catch (AsyncQueryExpiredException exception) {
+                        ctx.status(HttpStatus.GONE)
+                                .json(Map.of(
+                                        "queryId", queryId,
+                                        "status", AsyncQueryJob.Status.EXPIRED.name(),
+                                        "error", "query result expired"));
+                    } catch (IllegalArgumentException exception) {
+                        ctx.status(HttpStatus.NOT_FOUND).json(Map.of("error", exception.getMessage()));
+                    } catch (IllegalStateException exception) {
+                        ctx.status(HttpStatus.CONFLICT).json(Map.of("error", exception.getMessage()));
+                    }
                 })
                 .get("/v1/cluster/health", ctx -> {
                     Map<String, Object> body = new LinkedHashMap<>();
@@ -108,20 +168,37 @@ public final class CoordinatorHttpServer {
         }
     }
 
-    private static Map<String, Object> toResponse(QueryResult result) {
-        Map<String, Object> stats = new LinkedHashMap<>();
-        stats.put("mergeStrategy", result.stats().mergeStrategy().name());
-        stats.put("workersUsed", result.stats().workersUsed());
-        stats.put("fragmentsExecuted", result.stats().fragmentsExecuted());
-        stats.put("durationMs", result.stats().durationMs());
-        stats.put("workerDurationsMs", result.stats().workerDurationsMs());
+    private static Map<String, Object> toStatusResponse(AsyncQueryService.StatusView status) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("queryId", status.queryId());
+        body.put("status", status.status().name());
+        if (status.phase() != null) {
+            body.put("phase", status.phase().name());
+        }
+        if (status.status() == AsyncQueryJob.Status.RUNNING || status.status() == AsyncQueryJob.Status.QUEUED) {
+            body.put("fragmentsDone", status.fragmentsDone());
+            body.put("fragmentsTotal", status.fragmentsTotal());
+            body.put("elapsedMs", status.elapsedMs());
+        }
+        if (status.error() != null) {
+            body.put("error", status.error());
+        }
+        if (status.stats() != null) {
+            body.put("stats", QueryResponseMapper.toStatsMap(status.stats()));
+        }
+        return body;
+    }
 
-        Map<String, Object> response = new LinkedHashMap<>();
-        response.put("queryId", result.queryId());
-        response.put("columns", result.columns());
-        response.put("rows", result.rows());
-        response.put("stats", stats);
-        return response;
+    private static int parseIntQuery(io.javalin.http.Context ctx, String name, int defaultValue) {
+        String raw = ctx.queryParam(name);
+        if (raw == null || raw.isBlank()) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(raw);
+        } catch (NumberFormatException exception) {
+            throw new IllegalArgumentException("invalid " + name + ": " + raw);
+        }
     }
 
     private static final class QueryRequest {

@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from typing import TYPE_CHECKING
 
+from duckcluster.async_query import execute_query
 from duckcluster.banner import print_banner
 from duckcluster.client import ClusterError, ConnectionError
 from duckcluster.input import read_command, remember_command, setup_history
@@ -24,6 +25,8 @@ def run_shell(
     fmt: str = "table",
     verbose: bool = False,
     skip_validate: bool = False,
+    sync_mode: bool = False,
+    chunk_size: int = 1000,
 ) -> int:
     print_banner()
     setup_history()
@@ -64,11 +67,11 @@ def run_shell(
             history_entry = sql
             exec_sql = sql[:-1].strip()
             buffer = []
-            _execute_query(client, exec_sql, fmt, verbose, skip_validate)
+            _execute_query(client, exec_sql, fmt, verbose, skip_validate, sync_mode, chunk_size)
             remember_command(history_entry)
         elif len(buffer) == 1 and stripped and not stripped.endswith(";"):
             buffer = []
-            _execute_query(client, stripped, fmt, verbose, skip_validate)
+            _execute_query(client, stripped, fmt, verbose, skip_validate, sync_mode, chunk_size)
             remember_command(stripped)
 
 
@@ -78,11 +81,13 @@ def _execute_query(
     fmt: str,
     verbose: bool,
     skip_validate: bool,
+    sync_mode: bool,
+    chunk_size: int,
 ) -> None:
     try:
         if not skip_validate:
             validate_query_prerequisites(client, sql)
-        result = client.query(sql)
+        result = execute_query(client, sql, sync=sync_mode, chunk_size=chunk_size)
         sys.stdout.write(format_query_result(result, fmt))
         if verbose:
             print(format_stats(result), file=sys.stderr)

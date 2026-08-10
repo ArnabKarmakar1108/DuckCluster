@@ -137,8 +137,11 @@ public final class QueryExecutionService {
     }
 
     public QueryResult execute(String sql) {
+        return execute(UUID.randomUUID().toString(), sql);
+    }
+
+    public QueryResult execute(String queryId, String sql) {
         long startMs = System.currentTimeMillis();
-        String queryId = UUID.randomUUID().toString();
         LOG.info("Query [{}] received: {}", queryId, sql);
         trackStart(queryId, sql);
 

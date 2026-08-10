@@ -20,6 +20,9 @@ public final class ClusterConfig {
     private final int cacheMaxShards;
     private final long fragmentWaitMs;
     private final boolean logFragmentSql;
+    private final long asyncResultTtlMs;
+    private final int asyncMaxStoredJobs;
+    private final long asyncMaxStoredBytes;
 
     public ClusterConfig(
             String coordinatorHost,
@@ -37,7 +40,10 @@ public final class ClusterConfig {
             long watcherIntervalMs,
             int cacheMaxShards,
             long fragmentWaitMs,
-            boolean logFragmentSql) {
+            boolean logFragmentSql,
+            long asyncResultTtlMs,
+            int asyncMaxStoredJobs,
+            long asyncMaxStoredBytes) {
         this.coordinatorHost = Objects.requireNonNull(coordinatorHost, "coordinatorHost");
         this.coordinatorGrpcPort = coordinatorGrpcPort;
         this.coordinatorHttpPort = coordinatorHttpPort;
@@ -55,6 +61,9 @@ public final class ClusterConfig {
         this.cacheMaxShards = cacheMaxShards;
         this.fragmentWaitMs = fragmentWaitMs;
         this.logFragmentSql = logFragmentSql;
+        this.asyncResultTtlMs = asyncResultTtlMs;
+        this.asyncMaxStoredJobs = asyncMaxStoredJobs;
+        this.asyncMaxStoredBytes = asyncMaxStoredBytes;
     }
 
     public ClusterConfig(
@@ -75,7 +84,8 @@ public final class ClusterConfig {
         this(coordinatorHost, coordinatorGrpcPort, coordinatorHttpPort, "0.0.0.0", heartbeatInterval,
                 heartbeatMissThreshold,
                 shardCount, dataDir, poolSize, poolWaitMs, replicationFactor, vnodesPerWorker, watcherIntervalMs,
-                cacheMaxShards, fragmentWaitMs, false);
+                cacheMaxShards, fragmentWaitMs, false,
+                Duration.ofMinutes(30).toMillis(), 200, 64L * 1024 * 1024);
     }
 
     public static ClusterConfig fromEnvironment() {
@@ -96,7 +106,10 @@ public final class ClusterConfig {
                 parseLong("DUCKCLUSTER_WATCHER_INTERVAL_MS", 2000),
                 parseInt("DUCKCLUSTER_CACHE_MAX_SHARDS", 32),
                 parseLong("DUCKCLUSTER_FRAGMENT_WAIT_MS", 60_000),
-                parseBoolean("DUCKCLUSTER_LOG_FRAGMENT_SQL", false));
+                parseBoolean("DUCKCLUSTER_LOG_FRAGMENT_SQL", false),
+                Duration.ofSeconds(parseInt("DUCKCLUSTER_ASYNC_RESULT_TTL_SEC", 1800)).toMillis(),
+                parseInt("DUCKCLUSTER_ASYNC_MAX_STORED_JOBS", 200),
+                parseLong("DUCKCLUSTER_ASYNC_MAX_STORED_BYTES", 64L * 1024 * 1024));
     }
 
     public String coordinatorHost() {
@@ -161,6 +174,18 @@ public final class ClusterConfig {
 
     public boolean logFragmentSql() {
         return logFragmentSql;
+    }
+
+    public long asyncResultTtlMs() {
+        return asyncResultTtlMs;
+    }
+
+    public int asyncMaxStoredJobs() {
+        return asyncMaxStoredJobs;
+    }
+
+    public long asyncMaxStoredBytes() {
+        return asyncMaxStoredBytes;
     }
 
     private static boolean parseBoolean(String key, boolean defaultValue) {

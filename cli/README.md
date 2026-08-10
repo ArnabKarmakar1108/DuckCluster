@@ -74,6 +74,12 @@ duckcluster> \q
 # JSON for piping
 ./scripts/duckcluster query "SELECT COUNT(*) FROM events" --format json | jq .
 
+# Async (default): submit 202, poll status, fetch chunked rows
+./scripts/duckcluster query "SELECT COUNT(*) FROM events"
+
+# Blocking sync API (scripts / compatibility)
+./scripts/duckcluster query --sync "SELECT COUNT(*) FROM events"
+
 # From file + timing stats on stderr
 ./scripts/duckcluster query -f report.sql -v
 
