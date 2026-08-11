@@ -8,6 +8,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -16,17 +17,17 @@ public final class BroadcastMaterializer {
     private static final Logger LOG = LoggerFactory.getLogger(BroadcastMaterializer.class);
 
     private final DuckDBConnectionPool pool;
-    private final Set<String> materializedTables = ConcurrentHashMap.newKeySet();
+    private final Map<String, Set<String>> tablesByQueryId = new ConcurrentHashMap<>();
 
     public BroadcastMaterializer(DuckDBConnectionPool pool) {
         this.pool = pool;
     }
 
-    public String materialize(String tableName, int shardCount) throws SQLException, InterruptedException {
+    public String materialize(String queryId, String tableName, int shardCount) throws SQLException, InterruptedException {
+        String tempTable = BroadcastSqlNames.tempTable(queryId, tableName);
         if (shardCount <= 1) {
-            return BroadcastSqlNames.tempTable(tableName);
+            return tempTable;
         }
-        String tempTable = BroadcastSqlNames.tempTable(tableName);
         Connection connection = pool.checkout();
         if (connection == null) {
             throw new SQLException("Connection pool exhausted while materializing broadcast " + tableName);
@@ -34,16 +35,18 @@ public final class BroadcastMaterializer {
         try (Statement statement = connection.createStatement()) {
             statement.execute("DROP TABLE IF EXISTS " + quote(tempTable));
             statement.execute("CREATE TABLE " + quote(tempTable) + " AS (" + unionAllSql(tableName, shardCount) + ")");
-            materializedTables.add(tempTable);
-            LOG.info("Materialized broadcast {} ({} shards) as {}", tableName, shardCount, tempTable);
+            tablesByQueryId.computeIfAbsent(queryId, ignored -> ConcurrentHashMap.newKeySet()).add(tempTable);
+            LOG.info("Materialized broadcast {} ({} shards) as {} for query {}",
+                    tableName, shardCount, tempTable, queryId);
             return tempTable;
         } finally {
             pool.checkin(connection);
         }
     }
 
-    public void clearAll() throws SQLException, InterruptedException {
-        if (materializedTables.isEmpty()) {
+    public void clearQuery(String queryId) throws SQLException, InterruptedException {
+        Set<String> tables = tablesByQueryId.remove(queryId);
+        if (tables == null || tables.isEmpty()) {
             return;
         }
         Connection connection = pool.checkout();
@@ -51,10 +54,9 @@ public final class BroadcastMaterializer {
             return;
         }
         try (Statement statement = connection.createStatement()) {
-            for (String tableName : List.copyOf(materializedTables)) {
+            for (String tableName : List.copyOf(tables)) {
                 statement.execute("DROP TABLE IF EXISTS " + quote(tableName));
             }
-            materializedTables.clear();
         } finally {
             pool.checkin(connection);
         }

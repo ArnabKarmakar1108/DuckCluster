@@ -37,25 +37,25 @@ public final class FragmentSqlGenerator {
     public static String generate(SqlSelect select, int shardId, QueryAnalysis analysis,
                                    String drivingTable, Map<String, Integer> broadcastShardCounts,
                                    Map<String, Integer> catalogTableShardCounts, TopKSpec topK,
-                                   Set<String> materializedBroadcastTables) {
+                                   BroadcastScope broadcastScope) {
         SqlSelect fragmentSelect = (SqlSelect) select.clone(SqlParserPos.ZERO);
 
         FromScope outerFromScope = FromScope.of(select.getFrom());
 
         SqlNode rewrittenFrom = rewriteFrom(
                 select.getFrom(), shardId, drivingTable, broadcastShardCounts, catalogTableShardCounts,
-                TableRewriteMode.FRAGMENT, outerFromScope, materializedBroadcastTables);
+                TableRewriteMode.FRAGMENT, outerFromScope, broadcastScope);
         fragmentSelect.setFrom(rewrittenFrom);
 
         if (select.getWhere() != null) {
             fragmentSelect.setWhere(rewritePredicateTree(
                     select.getWhere(), shardId, drivingTable, broadcastShardCounts, catalogTableShardCounts,
-                    outerFromScope, materializedBroadcastTables));
+                    outerFromScope, broadcastScope));
         }
         if (select.getHaving() != null) {
             fragmentSelect.setHaving(rewritePredicateTree(
                     select.getHaving(), shardId, drivingTable, broadcastShardCounts, catalogTableShardCounts,
-                    outerFromScope, materializedBroadcastTables));
+                    outerFromScope, broadcastScope));
         }
 
         if (analysis.hasAggregates()) {
@@ -113,21 +113,21 @@ public final class FragmentSqlGenerator {
     private static SqlNode rewriteFrom(SqlNode from, int shardId,
                                         String drivingTable, Map<String, Integer> broadcastShardCounts,
                                         Map<String, Integer> catalogTableShardCounts, TableRewriteMode mode,
-                                        FromScope enclosingScope, Set<String> materializedBroadcastTables) {
+                                        FromScope enclosingScope, BroadcastScope broadcastScope) {
         if (from instanceof SqlIdentifier identifier) {
             return rewriteTableIdentifier(
                     identifier, shardId, drivingTable, broadcastShardCounts, catalogTableShardCounts, mode,
-                    materializedBroadcastTables);
+                    broadcastScope);
         }
         if (from instanceof SqlSelect subquery) {
             return rewriteEmbeddedSelect(subquery, shardId, drivingTable, broadcastShardCounts,
-                    catalogTableShardCounts, mode, enclosingScope, materializedBroadcastTables);
+                    catalogTableShardCounts, mode, enclosingScope, broadcastScope);
         }
         if (from instanceof SqlJoin join) {
             SqlNode left = rewriteFrom(join.getLeft(), shardId, drivingTable, broadcastShardCounts,
-                    catalogTableShardCounts, mode, enclosingScope, materializedBroadcastTables);
+                    catalogTableShardCounts, mode, enclosingScope, broadcastScope);
             SqlNode right = rewriteFrom(join.getRight(), shardId, drivingTable, broadcastShardCounts,
-                    catalogTableShardCounts, mode, enclosingScope, materializedBroadcastTables);
+                    catalogTableShardCounts, mode, enclosingScope, broadcastScope);
             return new SqlJoin(
                     join.getParserPosition(),
                     left,
@@ -141,7 +141,7 @@ public final class FragmentSqlGenerator {
             if (call.getKind() == SqlKind.UNION) {
                 SqlNode rewrittenUnion = rewriteUnionOperands(
                         call, shardId, drivingTable, broadcastShardCounts, catalogTableShardCounts, mode,
-                        enclosingScope, materializedBroadcastTables);
+                        enclosingScope, broadcastScope);
                 return rewrittenUnion;
             }
             SqlNode inner = call.operand(0);
@@ -150,13 +150,13 @@ public final class FragmentSqlGenerator {
             if (mode == TableRewriteMode.FRAGMENT && tableName != null
                     && broadcastShardCounts.containsKey(tableName.toLowerCase())) {
                 String tableNameLower = tableName.toLowerCase();
-                SqlNode source = materializedBroadcastTables.contains(tableNameLower)
-                        ? materializedBroadcastRef(tableNameLower)
+                SqlNode source = broadcastScope.isMaterialized(tableNameLower)
+                        ? materializedBroadcastRef(broadcastScope, tableNameLower)
                         : buildUnionAll(tableNameLower, broadcastShardCounts.get(tableNameLower));
                 return SqlStdOperatorTable.AS.createCall(call.getParserPosition(), source, alias);
             }
             SqlNode rewrittenInner = rewriteFrom(inner, shardId, drivingTable, broadcastShardCounts,
-                    catalogTableShardCounts, mode, enclosingScope, materializedBroadcastTables);
+                    catalogTableShardCounts, mode, enclosingScope, broadcastScope);
             return recreateAsCall(call, rewrittenInner, alias);
         }
         return from;
@@ -165,9 +165,9 @@ public final class FragmentSqlGenerator {
     private static SqlNode rewriteFrom(SqlNode from, int shardId,
                                         String drivingTable, Map<String, Integer> broadcastShardCounts,
                                         Map<String, Integer> catalogTableShardCounts, TableRewriteMode mode,
-                                        Set<String> materializedBroadcastTables) {
+                                        BroadcastScope broadcastScope) {
         return rewriteFrom(from, shardId, drivingTable, broadcastShardCounts, catalogTableShardCounts, mode,
-                FromScope.ofTables(List.of()), materializedBroadcastTables);
+                FromScope.ofTables(List.of()), broadcastScope);
     }
 
     private static SqlNode rewriteUnionOperands(
@@ -178,11 +178,11 @@ public final class FragmentSqlGenerator {
             Map<String, Integer> catalogTableShardCounts,
             TableRewriteMode mode,
             FromScope enclosingScope,
-            Set<String> materializedBroadcastTables) {
+            BroadcastScope broadcastScope) {
         List<SqlNode> rewrittenOperands = new ArrayList<>();
         for (SqlNode operand : union.getOperandList()) {
             rewrittenOperands.add(rewriteFrom(operand, shardId, drivingTable, broadcastShardCounts,
-                    catalogTableShardCounts, mode, enclosingScope, materializedBroadcastTables));
+                    catalogTableShardCounts, mode, enclosingScope, broadcastScope));
         }
         return union.getOperator().createCall(union.getParserPosition(), rewrittenOperands);
     }
@@ -195,20 +195,20 @@ public final class FragmentSqlGenerator {
             Map<String, Integer> catalogTableShardCounts,
             TableRewriteMode mode,
             FromScope enclosingScope,
-            Set<String> materializedBroadcastTables) {
+            BroadcastScope broadcastScope) {
         SqlSelect rewritten = (SqlSelect) select.clone(SqlParserPos.ZERO);
         FromScope scope = enclosingScope.union(FromScope.of(select.getFrom()));
         if (select.getFrom() != null) {
             rewritten.setFrom(rewriteFrom(select.getFrom(), shardId, drivingTable, broadcastShardCounts,
-                    catalogTableShardCounts, mode, scope, materializedBroadcastTables));
+                    catalogTableShardCounts, mode, scope, broadcastScope));
         }
         if (select.getWhere() != null) {
             rewritten.setWhere(rewritePredicateTree(select.getWhere(), shardId, drivingTable,
-                    broadcastShardCounts, catalogTableShardCounts, scope, materializedBroadcastTables));
+                    broadcastShardCounts, catalogTableShardCounts, scope, broadcastScope));
         }
         if (select.getHaving() != null) {
             rewritten.setHaving(rewritePredicateTree(select.getHaving(), shardId, drivingTable,
-                    broadcastShardCounts, catalogTableShardCounts, scope, materializedBroadcastTables));
+                    broadcastShardCounts, catalogTableShardCounts, scope, broadcastScope));
         }
         return rewritten;
     }
@@ -233,7 +233,7 @@ public final class FragmentSqlGenerator {
             Map<String, Integer> broadcastShardCounts,
             Map<String, Integer> catalogTableShardCounts,
             FromScope enclosingScope,
-            Set<String> materializedBroadcastTables) {
+            BroadcastScope broadcastScope) {
         return node.accept(new SqlShuttle() {
             @Override
             public SqlNode visit(SqlCall call) {
@@ -246,7 +246,7 @@ public final class FragmentSqlGenerator {
                                     subquery, drivingTable, catalogTableShardCounts);
                     SqlSelect rewrittenSubquery = rewriteSubqueryBody(
                             subquery, shardId, drivingTable, broadcastShardCounts, catalogTableShardCounts,
-                            coLocated, enclosingScope, materializedBroadcastTables);
+                            coLocated, enclosingScope, broadcastScope);
                     return SubqueryAnalyzer.replaceSubqueryOperand(call, rewrittenSubquery);
                 }
                 return super.visit(call);
@@ -262,22 +262,22 @@ public final class FragmentSqlGenerator {
             Map<String, Integer> catalogTableShardCounts,
             boolean coLocated,
             FromScope enclosingScope,
-            Set<String> materializedBroadcastTables) {
+            BroadcastScope broadcastScope) {
         TableRewriteMode mode = coLocated ? TableRewriteMode.CO_LOCATED_SUBQUERY : TableRewriteMode.GLOBAL_SUBQUERY;
         FromScope subqueryScope = enclosingScope.union(FromScope.of(select.getFrom()));
         SqlSelect rewritten = (SqlSelect) select.clone(SqlParserPos.ZERO);
 
         if (select.getFrom() != null) {
             rewritten.setFrom(rewriteFrom(select.getFrom(), shardId, drivingTable, broadcastShardCounts,
-                    catalogTableShardCounts, mode, subqueryScope, materializedBroadcastTables));
+                    catalogTableShardCounts, mode, subqueryScope, broadcastScope));
         }
         if (select.getWhere() != null) {
             rewritten.setWhere(rewritePredicateTree(select.getWhere(), shardId, drivingTable,
-                    broadcastShardCounts, catalogTableShardCounts, subqueryScope, materializedBroadcastTables));
+                    broadcastShardCounts, catalogTableShardCounts, subqueryScope, broadcastScope));
         }
         if (select.getHaving() != null) {
             rewritten.setHaving(rewritePredicateTree(select.getHaving(), shardId, drivingTable,
-                    broadcastShardCounts, catalogTableShardCounts, subqueryScope, materializedBroadcastTables));
+                    broadcastShardCounts, catalogTableShardCounts, subqueryScope, broadcastScope));
         }
         return rewritten;
     }
@@ -286,7 +286,7 @@ public final class FragmentSqlGenerator {
                                                    String drivingTable, Map<String, Integer> broadcastShardCounts,
                                                    Map<String, Integer> catalogTableShardCounts,
                                                    TableRewriteMode mode,
-                                                   Set<String> materializedBroadcastTables) {
+                                                   BroadcastScope broadcastScope) {
         String tableName = TableNameSupport.baseTableName(identifier);
         if (tableName == null) {
             return identifier;
@@ -298,8 +298,8 @@ public final class FragmentSqlGenerator {
             if (tableShardCount == 1) {
                 return new SqlIdentifier(List.of(tableNameLower + "_shard0", tableNameLower), SqlParserPos.ZERO);
             }
-            if (materializedBroadcastTables.contains(tableNameLower)) {
-                return materializedBroadcastRef(tableNameLower);
+            if (broadcastScope.isMaterialized(tableNameLower)) {
+                return materializedBroadcastRef(broadcastScope, tableNameLower);
             }
             return buildUnionAll(tableNameLower, tableShardCount);
         }
@@ -317,8 +317,8 @@ public final class FragmentSqlGenerator {
             String catalogName = tableNameLower + "_shard" + shardId;
             return new SqlIdentifier(List.of(catalogName, tableNameLower), SqlParserPos.ZERO);
         } else if (broadcastShardCounts.containsKey(tableNameLower)) {
-            if (materializedBroadcastTables.contains(tableNameLower)) {
-                return materializedBroadcastRef(tableNameLower);
+            if (broadcastScope.isMaterialized(tableNameLower)) {
+                return materializedBroadcastRef(broadcastScope, tableNameLower);
             }
             return buildUnionAll(tableNameLower, broadcastShardCounts.get(tableNameLower));
         } else if (catalogTableShardCounts.containsKey(tableNameLower)) {
@@ -478,8 +478,8 @@ public final class FragmentSqlGenerator {
         return node.toString();
     }
 
-    private static SqlNode materializedBroadcastRef(String tableNameLower) {
-        return new SqlIdentifier(List.of(BroadcastSqlNames.tempTable(tableNameLower)), SqlParserPos.ZERO);
+    private static SqlNode materializedBroadcastRef(BroadcastScope broadcastScope, String tableNameLower) {
+        return new SqlIdentifier(List.of(broadcastScope.tempTableName(tableNameLower)), SqlParserPos.ZERO);
     }
 
     private static String toSql(SqlNode node) {
