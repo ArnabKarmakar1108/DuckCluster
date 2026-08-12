@@ -27,6 +27,7 @@ import java.util.concurrent.TimeUnit;
 public final class CoordinatorGrpcServer {
     private static final Logger LOG = LoggerFactory.getLogger(CoordinatorGrpcServer.class);
 
+    private final long coordinatorBootEpoch = System.currentTimeMillis();
     private final ClusterConfig config;
     private final WorkerRegistry registry;
     private final ShardCatalog shardCatalog;
@@ -46,6 +47,10 @@ public final class CoordinatorGrpcServer {
 
     public void start() throws IOException {
         server = ServerBuilder.forPort(config.coordinatorGrpcPort())
+                .maxInboundMessageSize(config.grpcMaxInboundMessageBytes())
+                .keepAliveTime(30, TimeUnit.SECONDS)
+                .keepAliveTimeout(10, TimeUnit.SECONDS)
+                .permitKeepAliveTime(20, TimeUnit.SECONDS)
                 .addService(new CoordinatorServiceImpl())
                 .build()
                 .start();
@@ -93,6 +98,7 @@ public final class CoordinatorGrpcServer {
             RegisterWorkerResponse response = RegisterWorkerResponse.newBuilder()
                     .setAccepted(true)
                     .setMessage("registered")
+                    .setCoordinatorBootEpoch(coordinatorBootEpoch)
                     .build();
             responseObserver.onNext(response);
             responseObserver.onCompleted();
@@ -122,8 +128,10 @@ public final class CoordinatorGrpcServer {
                 @Override
                 public void onNext(HeartbeatRequest request) {
                     registry.heartbeat(request.getWorkerId(), request.getLoad());
-                    responseObserver.onNext(
-                            HeartbeatResponse.newBuilder().setHealthy(true).build());
+                    responseObserver.onNext(HeartbeatResponse.newBuilder()
+                            .setHealthy(true)
+                            .setCoordinatorBootEpoch(coordinatorBootEpoch)
+                            .build());
                 }
 
                 @Override

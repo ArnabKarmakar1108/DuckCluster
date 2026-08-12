@@ -20,6 +20,8 @@ import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.DoubleSupplier;
 
 public final class CoordinatorClient implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(CoordinatorClient.class);
@@ -29,6 +31,10 @@ public final class CoordinatorClient implements AutoCloseable {
     private final CoordinatorServiceGrpc.CoordinatorServiceBlockingStub blockingStub;
     private final CoordinatorServiceGrpc.CoordinatorServiceStub asyncStub;
     private ScheduledExecutorService heartbeatExecutor;
+    private volatile StreamObserver<HeartbeatRequest> heartbeatRequestObserver;
+    private volatile long lastCoordinatorBootEpoch;
+    private volatile Runnable reconnectHandler;
+    private final AtomicBoolean heartbeatStreamOpen = new AtomicBoolean();
 
     public CoordinatorClient(ClusterConfig config) {
         this.config = config;
@@ -38,6 +44,10 @@ public final class CoordinatorClient implements AutoCloseable {
                 .build();
         this.blockingStub = CoordinatorServiceGrpc.newBlockingStub(channel);
         this.asyncStub = CoordinatorServiceGrpc.newStub(channel);
+    }
+
+    public void setReconnectHandler(Runnable reconnectHandler) {
+        this.reconnectHandler = reconnectHandler;
     }
 
     public void registerWorker(String workerId, String host, int port, int numThreads,
@@ -53,6 +63,7 @@ public final class CoordinatorClient implements AutoCloseable {
         if (!response.getAccepted()) {
             throw new IllegalStateException("Worker registration rejected: " + response.getMessage());
         }
+        observeBootEpoch(response.getCoordinatorBootEpoch(), workerId);
         LOG.info("Registered with coordinator as {} ({} shards)", workerId, ownedShards.size());
     }
 
@@ -80,44 +91,102 @@ public final class CoordinatorClient implements AutoCloseable {
         LOG.debug("Updated shard cache: {} cached shards", cachedShards.size());
     }
 
-    public void startHeartbeat(String workerId, Duration interval) {
+    public void startHeartbeat(String workerId, Duration interval, DoubleSupplier loadSupplier) {
         heartbeatExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread thread = new Thread(r, "worker-heartbeat");
             thread.setDaemon(true);
             return thread;
         });
 
+        openHeartbeatStream(workerId);
+
+        heartbeatExecutor.scheduleAtFixedRate(() -> {
+            if (!heartbeatStreamOpen.get()) {
+                openHeartbeatStream(workerId);
+            }
+            StreamObserver<HeartbeatRequest> observer = heartbeatRequestObserver;
+            if (observer == null) {
+                return;
+            }
+            try {
+                double load = loadSupplier == null ? 0.0 : loadSupplier.getAsDouble();
+                observer.onNext(HeartbeatRequest.newBuilder()
+                        .setWorkerId(workerId)
+                        .setLoad(load)
+                        .build());
+            } catch (Exception e) {
+                LOG.warn("Failed to send heartbeat for {}: {}", workerId, e.getMessage());
+                heartbeatStreamOpen.set(false);
+            }
+        }, 0, interval.toSeconds(), TimeUnit.SECONDS);
+    }
+
+    private void openHeartbeatStream(String workerId) {
         StreamObserver<HeartbeatResponse> responseObserver = new StreamObserver<>() {
             @Override
             public void onNext(HeartbeatResponse value) {
                 if (!value.getHealthy()) {
                     LOG.warn("Coordinator marked heartbeat unhealthy for {}", workerId);
                 }
+                observeBootEpoch(value.getCoordinatorBootEpoch(), workerId);
             }
 
             @Override
             public void onError(Throwable t) {
                 LOG.warn("Heartbeat response stream error for {}: {}", workerId, t.getMessage());
+                heartbeatStreamOpen.set(false);
+                scheduleReconnect(workerId);
             }
 
             @Override
             public void onCompleted() {
                 LOG.info("Heartbeat response stream completed for {}", workerId);
+                heartbeatStreamOpen.set(false);
+                scheduleReconnect(workerId);
             }
         };
 
-        StreamObserver<HeartbeatRequest> requestObserver = asyncStub.heartbeat(responseObserver);
+        heartbeatRequestObserver = asyncStub.heartbeat(responseObserver);
+        heartbeatStreamOpen.set(true);
+        LOG.debug("Opened heartbeat stream for {}", workerId);
+    }
 
-        heartbeatExecutor.scheduleAtFixedRate(() -> {
-            try {
-                requestObserver.onNext(HeartbeatRequest.newBuilder()
-                        .setWorkerId(workerId)
-                        .setLoad(0.0)
-                        .build());
-            } catch (Exception e) {
-                LOG.warn("Failed to send heartbeat for {}: {}", workerId, e.getMessage());
+    private void scheduleReconnect(String workerId) {
+        if (heartbeatExecutor == null) {
+            return;
+        }
+        heartbeatExecutor.schedule(() -> {
+            Runnable handler = reconnectHandler;
+            if (handler != null) {
+                try {
+                    LOG.info("Re-registering worker {} after coordinator reconnect", workerId);
+                    handler.run();
+                } catch (Exception e) {
+                    LOG.warn("Worker re-registration failed for {}: {}", workerId, e.getMessage());
+                }
             }
-        }, 0, interval.toSeconds(), TimeUnit.SECONDS);
+            openHeartbeatStream(workerId);
+        }, 2, TimeUnit.SECONDS);
+    }
+
+    private void observeBootEpoch(long bootEpoch, String workerId) {
+        if (bootEpoch == 0) {
+            return;
+        }
+        long previous = lastCoordinatorBootEpoch;
+        if (previous != 0 && previous != bootEpoch) {
+            LOG.warn("Coordinator boot epoch changed for {} ({} -> {}), re-registering",
+                    workerId, previous, bootEpoch);
+            Runnable handler = reconnectHandler;
+            if (handler != null) {
+                try {
+                    handler.run();
+                } catch (Exception e) {
+                    LOG.warn("Worker re-registration after boot epoch change failed: {}", e.getMessage());
+                }
+            }
+        }
+        lastCoordinatorBootEpoch = bootEpoch;
     }
 
     @Override
