@@ -16,6 +16,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public final class TempShardCache implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(TempShardCache.class);
@@ -25,46 +28,70 @@ public final class TempShardCache implements AutoCloseable {
     private final String workerId;
     private final Path cacheDir;
     private final int maxShards;
+    private final long defaultPinLeaseMs;
     private final LinkedHashMap<String, CacheEntry> entries;
-    private int pinSessionDepth;
+    private final Map<String, QueryPinSession> pinSessions = new LinkedHashMap<>();
     private final Set<String> pinnedKeys = new HashSet<>();
+    private final ScheduledExecutorService reaper;
 
     public TempShardCache(ShardManager shardManager, CoordinatorClient coordinatorClient,
                           String workerId, Path cacheDir, int maxShards) throws IOException {
+        this(shardManager, coordinatorClient, workerId, cacheDir, maxShards, TimeUnit.MINUTES.toMillis(10));
+    }
+
+    public TempShardCache(ShardManager shardManager, CoordinatorClient coordinatorClient,
+                          String workerId, Path cacheDir, int maxShards, long defaultPinLeaseMs) throws IOException {
         this.shardManager = shardManager;
         this.coordinatorClient = coordinatorClient;
         this.workerId = workerId;
         this.cacheDir = cacheDir;
         this.maxShards = maxShards;
+        this.defaultPinLeaseMs = defaultPinLeaseMs;
         this.entries = new LinkedHashMap<>(maxShards, 0.75f, true);
         Files.createDirectories(cacheDir);
+        this.reaper = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread thread = new Thread(r, "temp-shard-pin-reaper");
+            thread.setDaemon(true);
+            return thread;
+        });
+        this.reaper.scheduleAtFixedRate(this::expireAbandonedPins, 30, 30, TimeUnit.SECONDS);
     }
 
-    /** Pins cached shards while broadcast tables are prefetched and a fragment executes. */
-    public synchronized void beginPinSession() {
-        pinSessionDepth++;
-        pinnedKeys.addAll(entries.keySet());
+    public synchronized void beginPinSession(String queryId, long leaseMs) {
+        if (queryId == null || queryId.isBlank()) {
+            throw new IllegalArgumentException("queryId is required for shard pin");
+        }
+        long ttl = leaseMs > 0 ? leaseMs : defaultPinLeaseMs;
+        pinSessions.put(queryId, new QueryPinSession(queryId, System.currentTimeMillis() + ttl));
+        LOG.debug("Begin shard pin for query {} (lease {}ms)", queryId, ttl);
     }
 
-    public synchronized void endPinSession() {
-        if (pinSessionDepth <= 0) {
+    public synchronized void endPinSession(String queryId) {
+        if (queryId == null || queryId.isBlank()) {
             return;
         }
-        pinSessionDepth--;
-        if (pinSessionDepth == 0) {
-            pinnedKeys.clear();
-            trimToMax();
+        QueryPinSession removed = pinSessions.remove(queryId);
+        if (removed == null) {
+            return;
         }
+        for (String key : removed.pinnedKeys) {
+            unpinnedIfNoSessions(key);
+        }
+        LOG.debug("End shard pin for query {}", queryId);
+        trimToMax();
     }
 
     public synchronized String loadShard(String tableName, int shardId, Path tmpFile) throws IOException, SQLException {
+        return loadShard(tableName, shardId, tmpFile, null);
+    }
+
+    public synchronized String loadShard(
+            String tableName, int shardId, Path tmpFile, String queryId) throws IOException, SQLException {
         String key = tableName + ":" + shardId;
         if (entries.containsKey(key)) {
             LOG.debug("Cache HIT: {}_shard{}", tableName, shardId);
             entries.get(key);
-            if (pinSessionDepth > 0) {
-                pinnedKeys.add(key);
-            }
+            pinKeyForQuery(key, queryId);
             Files.deleteIfExists(tmpFile);
             return entries.get(key).catalogName();
         }
@@ -80,9 +107,7 @@ public final class TempShardCache implements AutoCloseable {
         shardManager.attachCachedShard(meta);
 
         entries.put(key, new CacheEntry(catalogName, targetPath, tableName, shardId));
-        if (pinSessionDepth > 0) {
-            pinnedKeys.add(key);
-        }
+        pinKeyForQuery(key, queryId);
         LOG.info("Cached shard: {} (cache size: {}/{})", catalogName, entries.size(), maxShards);
 
         notifyCoordinator();
@@ -101,9 +126,44 @@ public final class TempShardCache implements AutoCloseable {
         return new ArrayList<>(entries.values());
     }
 
+    private void pinKeyForQuery(String key, String queryId) {
+        if (queryId == null || queryId.isBlank()) {
+            return;
+        }
+        QueryPinSession session = pinSessions.get(queryId);
+        if (session == null) {
+            return;
+        }
+        session.pinnedKeys.add(key);
+        pinnedKeys.add(key);
+    }
+
+    private void unpinnedIfNoSessions(String key) {
+        for (QueryPinSession session : pinSessions.values()) {
+            if (session.pinnedKeys.contains(key)) {
+                return;
+            }
+        }
+        pinnedKeys.remove(key);
+    }
+
+    private synchronized void expireAbandonedPins() {
+        long now = System.currentTimeMillis();
+        List<String> expired = new ArrayList<>();
+        for (Map.Entry<String, QueryPinSession> entry : pinSessions.entrySet()) {
+            if (entry.getValue().expiresAtMs <= now) {
+                expired.add(entry.getKey());
+            }
+        }
+        for (String queryId : expired) {
+            LOG.warn("Expiring abandoned shard pin for query {}", queryId);
+            endPinSession(queryId);
+        }
+    }
+
     private void makeRoom() {
         while (entries.size() >= maxShards) {
-            if (pinSessionDepth > 0) {
+            if (!pinSessions.isEmpty()) {
                 if (!evictUnpinned()) {
                     return;
                 }
@@ -154,6 +214,9 @@ public final class TempShardCache implements AutoCloseable {
             LOG.warn("Error evicting cached shard {}: {}", entry.catalogName(), e.getMessage());
         }
         pinnedKeys.remove(key);
+        for (QueryPinSession session : pinSessions.values()) {
+            session.pinnedKeys.remove(key);
+        }
         LOG.info("Evicted cached shard: {}", entry.catalogName());
         notifyCoordinator();
     }
@@ -168,6 +231,7 @@ public final class TempShardCache implements AutoCloseable {
 
     @Override
     public synchronized void close() {
+        reaper.shutdownNow();
         for (CacheEntry entry : entries.values()) {
             try {
                 ShardFileMetadata meta = new ShardFileMetadata(entry.tableName(), entry.shardId(), entry.filePath());
@@ -179,8 +243,19 @@ public final class TempShardCache implements AutoCloseable {
         }
         entries.clear();
         pinnedKeys.clear();
-        pinSessionDepth = 0;
+        pinSessions.clear();
         LOG.info("TempShardCache closed");
+    }
+
+    private static final class QueryPinSession {
+        final String queryId;
+        final long expiresAtMs;
+        final Set<String> pinnedKeys = new HashSet<>();
+
+        QueryPinSession(String queryId, long expiresAtMs) {
+            this.queryId = queryId;
+            this.expiresAtMs = expiresAtMs;
+        }
     }
 
     public record CacheEntry(String catalogName, Path filePath, String tableName, int shardId) {}

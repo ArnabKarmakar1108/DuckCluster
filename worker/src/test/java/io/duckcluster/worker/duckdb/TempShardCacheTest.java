@@ -115,17 +115,17 @@ class TempShardCacheTest {
 
     @Test
     void pinSession_preventsEvictionDuringBroadcastPrefetch() throws Exception {
-        cache.beginPinSession();
+        cache.beginPinSession("query-pin", 60_000);
         try {
-            cache.loadShard("orders", 0, createShardFile("orders", 0));
-            cache.loadShard("orders", 1, createShardFile("orders", 1));
-            cache.loadShard("orders", 2, createShardFile("orders", 2));
-            cache.loadShard("orders", 3, createShardFile("orders", 3));
+            cache.loadShard("orders", 0, createShardFile("orders", 0), "query-pin");
+            cache.loadShard("orders", 1, createShardFile("orders", 1), "query-pin");
+            cache.loadShard("orders", 2, createShardFile("orders", 2), "query-pin");
+            cache.loadShard("orders", 3, createShardFile("orders", 3), "query-pin");
 
             assertTrue(cache.hasShard("orders", 0));
             assertTrue(cache.hasShard("orders", 3));
         } finally {
-            cache.endPinSession();
+            cache.endPinSession("query-pin");
         }
     }
 
