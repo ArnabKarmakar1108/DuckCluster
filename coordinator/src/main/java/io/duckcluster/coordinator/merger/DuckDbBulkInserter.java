@@ -36,6 +36,57 @@ final class DuckDbBulkInserter {
         }
     }
 
+    static void appendSingleBatch(
+            Connection connection,
+            String tableName,
+            List<String> tempColumns,
+            List<String> columnTypes,
+            RowBatchData batch,
+            QueryAnalysis analysis)
+            throws SQLException {
+        if (batch.rows().isEmpty()) {
+            return;
+        }
+        if (!(connection instanceof DuckDBConnection duckConnection)) {
+            List<List<Object>> rows = materializeBatchRows(tempColumns, batch);
+            insertViaBatchedSql(connection, tableName, tempColumns, rows, columnTypes);
+            return;
+        }
+        try (DuckDBAppender appender =
+                new DuckDBAppender(duckConnection, DuckDBConnection.DEFAULT_SCHEMA, tableName)) {
+            Map<String, Integer> columnIndex = indexColumns(batch.columnNames());
+            int rowIndex = 0;
+            for (List<String> batchRow : batch.rows()) {
+                appender.beginRow();
+                for (int columnIndexPos = 0; columnIndexPos < tempColumns.size(); columnIndexPos++) {
+                    String column = tempColumns.get(columnIndexPos);
+                    int batchColumnIndex = columnIndex.get(column);
+                    Object value = batch.isNull(rowIndex, batchColumnIndex) ? null : batchRow.get(batchColumnIndex);
+                    appendValue(
+                            appender,
+                            normalizeValue(value, columnTypes.get(columnIndexPos)),
+                            columnTypes.get(columnIndexPos));
+                }
+                appender.endRow();
+                rowIndex++;
+            }
+            appender.flush();
+        }
+    }
+
+    private static List<List<Object>> materializeBatchRows(List<String> tempColumns, RowBatchData batch) {
+        Map<String, Integer> columnIndex = indexColumns(batch.columnNames());
+        List<List<Object>> rows = new ArrayList<>();
+        for (List<String> batchRow : batch.rows()) {
+            List<Object> row = new ArrayList<>(tempColumns.size());
+            for (String column : tempColumns) {
+                row.add(batchRow.get(columnIndex.get(column)));
+            }
+            rows.add(row);
+        }
+        return rows;
+    }
+
     static void appendFragmentBatches(
             Connection connection,
             String tableName,
@@ -54,17 +105,22 @@ final class DuckDbBulkInserter {
             for (FragmentResult fragment : fragmentResults) {
                 for (RowBatchData batch : fragment.batches()) {
                     Map<String, Integer> columnIndex = indexColumns(batch.columnNames());
+                    int rowIndex = 0;
                     for (List<String> batchRow : batch.rows()) {
                         appender.beginRow();
                         for (int columnIndexPos = 0; columnIndexPos < tempColumns.size(); columnIndexPos++) {
                             String column = tempColumns.get(columnIndexPos);
-                            Object value = batchRow.get(columnIndex.get(column));
+                            int batchColumnIndex = columnIndex.get(column);
+                            Object value = batch.isNull(rowIndex, batchColumnIndex)
+                                    ? null
+                                    : batchRow.get(batchColumnIndex);
                             appendValue(
                                     appender,
                                     normalizeValue(value, columnTypes.get(columnIndexPos)),
                                     columnTypes.get(columnIndexPos));
                         }
                         appender.endRow();
+                        rowIndex++;
                     }
                 }
             }
@@ -204,7 +260,11 @@ final class DuckDbBulkInserter {
         return "'" + text.replace("'", "''") + "'";
     }
 
-    private static String quote(String identifier) {
+    static String quoteIdentifier(String identifier) {
         return "\"" + identifier.replace("\"", "\"\"") + "\"";
+    }
+
+    private static String quote(String identifier) {
+        return quoteIdentifier(identifier);
     }
 }

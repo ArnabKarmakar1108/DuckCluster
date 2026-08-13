@@ -6,6 +6,7 @@ import io.duckcluster.common.merger.RowBatchData;
 import io.duckcluster.common.model.MergeStrategyType;
 import io.duckcluster.common.model.NestedDerivedTableSpec;
 import io.duckcluster.common.model.OrderByClause;
+import io.duckcluster.common.model.PlannedQuery;
 import io.duckcluster.common.model.QueryAnalysis;
 import io.duckcluster.common.model.QueryResult;
 import io.duckcluster.common.model.TopKSpec;
@@ -34,19 +35,15 @@ final class DuckDbMergeSupport {
                     MergeSqlBuilder.buildGroupByIntermediateMerge(context.plan().analysis());
             return mergeGroupByHierarchical(context, stats, mergeSql, intermediateMergeSql);
         }
-        try (CoordinatorDuckDbPool.Lease lease = CoordinatorDuckDbPool.get().lease()) {
-            Connection connection = lease.connection();
-            createTempTableFromFragments(connection, context);
+        return withMergeConnection(context, connection -> {
+            populateTempTable(connection, context);
             try (Statement statement = connection.createStatement();
                     ResultSet resultSet = statement.executeQuery(mergeSql)) {
                 return toQueryResult(context.queryId(), resultSet, stats);
             } finally {
                 dropTable(connection, TEMP_TABLE);
             }
-        } catch (SQLException e) {
-            throw new IllegalStateException(
-                    "Failed to merge partial results in coordinator DuckDB: " + e.getMessage(), e);
-        }
+        });
     }
 
     static QueryResult mergeGroupByHierarchical(
@@ -54,11 +51,10 @@ final class DuckDbMergeSupport {
             QueryResult.QueryStats stats,
             String finalMergeSql,
             String intermediateMergeSql) {
-        try (CoordinatorDuckDbPool.Lease lease = CoordinatorDuckDbPool.get().lease()) {
-            Connection connection = lease.connection();
+        return withMergeConnection(context, connection -> {
             HierarchicalCollapse collapse = collapseWorkerFragments(connection, context, intermediateMergeSql);
             try {
-                createTempTableFromFragments(connection, collapse.singleFragmentContext());
+                populateTempTable(connection, collapse.singleFragmentContext());
                 for (String workerTable : collapse.workerTables()) {
                     connection.createStatement().execute(
                             "INSERT INTO " + TEMP_TABLE + " SELECT * FROM " + workerTable);
@@ -73,10 +69,7 @@ final class DuckDbMergeSupport {
                     dropTable(connection, workerTable);
                 }
             }
-        } catch (SQLException e) {
-            throw new IllegalStateException(
-                    "Failed hierarchical GROUP BY merge in coordinator DuckDB: " + e.getMessage(), e);
-        }
+        });
     }
 
     private record HierarchicalCollapse(MergeContext singleFragmentContext, List<String> workerTables) {}
@@ -104,7 +97,7 @@ final class DuckDbMergeSupport {
             MergeContext workerContext = new MergeContext(
                     context.queryId(), context.plan(), workerFragments, context.durationMs(), Map.of());
             dropTable(connection, TEMP_TABLE);
-            createTempTableFromFragments(connection, workerContext);
+            populateTempTable(connection, workerContext);
             dropTable(connection, workerTable);
             connection.createStatement().execute(
                     "CREATE TABLE " + workerTable + " AS (" + intermediateMergeSql + ")");
@@ -122,9 +115,8 @@ final class DuckDbMergeSupport {
             String phase1Sql,
             String phase2Sql,
             Map<String, RowBatchData> coordinatorTables) {
-        try (CoordinatorDuckDbPool.Lease lease = CoordinatorDuckDbPool.get().lease()) {
-            Connection connection = lease.connection();
-            createTempTableFromFragments(connection, context);
+        return withMergeConnection(context, connection -> {
+            populateTempTable(connection, context);
             materializePhase1InDb(connection, phase1Sql);
 
             for (Map.Entry<String, RowBatchData> entry : coordinatorTables.entrySet()) {
@@ -146,10 +138,7 @@ final class DuckDbMergeSupport {
                     dropTable(connection, tableName);
                 }
             }
-        } catch (SQLException e) {
-            throw new IllegalStateException(
-                    "Failed to merge WITH CTE results in coordinator DuckDB: " + e.getMessage(), e);
-        }
+        });
     }
 
     private static List<List<Object>> batchRows(RowBatchData batch) {
@@ -174,9 +163,8 @@ final class DuckDbMergeSupport {
             String phase1Sql,
             String phase2Sql,
             NestedDerivedTableSpec nested) {
-        try (CoordinatorDuckDbPool.Lease lease = CoordinatorDuckDbPool.get().lease()) {
-            Connection connection = lease.connection();
-            createTempTableFromFragments(connection, context);
+        return withMergeConnection(context, connection -> {
+            populateTempTable(connection, context);
             materializePhase1InDb(connection, phase1Sql);
 
             try (Statement statement = connection.createStatement();
@@ -185,10 +173,36 @@ final class DuckDbMergeSupport {
             } finally {
                 dropTable(connection, TEMP_TABLE);
             }
+        });
+    }
+
+    @FunctionalInterface
+    private interface MergeConnectionWork {
+        QueryResult run(Connection connection) throws SQLException;
+    }
+
+    private static QueryResult withMergeConnection(MergeContext context, MergeConnectionWork work) {
+        MergeStreamStaging staging = MergeStreamRegistry.get(context.queryId());
+        try {
+            if (staging != null) {
+                return work.run(staging.connection());
+            }
+            try (CoordinatorDuckDbPool.Lease lease = CoordinatorDuckDbPool.get().lease()) {
+                return work.run(lease.connection());
+            }
         } catch (SQLException e) {
             throw new IllegalStateException(
-                    "Failed to merge nested derived table results in coordinator DuckDB: " + e.getMessage(), e);
+                    "Failed to merge partial results in coordinator DuckDB: " + e.getMessage(), e);
         }
+    }
+
+    private static void populateTempTable(Connection connection, MergeContext context) throws SQLException {
+        MergeStreamStaging staging = MergeStreamRegistry.get(context.queryId());
+        if (staging != null && staging.hasData()) {
+            staging.assembleInto(connection, TEMP_TABLE, context);
+            return;
+        }
+        createTempTableFromFragments(connection, context);
     }
 
     private static void createTempTableFromFragments(Connection connection, MergeContext context)
@@ -201,6 +215,17 @@ final class DuckDbMergeSupport {
                 connection, TEMP_TABLE, columns, columnTypes, context.fragmentResults(), analysis);
     }
 
+    static List<String> columnTypesForPlannedQuery(PlannedQuery plan, List<String> columns) {
+        QueryAnalysis analysis = plan.analysis();
+        TopKSpec topK = plan.topK();
+        MergeStrategyType mergeStrategy = plan.mergeStrategy();
+        List<String> types = new ArrayList<>(columns.size());
+        for (String column : columns) {
+            types.add(columnType(analysis, column, topK, mergeStrategy, null));
+        }
+        return types;
+    }
+
     private static void materializePhase1InDb(Connection connection, String phase1Sql) throws SQLException {
         dropTable(connection, PHASE1_TABLE);
         connection.createStatement().execute("CREATE TABLE " + PHASE1_TABLE + " AS (" + phase1Sql + ")");
@@ -208,7 +233,7 @@ final class DuckDbMergeSupport {
         connection.createStatement().execute("ALTER TABLE " + PHASE1_TABLE + " RENAME TO " + TEMP_TABLE);
     }
 
-    private static void createEmptyTable(
+    static void createEmptyTable(
             Connection connection, String tableName, List<String> columns, List<String> columnTypes)
             throws SQLException {
         StringBuilder ddl = new StringBuilder("CREATE TABLE ").append(tableName).append(" (");
@@ -234,12 +259,37 @@ final class DuckDbMergeSupport {
     }
 
     private static List<String> columnTypesForContext(MergeContext context, List<String> columns) {
+        Map<String, String> wireTypes = wireColumnTypes(context);
         QueryAnalysis analysis = context.plan().analysis();
         TopKSpec topK = context.plan().topK();
         MergeStrategyType mergeStrategy = context.plan().mergeStrategy();
         List<String> types = new ArrayList<>(columns.size());
         for (String column : columns) {
-            types.add(columnType(analysis, column, topK, mergeStrategy, context));
+            String wireType = wireTypes.get(column);
+            if (wireType != null && !wireType.isBlank()) {
+                types.add(wireType);
+            } else {
+                types.add(columnType(analysis, column, topK, mergeStrategy, context));
+            }
+        }
+        return types;
+    }
+
+    private static Map<String, String> wireColumnTypes(MergeContext context) {
+        Map<String, String> types = new LinkedHashMap<>();
+        MergeStreamStaging staging = MergeStreamRegistry.get(context.queryId());
+        if (staging != null) {
+            types.putAll(staging.wireColumnTypes());
+        }
+        for (FragmentResult fragment : context.fragmentResults()) {
+            for (RowBatchData batch : fragment.batches()) {
+                if (batch.columnSqlTypes().isEmpty()) {
+                    continue;
+                }
+                for (int i = 0; i < batch.columnNames().size(); i++) {
+                    types.putIfAbsent(batch.columnNames().get(i), batch.columnSqlTypes().get(i));
+                }
+            }
         }
         return types;
     }
@@ -281,7 +331,9 @@ final class DuckDbMergeSupport {
                 return "DOUBLE";
             }
         }
-        if (MergeStrategyType.TOP_K.equals(mergeStrategy) && topK.hasOrderBy()) {
+        if (context != null
+                && MergeStrategyType.TOP_K.equals(mergeStrategy)
+                && topK.hasOrderBy()) {
             for (OrderByClause clause : topK.orderBy()) {
                 if (clause.column().equals(column)) {
                     return topKOrderByColumnType(context, column);
@@ -327,7 +379,7 @@ final class DuckDbMergeSupport {
         return "DOUBLE";
     }
 
-    private static void dropTable(Connection connection, String tableName) throws SQLException {
+    static void dropTable(Connection connection, String tableName) throws SQLException {
         connection.createStatement().execute("DROP TABLE IF EXISTS " + tableName);
     }
 
