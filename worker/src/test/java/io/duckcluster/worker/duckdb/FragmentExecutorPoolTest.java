@@ -54,7 +54,7 @@ class FragmentExecutorPoolTest {
     @Test
     void execute_returnsResourceExhausted_whenPoolExhausted() throws Exception {
         pool = new DuckDBConnectionPool(dbPath, 1, 50);
-        executor = new FragmentExecutor(pool);
+        executor = new FragmentExecutor(pool, new RunningFragmentRegistry());
 
         Connection held = pool.checkout();
         assertNotNull(held);
@@ -62,7 +62,7 @@ class FragmentExecutorPoolTest {
         AtomicReference<Throwable> error = new AtomicReference<>();
         CountDownLatch done = new CountDownLatch(1);
 
-        executor.execute("SELECT * FROM events", new StreamObserver<>() {
+        executor.execute("SELECT * FROM events", "test-query", 0, new StreamObserver<>() {
             @Override public void onNext(RowBatch value) { fail("Should not receive data"); }
             @Override public void onError(Throwable t) { error.set(t); done.countDown(); }
             @Override public void onCompleted() { fail("Should not complete"); }
@@ -80,7 +80,7 @@ class FragmentExecutorPoolTest {
     @Test
     void execute_concurrentFragments_correctResults() throws Exception {
         pool = new DuckDBConnectionPool(dbPath, 2, 500);
-        executor = new FragmentExecutor(pool);
+        executor = new FragmentExecutor(pool, new RunningFragmentRegistry());
 
         int threadCount = 4;
         ExecutorService threadPool = Executors.newFixedThreadPool(threadCount);
@@ -94,6 +94,7 @@ class FragmentExecutorPoolTest {
                 List<RowBatch> batches = Collections.synchronizedList(new ArrayList<>());
 
                 executor.execute("SELECT category, COUNT(*) as cnt FROM events GROUP BY category ORDER BY category",
+                        "test-query", 0,
                         new StreamObserver<>() {
                             @Override public void onNext(RowBatch value) { batches.add(value); }
                             @Override public void onError(Throwable t) { errors.add(t); latch.countDown(); }

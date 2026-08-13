@@ -9,8 +9,11 @@ import io.duckcluster.proto.v1.ReceiveShardResponse;
 import io.duckcluster.proto.v1.RowBatch;
 import io.duckcluster.proto.v1.ShardDataChunk;
 import io.duckcluster.proto.v1.WorkerServiceGrpc;
+import io.duckcluster.common.shard.ShardNameValidator;
+import io.duckcluster.common.shard.ShardTransferChecksum;
 import io.duckcluster.worker.duckdb.BroadcastMaterializer;
 import io.duckcluster.worker.duckdb.FragmentExecutor;
+import io.duckcluster.worker.duckdb.RunningFragmentRegistry;
 import io.duckcluster.worker.duckdb.ShardFileMetadata;
 import io.duckcluster.worker.duckdb.ShardManager;
 import io.duckcluster.worker.duckdb.TempShardCache;
@@ -28,7 +31,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.zip.CRC32;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -40,25 +45,37 @@ public final class WorkerGrpcServer {
     private final String host;
     private final int port;
     private final FragmentExecutor fragmentExecutor;
+    private final RunningFragmentRegistry runningFragments;
     private final ShardManager shardManager;
     private final TempShardCache tempShardCache;
     private final BroadcastMaterializer broadcastMaterializer;
+    private final Path transferTempDir;
+    private final int maxInboundMessageBytes;
     private Server server;
 
     public WorkerGrpcServer(String workerId, String host, int port,
-                            FragmentExecutor fragmentExecutor, ShardManager shardManager,
-                            TempShardCache tempShardCache, BroadcastMaterializer broadcastMaterializer) {
+                            FragmentExecutor fragmentExecutor, RunningFragmentRegistry runningFragments,
+                            ShardManager shardManager, TempShardCache tempShardCache,
+                            BroadcastMaterializer broadcastMaterializer, Path transferTempDir,
+                            int maxInboundMessageBytes) {
         this.workerId = workerId;
         this.host = host;
         this.port = port;
         this.fragmentExecutor = fragmentExecutor;
+        this.runningFragments = runningFragments;
         this.shardManager = shardManager;
         this.tempShardCache = tempShardCache;
         this.broadcastMaterializer = broadcastMaterializer;
+        this.transferTempDir = transferTempDir;
+        this.maxInboundMessageBytes = maxInboundMessageBytes;
     }
 
     public void start() throws IOException {
         server = ServerBuilder.forPort(port)
+                .maxInboundMessageSize(maxInboundMessageBytes)
+                .keepAliveTime(30, TimeUnit.SECONDS)
+                .keepAliveTimeout(10, TimeUnit.SECONDS)
+                .permitKeepAliveTime(20, TimeUnit.SECONDS)
                 .addService(new WorkerServiceImpl())
                 .build()
                 .start();
@@ -93,13 +110,33 @@ public final class WorkerGrpcServer {
         @Override
         public void executeFragment(FragmentRequest request, StreamObserver<RowBatch> responseObserver) {
             LOG.info("Executing fragment {} for query {}", request.getFragmentId(), request.getQueryId());
-            fragmentExecutor.execute(request.getSql(), responseObserver);
+            fragmentExecutor.execute(
+                    request.getSql(), request.getQueryId(), request.getFragmentId(), responseObserver);
+        }
+
+        @Override
+        public void cancelQuery(
+                io.duckcluster.proto.v1.CancelQueryRequest request,
+                StreamObserver<io.duckcluster.proto.v1.CancelQueryResponse> responseObserver) {
+            int cancelled = runningFragments.cancelQuery(request.getQueryId());
+            responseObserver.onNext(io.duckcluster.proto.v1.CancelQueryResponse.newBuilder()
+                    .setAccepted(true)
+                    .setCancelledFragments(cancelled)
+                    .build());
+            responseObserver.onCompleted();
         }
 
         @Override
         public void readShard(ReadShardRequest request, StreamObserver<ShardDataChunk> responseObserver) {
             String tableName = request.getTableName();
             int shardId = request.getShardId();
+            try {
+                ShardNameValidator.validateTableName(tableName);
+                ShardNameValidator.validateShardId(shardId);
+            } catch (IllegalArgumentException e) {
+                responseObserver.onError(Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException());
+                return;
+            }
             Optional<ShardFileMetadata> meta = shardManager.getShard(tableName, shardId);
             if (meta.isEmpty()) {
                 responseObserver.onError(Status.NOT_FOUND
@@ -111,8 +148,12 @@ public final class WorkerGrpcServer {
             LOG.info("Streaming shard file {} for replication", filePath);
             try (FileInputStream fis = new FileInputStream(filePath.toFile())) {
                 byte[] buffer = new byte[CHUNK_SIZE];
+                CRC32 crc = ShardTransferChecksum.newCrc();
+                long totalBytes = 0;
                 int bytesRead;
                 while ((bytesRead = fis.read(buffer)) != -1) {
+                    ShardTransferChecksum.update(crc, buffer, 0, bytesRead);
+                    totalBytes += bytesRead;
                     ShardDataChunk chunk = ShardDataChunk.newBuilder()
                             .setTableName(tableName)
                             .setShardId(shardId)
@@ -126,6 +167,8 @@ public final class WorkerGrpcServer {
                         .setShardId(shardId)
                         .setData(ByteString.EMPTY)
                         .setIsLast(true)
+                        .setContentLength(totalBytes)
+                        .setCrc32((int) crc.getValue())
                         .build());
                 responseObserver.onCompleted();
             } catch (IOException e) {
@@ -146,6 +189,8 @@ public final class WorkerGrpcServer {
                 private String tableName;
                 private int shardId;
                 private boolean receivedLast;
+                private final CRC32 crc = ShardTransferChecksum.newCrc();
+                private long bytesWritten;
 
                 @Override
                 public void onNext(ShardDataChunk chunk) {
@@ -156,19 +201,27 @@ public final class WorkerGrpcServer {
                         if (outputStream == null) {
                             tableName = chunk.getTableName();
                             shardId = chunk.getShardId();
+                            ShardNameValidator.validateTableName(tableName);
+                            ShardNameValidator.validateShardId(shardId);
                             String fileName = tableName + "_shard" + shardId + ".duckdb";
                             finalPath = shardManager.getDataDir().resolve(fileName);
-                            tempPath = shardManager.getDataDir().resolve(fileName + ".tmp");
+                            tempPath = transferTempDir.resolve(fileName + ".tmp");
                             outputStream = new FileOutputStream(tempPath.toFile());
                             LOG.info("Receiving shard: {}_shard{}", tableName, shardId);
                         }
                         if (!chunk.getData().isEmpty()) {
-                            chunk.getData().writeTo(outputStream);
+                            byte[] data = chunk.getData().toByteArray();
+                            ShardTransferChecksum.update(crc, data, 0, data.length);
+                            bytesWritten += data.length;
+                            outputStream.write(data);
                         }
                         if (chunk.getIsLast()) {
                             receivedLast = true;
                             outputStream.close();
                             outputStream = null;
+                            if (chunk.getContentLength() > 0) {
+                                verifyTransferChecksum(bytesWritten, crc.getValue(), chunk);
+                            }
                             Files.move(tempPath, finalPath, StandardCopyOption.ATOMIC_MOVE);
                             tempPath = null;
                             LOG.info("Shard received and placed: {}", finalPath);
@@ -245,7 +298,10 @@ public final class WorkerGrpcServer {
                 private Path tempPath;
                 private String tableName;
                 private int shardId;
+                private String pinQueryId;
                 private boolean receivedLast;
+                private final CRC32 crc = ShardTransferChecksum.newCrc();
+                private long bytesWritten;
 
                 @Override
                 public void onNext(ShardDataChunk chunk) {
@@ -256,15 +312,25 @@ public final class WorkerGrpcServer {
                         if (outputStream == null) {
                             tableName = chunk.getTableName();
                             shardId = chunk.getShardId();
-                            tempPath = Files.createTempFile("shard_cache_", ".duckdb.tmp");
+                            pinQueryId = chunk.getQueryId();
+                            ShardNameValidator.validateTableName(tableName);
+                            ShardNameValidator.validateShardId(shardId);
+                            tempPath = transferTempDir.resolve(
+                                    tableName + "_shard" + shardId + "_" + System.nanoTime() + ".tmp");
                             outputStream = new FileOutputStream(tempPath.toFile());
                             LOG.info("Loading temp data: {}_shard{}", tableName, shardId);
                         }
                         if (!chunk.getData().isEmpty()) {
-                            chunk.getData().writeTo(outputStream);
+                            byte[] data = chunk.getData().toByteArray();
+                            ShardTransferChecksum.update(crc, data, 0, data.length);
+                            bytesWritten += data.length;
+                            outputStream.write(data);
                         }
                         if (chunk.getIsLast()) {
                             receivedLast = true;
+                            if (chunk.getContentLength() > 0) {
+                                verifyTransferChecksum(bytesWritten, crc.getValue(), chunk);
+                            }
                             outputStream.close();
                             outputStream = null;
                         }
@@ -290,7 +356,8 @@ public final class WorkerGrpcServer {
                         return;
                     }
                     try {
-                        String catalogName = tempShardCache.loadShard(tableName, shardId, tempPath);
+                        String catalogName = tempShardCache.loadShard(
+                                tableName, shardId, tempPath, pinQueryId);
                         tempPath = null;
                         succeed(catalogName);
                     } catch (Exception e) {
@@ -343,7 +410,10 @@ public final class WorkerGrpcServer {
         public void beginShardPin(
                 io.duckcluster.proto.v1.BeginShardPinRequest request,
                 StreamObserver<io.duckcluster.proto.v1.BeginShardPinResponse> responseObserver) {
-            tempShardCache.beginPinSession();
+            long leaseMs = request.getLeaseTtlSec() > 0
+                    ? TimeUnit.SECONDS.toMillis(request.getLeaseTtlSec())
+                    : 0L;
+            tempShardCache.beginPinSession(request.getQueryId(), leaseMs);
             responseObserver.onNext(io.duckcluster.proto.v1.BeginShardPinResponse.newBuilder()
                     .setAccepted(true)
                     .build());
@@ -354,7 +424,7 @@ public final class WorkerGrpcServer {
         public void endShardPin(
                 io.duckcluster.proto.v1.EndShardPinRequest request,
                 StreamObserver<io.duckcluster.proto.v1.EndShardPinResponse> responseObserver) {
-            tempShardCache.endPinSession();
+            tempShardCache.endPinSession(request.getQueryId());
             responseObserver.onNext(io.duckcluster.proto.v1.EndShardPinResponse.newBuilder()
                     .setAccepted(true)
                     .build());
@@ -367,7 +437,7 @@ public final class WorkerGrpcServer {
                 StreamObserver<io.duckcluster.proto.v1.MaterializeBroadcastResponse> responseObserver) {
             try {
                 String tempTable = broadcastMaterializer.materialize(
-                        request.getTableName(), request.getShardCount());
+                        request.getQueryId(), request.getTableName(), request.getShardCount());
                 responseObserver.onNext(io.duckcluster.proto.v1.MaterializeBroadcastResponse.newBuilder()
                         .setAccepted(true)
                         .setTempTableName(tempTable)
@@ -386,7 +456,7 @@ public final class WorkerGrpcServer {
                 io.duckcluster.proto.v1.ClearBroadcastTablesRequest request,
                 StreamObserver<io.duckcluster.proto.v1.ClearBroadcastTablesResponse> responseObserver) {
             try {
-                broadcastMaterializer.clearAll();
+                broadcastMaterializer.clearQuery(request.getQueryId());
                 responseObserver.onNext(io.duckcluster.proto.v1.ClearBroadcastTablesResponse.newBuilder()
                         .setAccepted(true)
                         .build());
@@ -396,6 +466,20 @@ public final class WorkerGrpcServer {
                 responseObserver.onError(Status.INTERNAL
                         .withDescription(e.getMessage()).asRuntimeException());
             }
+        }
+    }
+
+    private static void verifyTransferChecksum(long bytesWritten, long crcValue, ShardDataChunk chunk)
+            throws IOException {
+        if (chunk.getContentLength() == 0) {
+            return;
+        }
+        if (bytesWritten != chunk.getContentLength()) {
+            throw new IOException(
+                    "shard transfer length mismatch: expected " + chunk.getContentLength() + " got " + bytesWritten);
+        }
+        if ((int) crcValue != chunk.getCrc32()) {
+            throw new IOException("shard transfer checksum mismatch");
         }
     }
 }
