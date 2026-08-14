@@ -14,12 +14,25 @@ public final class WorkerChannelPool implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(WorkerChannelPool.class);
 
     private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
+    private final int maxInboundMessageBytes;
+
+    public WorkerChannelPool() {
+        this(32 * 1024 * 1024);
+    }
+
+    public WorkerChannelPool(int maxInboundMessageBytes) {
+        this.maxInboundMessageBytes = maxInboundMessageBytes;
+    }
 
     public ManagedChannel getChannel(WorkerRegistry.WorkerRecord worker) {
         return channels.computeIfAbsent(worker.workerId(), id ->
                 ManagedChannelBuilder
                         .forAddress(worker.host(), worker.port())
                         .usePlaintext()
+                        .maxInboundMessageSize(maxInboundMessageBytes)
+                        .keepAliveTime(30, TimeUnit.SECONDS)
+                        .keepAliveTimeout(10, TimeUnit.SECONDS)
+                        .keepAliveWithoutCalls(true)
                         .build());
     }
 

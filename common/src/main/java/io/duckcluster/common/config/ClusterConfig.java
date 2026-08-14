@@ -23,6 +23,19 @@ public final class ClusterConfig {
     private final long asyncResultTtlMs;
     private final int asyncMaxStoredJobs;
     private final long asyncMaxStoredBytes;
+    private final long shardPinLeaseMs;
+    private final long workerRpcDeadlineMs;
+    private final int maxConcurrentFragments;
+    private final int maxAsyncQueryThreads;
+    private final int heartbeatSuspectThreshold;
+    private final int maxConcurrentQueries;
+    private final long queryTimeoutMs;
+    private final int mergePoolSize;
+    private final long mergeMemoryLimitMb;
+    private final long workerMemoryLimitMb;
+    private final long metadataSnapshotIntervalMs;
+    private final int grpcMaxInboundMessageBytes;
+    private final boolean grpcUseCompression;
 
     public ClusterConfig(
             String coordinatorHost,
@@ -43,7 +56,20 @@ public final class ClusterConfig {
             boolean logFragmentSql,
             long asyncResultTtlMs,
             int asyncMaxStoredJobs,
-            long asyncMaxStoredBytes) {
+            long asyncMaxStoredBytes,
+            long shardPinLeaseMs,
+            long workerRpcDeadlineMs,
+            int maxConcurrentFragments,
+            int maxAsyncQueryThreads,
+            int heartbeatSuspectThreshold,
+            int maxConcurrentQueries,
+            long queryTimeoutMs,
+            int mergePoolSize,
+            long mergeMemoryLimitMb,
+            long workerMemoryLimitMb,
+            long metadataSnapshotIntervalMs,
+            int grpcMaxInboundMessageBytes,
+            boolean grpcUseCompression) {
         this.coordinatorHost = Objects.requireNonNull(coordinatorHost, "coordinatorHost");
         this.coordinatorGrpcPort = coordinatorGrpcPort;
         this.coordinatorHttpPort = coordinatorHttpPort;
@@ -64,6 +90,19 @@ public final class ClusterConfig {
         this.asyncResultTtlMs = asyncResultTtlMs;
         this.asyncMaxStoredJobs = asyncMaxStoredJobs;
         this.asyncMaxStoredBytes = asyncMaxStoredBytes;
+        this.shardPinLeaseMs = shardPinLeaseMs;
+        this.workerRpcDeadlineMs = workerRpcDeadlineMs;
+        this.maxConcurrentFragments = maxConcurrentFragments;
+        this.maxAsyncQueryThreads = maxAsyncQueryThreads;
+        this.heartbeatSuspectThreshold = heartbeatSuspectThreshold;
+        this.maxConcurrentQueries = maxConcurrentQueries;
+        this.queryTimeoutMs = queryTimeoutMs;
+        this.mergePoolSize = mergePoolSize;
+        this.mergeMemoryLimitMb = mergeMemoryLimitMb;
+        this.workerMemoryLimitMb = workerMemoryLimitMb;
+        this.metadataSnapshotIntervalMs = metadataSnapshotIntervalMs;
+        this.grpcMaxInboundMessageBytes = Math.max(1024 * 1024, grpcMaxInboundMessageBytes);
+        this.grpcUseCompression = grpcUseCompression;
     }
 
     public ClusterConfig(
@@ -85,7 +124,11 @@ public final class ClusterConfig {
                 heartbeatMissThreshold,
                 shardCount, dataDir, poolSize, poolWaitMs, replicationFactor, vnodesPerWorker, watcherIntervalMs,
                 cacheMaxShards, fragmentWaitMs, false,
-                Duration.ofMinutes(30).toMillis(), 200, 64L * 1024 * 1024);
+                Duration.ofMinutes(30).toMillis(), 200, 64L * 1024 * 1024,
+                Duration.ofMinutes(10).toMillis(), Duration.ofMinutes(2).toMillis(), 64, 8,
+                2, 32, Duration.ofMinutes(5).toMillis(), 4, 2048, 4096, Duration.ofMinutes(5).toMillis(),
+                32 * 1024 * 1024,
+                true);
     }
 
     public static ClusterConfig fromEnvironment() {
@@ -96,7 +139,7 @@ public final class ClusterConfig {
                 parseInt("DUCKCLUSTER_COORDINATOR_HTTP_PORT", 8080),
                 getenv("DUCKCLUSTER_COORDINATOR_HTTP_BIND_HOST", "0.0.0.0"),
                 Duration.ofSeconds(parseInt("DUCKCLUSTER_HEARTBEAT_INTERVAL_SEC", 5)),
-                parseInt("DUCKCLUSTER_HEARTBEAT_MISS_THRESHOLD", 3),
+                parseInt("DUCKCLUSTER_HEARTBEAT_MISS_THRESHOLD", 6),
                 parseInt("DUCKCLUSTER_SHARD_COUNT", 3),
                 getenv("DUCKCLUSTER_DATA_DIR", "./data"),
                 parseInt("DUCKCLUSTER_POOL_SIZE", defaultPoolSize),
@@ -109,7 +152,20 @@ public final class ClusterConfig {
                 parseBoolean("DUCKCLUSTER_LOG_FRAGMENT_SQL", false),
                 Duration.ofSeconds(parseInt("DUCKCLUSTER_ASYNC_RESULT_TTL_SEC", 1800)).toMillis(),
                 parseInt("DUCKCLUSTER_ASYNC_MAX_STORED_JOBS", 200),
-                parseLong("DUCKCLUSTER_ASYNC_MAX_STORED_BYTES", 64L * 1024 * 1024));
+                parseLong("DUCKCLUSTER_ASYNC_MAX_STORED_BYTES", 64L * 1024 * 1024),
+                Duration.ofSeconds(parseInt("DUCKCLUSTER_SHARD_PIN_LEASE_SEC", 600)).toMillis(),
+                Duration.ofSeconds(parseInt("DUCKCLUSTER_WORKER_RPC_DEADLINE_SEC", 120)).toMillis(),
+                parseInt("DUCKCLUSTER_MAX_CONCURRENT_FRAGMENTS", 64),
+                parseInt("DUCKCLUSTER_MAX_ASYNC_QUERY_THREADS", 8),
+                parseInt("DUCKCLUSTER_HEARTBEAT_SUSPECT_THRESHOLD", 2),
+                parseInt("DUCKCLUSTER_MAX_CONCURRENT_QUERIES", 32),
+                Duration.ofSeconds(parseInt("DUCKCLUSTER_QUERY_TIMEOUT_SEC", 300)).toMillis(),
+                parseInt("DUCKCLUSTER_MERGE_POOL_SIZE", 4),
+                parseLong("DUCKCLUSTER_MERGE_MEMORY_LIMIT_MB", 2048),
+                parseLong("DUCKCLUSTER_WORKER_MEMORY_LIMIT_MB", 4096),
+                Duration.ofSeconds(parseInt("DUCKCLUSTER_METADATA_SNAPSHOT_INTERVAL_SEC", 300)).toMillis(),
+                parseInt("DUCKCLUSTER_GRPC_MAX_INBOUND_MB", 32) * 1024 * 1024,
+                parseBoolean("DUCKCLUSTER_GRPC_COMPRESSION", true));
     }
 
     public String coordinatorHost() {
@@ -186,6 +242,58 @@ public final class ClusterConfig {
 
     public long asyncMaxStoredBytes() {
         return asyncMaxStoredBytes;
+    }
+
+    public long shardPinLeaseMs() {
+        return shardPinLeaseMs;
+    }
+
+    public long workerRpcDeadlineMs() {
+        return workerRpcDeadlineMs;
+    }
+
+    public int maxConcurrentFragments() {
+        return maxConcurrentFragments;
+    }
+
+    public int maxAsyncQueryThreads() {
+        return maxAsyncQueryThreads;
+    }
+
+    public int heartbeatSuspectThreshold() {
+        return heartbeatSuspectThreshold;
+    }
+
+    public int maxConcurrentQueries() {
+        return maxConcurrentQueries;
+    }
+
+    public long queryTimeoutMs() {
+        return queryTimeoutMs;
+    }
+
+    public int mergePoolSize() {
+        return mergePoolSize;
+    }
+
+    public long mergeMemoryLimitMb() {
+        return mergeMemoryLimitMb;
+    }
+
+    public long workerMemoryLimitMb() {
+        return workerMemoryLimitMb;
+    }
+
+    public long metadataSnapshotIntervalMs() {
+        return metadataSnapshotIntervalMs;
+    }
+
+    public int grpcMaxInboundMessageBytes() {
+        return grpcMaxInboundMessageBytes;
+    }
+
+    public boolean grpcUseCompression() {
+        return grpcUseCompression;
     }
 
     private static boolean parseBoolean(String key, boolean defaultValue) {
