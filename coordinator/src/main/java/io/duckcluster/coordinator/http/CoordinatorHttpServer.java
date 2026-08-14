@@ -7,6 +7,7 @@ import io.duckcluster.coordinator.execution.AsyncQueryExpiredException;
 import io.duckcluster.coordinator.execution.AsyncQueryJob;
 import io.duckcluster.coordinator.execution.AsyncQueryService;
 import io.duckcluster.coordinator.execution.QueryExecutionService;
+import io.duckcluster.coordinator.monitor.CoordinatorMetrics;
 import io.duckcluster.coordinator.monitor.MonitorService;
 import io.javalin.Javalin;
 import io.javalin.http.HttpStatus;
@@ -17,6 +18,7 @@ import org.slf4j.LoggerFactory;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 public final class CoordinatorHttpServer {
     private static final Logger LOG = LoggerFactory.getLogger(CoordinatorHttpServer.class);
@@ -26,6 +28,7 @@ public final class CoordinatorHttpServer {
     private final QueryExecutionService queryExecutionService;
     private final AsyncQueryService asyncQueryService;
     private final MonitorService monitorService;
+    private final CoordinatorMetrics metrics;
     private Javalin app;
 
     public CoordinatorHttpServer(
@@ -33,12 +36,14 @@ public final class CoordinatorHttpServer {
             WorkerRegistry registry,
             QueryExecutionService queryExecutionService,
             AsyncQueryService asyncQueryService,
-            MonitorService monitorService) {
+            MonitorService monitorService,
+            CoordinatorMetrics metrics) {
         this.config = config;
         this.registry = registry;
         this.queryExecutionService = queryExecutionService;
         this.asyncQueryService = asyncQueryService;
         this.monitorService = monitorService;
+        this.metrics = metrics;
     }
 
     public void start() {
@@ -56,8 +61,15 @@ public final class CoordinatorHttpServer {
                         ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", "sql is required"));
                         return;
                     }
-                    QueryResult result = queryExecutionService.execute(request.sql);
-                    ctx.json(QueryResponseMapper.toFullResponse(result));
+                    try {
+                        QueryResult result = queryExecutionService.execute(request.sql);
+                        ctx.json(QueryResponseMapper.toFullResponse(result));
+                    } catch (ApiException apiError) {
+                        ctx.status(apiError.code().httpStatus()).json(ApiErrorMapper.body(apiError));
+                        if (apiError.code() == io.duckcluster.coordinator.http.ApiErrorCode.RESOURCE_EXHAUSTED) {
+                            ctx.header("Retry-After", "5");
+                        }
+                    }
                 })
                 .post("/v1/query/async", ctx -> {
                     QueryRequest request = ctx.bodyAsClass(QueryRequest.class);
@@ -65,13 +77,39 @@ public final class CoordinatorHttpServer {
                         ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", "sql is required"));
                         return;
                     }
-                    String queryId = asyncQueryService.submit(request.sql);
+                    Optional<String> accepted = asyncQueryService.trySubmit(request.sql);
+                    if (accepted.isEmpty()) {
+                        ctx.status(HttpStatus.TOO_MANY_REQUESTS)
+                                .header("Retry-After", "5")
+                                .json(Map.of(
+                                        "code", ApiErrorCode.RESOURCE_EXHAUSTED.name(),
+                                        "error", "too many concurrent queries"));
+                        return;
+                    }
+                    String queryId = accepted.get();
                     Map<String, Object> body = new LinkedHashMap<>();
                     body.put("queryId", queryId);
                     body.put("status", AsyncQueryJob.Status.QUEUED.name());
                     body.put("statusUrl", "/v1/query/" + queryId);
                     body.put("resultsUrl", "/v1/query/" + queryId + "/results");
                     ctx.status(HttpStatus.ACCEPTED).json(body);
+                })
+                .delete("/v1/query/{queryId}", ctx -> {
+                    String queryId = ctx.pathParam("queryId");
+                    boolean cancelled = asyncQueryService.cancel(queryId);
+                    if (!cancelled) {
+                        cancelled = queryExecutionService.cancelQuery(queryId);
+                    }
+                    if (!cancelled) {
+                        ctx.status(HttpStatus.NOT_FOUND)
+                                .json(Map.of(
+                                        "code", ApiErrorCode.NOT_FOUND.name(),
+                                        "error", "unknown or finished query id"));
+                        return;
+                    }
+                    ctx.json(Map.of(
+                            "queryId", queryId,
+                            "status", AsyncQueryJob.Status.CANCELLED.name()));
                 })
                 .get("/v1/query/{queryId}", ctx -> {
                     String queryId = ctx.pathParam("queryId");
@@ -119,6 +157,18 @@ public final class CoordinatorHttpServer {
                     body.put("workerCount", registry.workerCount());
                     ctx.json(body);
                 })
+                .get("/v1/cluster/ready", ctx -> {
+                    boolean ready = monitorService.isReady();
+                    Map<String, Object> body = new LinkedHashMap<>();
+                    body.put("ready", ready);
+                    body.put("workerCount", registry.workerCount());
+                    if (!ready) {
+                        ctx.status(HttpStatus.SERVICE_UNAVAILABLE);
+                    }
+                    ctx.json(body);
+                })
+                .get("/v1/catalog/tables", ctx -> ctx.json(monitorService.catalogTables()))
+                .get("/metrics", ctx -> ctx.contentType("text/plain; version=0.0.4").result(metrics.prometheusText()))
                 .get("/v1/cluster/workers", ctx -> {
                     List<Map<String, Object>> workers = registry.listWorkers().stream()
                             .map(worker -> {
@@ -141,8 +191,17 @@ public final class CoordinatorHttpServer {
                 .get("/", ctx -> ctx.redirect("/dashboard/index.html"))
                 .get("/dashboard", ctx -> ctx.redirect("/dashboard/index.html"))
                 .get("/dashboard/", ctx -> ctx.redirect("/dashboard/index.html"))
+                .exception(ApiException.class, (exception, ctx) -> {
+                    ctx.status(exception.code().httpStatus()).json(ApiErrorMapper.body(exception));
+                    if (exception.code() == ApiErrorCode.RESOURCE_EXHAUSTED) {
+                        ctx.header("Retry-After", "5");
+                    }
+                })
                 .exception(IllegalArgumentException.class, (exception, ctx) -> {
-                    ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", exception.getMessage()));
+                    ctx.status(HttpStatus.BAD_REQUEST)
+                            .json(Map.of(
+                                    "code", ApiErrorCode.BAD_REQUEST.name(),
+                                    "error", exception.getMessage()));
                 })
                 .exception(IllegalStateException.class, (exception, ctx) -> {
                     ctx.status(HttpStatus.SERVICE_UNAVAILABLE).json(Map.of("error", exception.getMessage()));

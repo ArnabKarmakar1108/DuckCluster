@@ -10,7 +10,8 @@ public final class AsyncQueryJob {
         RUNNING,
         SUCCEEDED,
         FAILED,
-        EXPIRED
+        EXPIRED,
+        CANCELLED
     }
 
     private volatile Status status = Status.QUEUED;
@@ -47,5 +48,11 @@ public final class AsyncQueryJob {
         result = null;
         errorMessage = null;
         status = Status.EXPIRED;
+    }
+
+    void cancel(String message) {
+        result = null;
+        errorMessage = message != null ? message : "query cancelled";
+        status = Status.CANCELLED;
     }
 }

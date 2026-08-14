@@ -14,12 +14,14 @@ import io.duckcluster.common.model.QueryResult;
 import io.duckcluster.common.planner.QueryPlanner;
 import io.duckcluster.common.registry.WorkerRegistry;
 import io.duckcluster.coordinator.catalog.ShardCatalog;
+import io.duckcluster.coordinator.merger.MergeStreamRegistry;
 import io.duckcluster.coordinator.merger.MergeStrategyRegistry;
 import io.duckcluster.coordinator.monitor.QueryActivityTracker;
 import io.duckcluster.coordinator.worker.WorkerNodeClient;
 import io.duckcluster.proto.v1.ShardDataChunk;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -33,9 +35,15 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import io.duckcluster.coordinator.http.ApiErrorCode;
+import io.duckcluster.coordinator.http.ApiException;
+
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 public final class QueryExecutionService {
     private static final Logger LOG = LoggerFactory.getLogger(QueryExecutionService.class);
@@ -51,19 +59,13 @@ public final class QueryExecutionService {
     private final long fragmentWaitMs;
     private final boolean logFragmentSql;
     private final ExecutorService fragmentExecutor;
+    private final Semaphore fragmentAdmission;
+    private final long shardPinLeaseMs;
+    private final long queryTimeoutMs;
+    private final QueryAdmissionControl admission;
     private final QueryActivityTracker activityTracker;
-
-    public QueryExecutionService(
-            QueryPlanner planner,
-            ClusterCatalog catalog,
-            WorkerRegistry registry,
-            WorkerNodeClient workerClient,
-            MergeStrategyRegistry mergeStrategyRegistry,
-            ShardCatalog shardCatalog,
-            ClusterConfig config) {
-        this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog,
-                config.fragmentWaitMs(), config.logFragmentSql(), null);
-    }
+    private final ConcurrentHashMap<String, ActiveQueryHandle> activeQueries = new ConcurrentHashMap<>();
+    private static final int PREFETCH_MAX_ATTEMPTS = 3;
 
     public QueryExecutionService(
             QueryPlanner planner,
@@ -73,9 +75,11 @@ public final class QueryExecutionService {
             MergeStrategyRegistry mergeStrategyRegistry,
             ShardCatalog shardCatalog,
             ClusterConfig config,
-            QueryActivityTracker activityTracker) {
+            QueryActivityTracker activityTracker,
+            QueryAdmissionControl admission) {
         this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog,
-                config.fragmentWaitMs(), config.logFragmentSql(), activityTracker);
+                config.fragmentWaitMs(), config.logFragmentSql(), config.shardPinLeaseMs(),
+                config.maxConcurrentFragments(), config.queryTimeoutMs(), activityTracker, admission);
     }
 
     QueryExecutionService(
@@ -86,7 +90,8 @@ public final class QueryExecutionService {
             MergeStrategyRegistry mergeStrategyRegistry,
             ShardCatalog shardCatalog,
             long fragmentWaitMs) {
-        this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog, fragmentWaitMs, false, null);
+        this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog, fragmentWaitMs, false,
+                TimeUnit.MINUTES.toMillis(10), 64, 0, null, new QueryAdmissionControl(32));
     }
 
     QueryExecutionService(
@@ -99,7 +104,8 @@ public final class QueryExecutionService {
             long fragmentWaitMs,
             boolean logFragmentSql) {
         this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog,
-                fragmentWaitMs, logFragmentSql, null);
+                fragmentWaitMs, logFragmentSql, TimeUnit.MINUTES.toMillis(10), 64, 0, null,
+                new QueryAdmissionControl(32));
     }
 
     QueryExecutionService(
@@ -111,7 +117,11 @@ public final class QueryExecutionService {
             ShardCatalog shardCatalog,
             long fragmentWaitMs,
             boolean logFragmentSql,
-            QueryActivityTracker activityTracker) {
+            long shardPinLeaseMs,
+            int maxConcurrentFragments,
+            long queryTimeoutMs,
+            QueryActivityTracker activityTracker,
+            QueryAdmissionControl admission) {
         this.planner = planner;
         this.catalog = catalog;
         this.registry = registry;
@@ -121,9 +131,14 @@ public final class QueryExecutionService {
         this.fragmentTracker = new WorkerFragmentTracker(registry);
         this.fragmentWaitMs = fragmentWaitMs;
         this.logFragmentSql = logFragmentSql;
+        this.shardPinLeaseMs = shardPinLeaseMs;
+        this.queryTimeoutMs = queryTimeoutMs;
+        this.admission = admission;
         this.activityTracker = activityTracker;
-        this.fragmentExecutor = Executors.newCachedThreadPool(r -> {
-            Thread t = new Thread(r);
+        int poolSize = Math.max(1, maxConcurrentFragments);
+        this.fragmentAdmission = new Semaphore(poolSize);
+        this.fragmentExecutor = Executors.newFixedThreadPool(poolSize, r -> {
+            Thread t = new Thread(r, "query-fragment");
             t.setDaemon(true);
             return t;
         });
@@ -141,20 +156,37 @@ public final class QueryExecutionService {
     }
 
     public QueryResult execute(String queryId, String sql) {
+        return execute(queryId, sql, true);
+    }
+
+    public QueryResult execute(String queryId, String sql, boolean acquireAdmission) {
+        if (acquireAdmission && !admission.tryAcquire()) {
+            throw new QueryRejectedException("too many concurrent queries");
+        }
         long startMs = System.currentTimeMillis();
+        long deadlineMs = queryTimeoutMs > 0 ? startMs + queryTimeoutMs : Long.MAX_VALUE;
         LOG.info("Query [{}] received: {}", queryId, sql);
+        MDC.put("queryId", queryId);
         trackStart(queryId, sql);
+        ActiveQueryHandle activeQuery = new ActiveQueryHandle();
+        activeQueries.put(queryId, activeQuery);
 
         try {
+            ensureNotCancelled(queryId);
             trackPhase(queryId, QueryActivityTracker.Phase.PLAN);
-            PlannedQuery plan = planner.plan(sql, catalog);
+            PlannedQuery plan;
+            try {
+                plan = planner.plan(sql, catalog, queryId);
+            } catch (IllegalArgumentException planningError) {
+                throw new ApiException(ApiErrorCode.PLANNING_ERROR, planningError.getMessage(), planningError);
+            }
             trackFragmentsTotal(queryId, plan.fragments().size());
             LOG.info("Query [{}] planned: table={}, fragments={}, broadcast={}, strategy={}",
                     queryId, plan.tableName(), plan.fragments().size(),
                     plan.broadcastTables().size(), plan.mergeStrategy());
 
             if (registry.workerCount() == 0) {
-                throw new IllegalStateException("No workers registered");
+                throw new ApiException(ApiErrorCode.NO_WORKERS, "No workers registered");
             }
 
             MergeStrategy mergeStrategy = mergeStrategyRegistry.get(plan.mergeStrategy());
@@ -181,7 +213,10 @@ public final class QueryExecutionService {
         }
 
         Set<String> preparedWorkers = prepareWorkersForQuery(queryId, plan, fragmentTargets);
+        activeQuery.setPreparedWorkers(preparedWorkers);
+        boolean streamMergeToDuckDb = MergeStreamRegistry.tryStart(queryId, plan);
         try {
+            ensureNotCancelled(queryId);
             trackPhase(queryId, QueryActivityTracker.Phase.FRAGMENTS);
             List<CompletableFuture<ExecutionOutcome>> futures = new ArrayList<>(plan.fragments().size());
             for (FragmentSpec fragment : plan.fragments()) {
@@ -190,17 +225,41 @@ public final class QueryExecutionService {
                             queryId, fragment.fragmentId(), fragment.shardId(), fragment.sql());
                 }
                 String preferredWorkerId = fragmentTargets.get(fragment.shardId());
-                futures.add(CompletableFuture.supplyAsync(
-                        () -> executeFragmentWithRetry(queryId, plan, fragment, preferredWorkerId, preparedWorkers),
-                        fragmentExecutor));
+                CompletableFuture<ExecutionOutcome> future = CompletableFuture.supplyAsync(
+                        () -> runFragmentWithAdmission(
+                                queryId, plan, fragment, preferredWorkerId, preparedWorkers, streamMergeToDuckDb),
+                        fragmentExecutor);
+                activeQuery.trackFuture(future);
+                futures.add(future);
             }
 
             List<FragmentResult> fragmentResults = new ArrayList<>(plan.fragments().size());
             Map<String, Long> workerDurationsMs = new LinkedHashMap<>();
 
             for (int i = 0; i < futures.size(); i++) {
+                ensureNotCancelled(queryId);
                 FragmentSpec fragment = plan.fragments().get(i);
-                ExecutionOutcome outcome = futures.get(i).join();
+                long remainingMs = deadlineMs - System.currentTimeMillis();
+                if (remainingMs <= 0) {
+                    futures.forEach(future -> future.cancel(true));
+                    throw new QueryTimeoutException("query timed out after " + queryTimeoutMs + "ms");
+                }
+                ExecutionOutcome outcome;
+                try {
+                    outcome = futures.get(i).get(remainingMs, TimeUnit.MILLISECONDS);
+                } catch (java.util.concurrent.TimeoutException e) {
+                    futures.forEach(future -> future.cancel(true));
+                    throw new QueryTimeoutException("query timed out waiting for fragment " + fragment.fragmentId());
+                } catch (java.util.concurrent.ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    if (cause instanceof RuntimeException runtime) {
+                        throw runtime;
+                    }
+                    throw new IllegalStateException(cause);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted waiting for fragment", e);
+                }
                 workerDurationsMs.merge(outcome.workerId, outcome.durationMs, Long::sum);
                 fragmentResults.add(new FragmentResult(
                         fragment.fragmentId(),
@@ -224,11 +283,69 @@ public final class QueryExecutionService {
             trackComplete(queryId, timed);
             return timed;
         } finally {
+            MergeStreamRegistry.remove(queryId);
             releasePreparedWorkers(queryId, preparedWorkers);
         }
         } catch (RuntimeException e) {
             trackFail(queryId, e.getMessage(), System.currentTimeMillis() - startMs);
             throw e;
+        } finally {
+            activeQueries.remove(queryId);
+            if (acquireAdmission) {
+                admission.release();
+            }
+            MDC.remove("queryId");
+        }
+    }
+
+    public void awaitDrain(long timeoutMs) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (!activeQueries.isEmpty() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50);
+        }
+    }
+
+    public boolean cancelQuery(String queryId) {
+        ActiveQueryHandle handle = activeQueries.get(queryId);
+        if (handle == null) {
+            return false;
+        }
+        handle.cancel();
+        for (String workerId : handle.preparedWorkers()) {
+            registry.getWorker(workerId).ifPresent(worker -> workerClient.cancelQuery(worker, queryId));
+        }
+        if (!handle.preparedWorkers().isEmpty()) {
+            releasePreparedWorkers(queryId, new LinkedHashSet<>(handle.preparedWorkers()));
+        }
+        return true;
+    }
+
+    private void ensureNotCancelled(String queryId) {
+        ActiveQueryHandle handle = activeQueries.get(queryId);
+        if (handle != null && handle.isCancelled()) {
+            throw new QueryCancelledException(queryId);
+        }
+    }
+
+    private ExecutionOutcome runFragmentWithAdmission(
+            String queryId,
+            PlannedQuery plan,
+            FragmentSpec fragment,
+            String preferredWorkerId,
+            Set<String> preparedWorkers,
+            boolean streamMergeToDuckDb) {
+        ensureNotCancelled(queryId);
+        try {
+            fragmentAdmission.acquire();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted waiting for fragment admission slot", e);
+        }
+        try {
+            return executeFragmentWithRetry(
+                    queryId, plan, fragment, preferredWorkerId, preparedWorkers, streamMergeToDuckDb);
+        } finally {
+            fragmentAdmission.release();
         }
     }
 
@@ -289,17 +406,17 @@ public final class QueryExecutionService {
 
     private String resolveRegisteredCandidate(String tableName, int shardId) {
         for (String ownerId : shardCatalog.getOwners(tableName, shardId)) {
-            if (registry.getWorker(ownerId).isPresent()) {
+            if (registry.isSchedulable(ownerId)) {
                 return ownerId;
             }
         }
         for (String workerId : shardCatalog.getCachedWorkers(tableName, shardId)) {
-            if (registry.getWorker(workerId).isPresent()) {
+            if (registry.isSchedulable(workerId)) {
                 return workerId;
             }
         }
         for (String ownerId : shardCatalog.getActualOwners(tableName, shardId)) {
-            if (registry.getWorker(ownerId).isPresent()) {
+            if (registry.isSchedulable(ownerId)) {
                 return ownerId;
             }
         }
@@ -323,10 +440,11 @@ public final class QueryExecutionService {
 
     private String pickFallbackWorker() {
         return registry.listWorkers().stream()
+                .filter(worker -> worker.status() == WorkerRegistry.WorkerStatus.HEALTHY)
                 .min((left, right) -> Integer.compare(
                         fragmentTracker.inFlightCount(left.workerId()),
                         fragmentTracker.inFlightCount(right.workerId())))
-                .orElseThrow(() -> new IllegalStateException("No workers registered"))
+                .orElseThrow(() -> new IllegalStateException("No healthy workers registered"))
                 .workerId();
     }
 
@@ -393,29 +511,16 @@ public final class QueryExecutionService {
     }
 
     private void prefetchShard(WorkerRegistry.WorkerRecord target, String tableName, int shardId) {
-        List<String> sourceOwners = shardCatalog.getActualOwners(tableName, shardId);
-        if (sourceOwners.isEmpty()) {
-            sourceOwners = shardCatalog.getOwners(tableName, shardId);
-        }
-        WorkerRegistry.WorkerRecord source = null;
-        for (String ownerId : sourceOwners) {
-            Optional<WorkerRegistry.WorkerRecord> w = registry.getWorker(ownerId);
-            if (w.isPresent()) {
-                source = w.get();
-                break;
-            }
-        }
-        if (source == null) {
-            throw new IllegalStateException(
-                    "No source worker available for broadcast shard " + tableName + "_shard" + shardId);
-        }
+        prefetchShard(target, tableName, shardId, null);
+    }
 
+    private void prefetchShard(WorkerRegistry.WorkerRecord target, String tableName, int shardId, String queryId) {
+        WorkerRegistry.WorkerRecord source = findSourceWorker(tableName, shardId);
         long transferStart = System.currentTimeMillis();
         LOG.info("Prefetching {}_shard{} from {} to {}",
                 tableName, shardId, source.workerId(), target.workerId());
 
-        Iterator<ShardDataChunk> chunks = workerClient.streamShardFrom(source, tableName, shardId);
-        boolean loaded = workerClient.loadTempData(target, chunks);
+        boolean loaded = prefetchWithRetry(target, tableName, shardId, queryId);
         if (!loaded) {
             throw new IllegalStateException(
                     "Failed to prefetch broadcast shard " + tableName + "_shard" + shardId
@@ -427,19 +532,23 @@ public final class QueryExecutionService {
     }
 
     private ExecutionOutcome executeFragmentWithRetry(
-            String queryId, PlannedQuery plan, FragmentSpec fragment, String preferredWorkerId,
-            Set<String> preparedWorkers) {
+            String queryId,
+            PlannedQuery plan,
+            FragmentSpec fragment,
+            String preferredWorkerId,
+            Set<String> preparedWorkers,
+            boolean streamMergeToDuckDb) {
         List<String> candidates = buildExecutionCandidates(plan, fragment.shardId(), preferredWorkerId);
         FragmentExecutionException lastRetryable = null;
 
         for (String workerId : candidates) {
-            if (registry.getWorker(workerId).isEmpty()) {
+            if (!registry.isSchedulable(workerId)) {
                 continue;
             }
             try {
                 ensureWorkerPrepared(
                         queryId, plan, workerId, List.of(fragment.shardId()), preparedWorkers);
-                return tryExecuteOnWorker(queryId, fragment, workerId);
+                return tryExecuteOnWorker(queryId, fragment, workerId, streamMergeToDuckDb);
             } catch (FragmentExecutionException e) {
                 if (e.retryable()) {
                     LOG.warn("Query [{}] fragment {} failed on {} ({}), trying next worker",
@@ -491,32 +600,32 @@ public final class QueryExecutionService {
         return List.copyOf(candidates);
     }
 
-    private void ensureShardsLocal(PlannedQuery plan, String workerId, int drivingShardId) {
+    private void ensureShardsLocal(String queryId, PlannedQuery plan, String workerId, int drivingShardId) {
         Optional<WorkerRegistry.WorkerRecord> targetOpt = registry.getWorker(workerId);
         if (targetOpt.isEmpty()) {
             return;
         }
         WorkerRegistry.WorkerRecord target = targetOpt.get();
         if (!workerHasShard(workerId, plan.tableName(), drivingShardId)) {
-            prefetchShard(target, plan.tableName(), drivingShardId);
+            prefetchShard(target, plan.tableName(), drivingShardId, queryId);
         }
         for (BroadcastTable broadcastTable : plan.broadcastTables()) {
             for (int shardId = 0; shardId < broadcastTable.shardCount(); shardId++) {
                 if (!workerHasShard(workerId, broadcastTable.tableName(), shardId)) {
-                    prefetchShard(target, broadcastTable.tableName(), shardId);
+                    prefetchShard(target, broadcastTable.tableName(), shardId, queryId);
                 }
             }
         }
         for (BroadcastTable broadcastTable : plan.subqueryBroadcastTables()) {
             for (int shardId = 0; shardId < broadcastTable.shardCount(); shardId++) {
                 if (!workerHasShard(workerId, broadcastTable.tableName(), shardId)) {
-                    prefetchShard(target, broadcastTable.tableName(), shardId);
+                    prefetchShard(target, broadcastTable.tableName(), shardId, queryId);
                 }
             }
         }
         for (String tableName : plan.correlatedCoPartitionTables()) {
             if (!workerHasShard(workerId, tableName, drivingShardId)) {
-                prefetchShard(target, tableName, drivingShardId);
+                prefetchShard(target, tableName, drivingShardId, queryId);
             }
         }
     }
@@ -531,10 +640,60 @@ public final class QueryExecutionService {
         }
 
         Set<String> preparedWorkers = Collections.synchronizedSet(new LinkedHashSet<>());
+        List<CompletableFuture<Void>> prepareFutures = new ArrayList<>();
         for (Map.Entry<String, List<Integer>> entry : shardIdsByWorker.entrySet()) {
-            ensureWorkerPrepared(queryId, plan, entry.getKey(), entry.getValue(), preparedWorkers);
+            prepareFutures.add(CompletableFuture.runAsync(
+                    () -> ensureWorkerPrepared(queryId, plan, entry.getKey(), entry.getValue(), preparedWorkers),
+                    fragmentExecutor));
+        }
+        for (CompletableFuture<Void> future : prepareFutures) {
+            future.join();
         }
         return preparedWorkers;
+    }
+
+    private boolean prefetchWithRetry(
+            WorkerRegistry.WorkerRecord target, String tableName, int shardId, String queryId) {
+        RuntimeException lastFailure = null;
+        for (int attempt = 1; attempt <= PREFETCH_MAX_ATTEMPTS; attempt++) {
+            try {
+                Iterator<ShardDataChunk> chunks = workerClient.streamShardFrom(
+                        findSourceWorker(tableName, shardId), tableName, shardId);
+                if (workerClient.loadTempData(target, chunks, queryId)) {
+                    return true;
+                }
+            } catch (RuntimeException e) {
+                lastFailure = e;
+                LOG.warn(
+                        "Prefetch attempt {}/{} failed for {}_shard{} -> {}: {}",
+                        attempt,
+                        PREFETCH_MAX_ATTEMPTS,
+                        tableName,
+                        shardId,
+                        target.workerId(),
+                        e.getMessage());
+            }
+            sleepQuietly(50L * attempt);
+        }
+        if (lastFailure != null) {
+            throw lastFailure;
+        }
+        return false;
+    }
+
+    private WorkerRegistry.WorkerRecord findSourceWorker(String tableName, int shardId) {
+        List<String> sourceOwners = shardCatalog.getActualOwners(tableName, shardId);
+        if (sourceOwners.isEmpty()) {
+            sourceOwners = shardCatalog.getOwners(tableName, shardId);
+        }
+        for (String ownerId : sourceOwners) {
+            Optional<WorkerRegistry.WorkerRecord> worker = registry.getWorker(ownerId);
+            if (worker.isPresent()) {
+                return worker.get();
+            }
+        }
+        throw new IllegalStateException(
+                "No source worker available for shard " + tableName + "_shard" + shardId);
     }
 
     private void ensureWorkerPrepared(
@@ -552,9 +711,10 @@ public final class QueryExecutionService {
             }
             WorkerRegistry.WorkerRecord worker = registry.getWorker(workerId)
                     .orElseThrow(() -> new IllegalStateException("Worker " + workerId + " not available"));
-            workerClient.beginShardPin(worker);
+            long leaseTtlSec = TimeUnit.MILLISECONDS.toSeconds(shardPinLeaseMs);
+            workerClient.beginShardPin(worker, queryId, leaseTtlSec);
             for (int shardId : shardIds) {
-                ensureShardsLocal(plan, workerId, shardId);
+                ensureShardsLocal(queryId, plan, workerId, shardId);
             }
             for (BroadcastTable broadcastTable : broadcastTablesToMaterialize(plan)) {
                 workerClient.materializeBroadcast(
@@ -566,13 +726,27 @@ public final class QueryExecutionService {
 
     private void releasePreparedWorkers(String queryId, Set<String> preparedWorkers) {
         for (String workerId : preparedWorkers) {
-            Optional<WorkerRegistry.WorkerRecord> workerOpt = registry.getWorker(workerId);
-            if (workerOpt.isEmpty()) {
-                continue;
+            try {
+                Optional<WorkerRegistry.WorkerRecord> workerOpt = registry.getWorker(workerId);
+                if (workerOpt.isEmpty()) {
+                    continue;
+                }
+                WorkerRegistry.WorkerRecord worker = workerOpt.get();
+                try {
+                    workerClient.clearBroadcastTables(worker, queryId);
+                } catch (Exception e) {
+                    LOG.warn("Query [{}] failed to clear broadcast tables on {}: {}",
+                            queryId, workerId, e.getMessage());
+                }
+                try {
+                    workerClient.endShardPin(worker, queryId);
+                } catch (Exception e) {
+                    LOG.warn("Query [{}] failed to end shard pin on {}: {}",
+                            queryId, workerId, e.getMessage());
+                }
+            } catch (Exception e) {
+                LOG.warn("Query [{}] worker cleanup failed for {}: {}", queryId, workerId, e.getMessage());
             }
-            WorkerRegistry.WorkerRecord worker = workerOpt.get();
-            workerClient.clearBroadcastTables(worker, queryId);
-            workerClient.endShardPin(worker);
         }
     }
 
@@ -591,13 +765,24 @@ public final class QueryExecutionService {
         return List.copyOf(tables.values());
     }
 
-    private ExecutionOutcome tryExecuteOnWorker(String queryId, FragmentSpec fragment, String targetWorkerId) {
+    private ExecutionOutcome tryExecuteOnWorker(
+            String queryId, FragmentSpec fragment, String targetWorkerId, boolean streamMergeToDuckDb) {
         fragmentTracker.acquireBlocking(targetWorkerId, fragmentWaitMs);
         try {
             WorkerRegistry.WorkerRecord worker = registry.getWorker(targetWorkerId)
                     .orElseThrow(() -> new IllegalStateException("Target worker " + targetWorkerId + " not available"));
             long fragmentStartMs = System.currentTimeMillis();
-            List<RowBatchData> batches = workerClient.executeFragment(worker, queryId, fragment);
+            List<RowBatchData> batches;
+            if (streamMergeToDuckDb) {
+                workerClient.consumeFragmentBatches(
+                        worker,
+                        queryId,
+                        fragment,
+                        batch -> MergeStreamRegistry.appendBatch(queryId, fragment.fragmentId(), batch));
+                batches = List.of();
+            } else {
+                batches = workerClient.executeFragment(worker, queryId, fragment);
+            }
             long fragmentDurationMs = System.currentTimeMillis() - fragmentStartMs;
             return new ExecutionOutcome(targetWorkerId, fragmentDurationMs, batches);
         } finally {

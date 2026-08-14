@@ -29,6 +29,8 @@ def wait_for_completion(
             from duckcluster.client import QueryExpiredError
 
             raise QueryExpiredError(410, str(status.get("error", "query result expired")))
+        if state == "CANCELLED":
+            raise ClusterError(499, str(status.get("error", "query cancelled")))
         if state in {"SUCCEEDED", "FAILED"}:
             if state == "FAILED":
                 raise ClusterError(500, str(status.get("error", "query failed")))
@@ -70,7 +72,14 @@ def fetch_all_rows(
 def query_async(client: CoordinatorClient, sql: str, chunk_size: int = 1000) -> dict[str, Any]:
     accepted = submit_query(client, sql)
     query_id = str(accepted["queryId"])
-    wait_for_completion(client, query_id, timeout_sec=client.timeout_sec)
+    try:
+        wait_for_completion(client, query_id, timeout_sec=client.timeout_sec)
+    except KeyboardInterrupt:
+        try:
+            client.cancel_query(query_id)
+        except (ConnectionError, ClusterError):
+            pass
+        raise
     return fetch_all_rows(client, query_id, chunk_size=chunk_size)
 
 

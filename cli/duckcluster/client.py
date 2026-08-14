@@ -58,6 +58,17 @@ class CoordinatorClient:
     def query_results(self, query_id: str, offset: int = 0, limit: int = 1000) -> dict[str, Any]:
         return self._get(f"/v1/query/{query_id}/results?offset={offset}&limit={limit}")
 
+    def cancel_query(self, query_id: str) -> dict[str, Any]:
+        request = urllib.request.Request(
+            f"{self._base_url}/v1/query/{query_id}",
+            method="DELETE",
+            headers={"Accept": "application/json"},
+        )
+        return self._send(request)
+
+    def catalog_tables(self) -> dict[str, Any]:
+        return self._get("/v1/catalog/tables")
+
     @property
     def timeout_sec(self) -> float:
         return self._timeout_sec

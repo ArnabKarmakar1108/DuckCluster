@@ -13,6 +13,9 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class AsyncQueryService {
     public static final int DEFAULT_RESULT_LIMIT = 1_000;
@@ -37,34 +40,74 @@ public final class AsyncQueryService {
     private final int maxStoredJobs;
     private final long maxStoredBytes;
     private final ConcurrentHashMap<String, AsyncQueryJobEntry> jobs = new ConcurrentHashMap<>();
-    private volatile long totalRetainedBytes;
-    private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
-        Thread thread = new Thread(r, "async-query");
-        thread.setDaemon(true);
-        return thread;
-    });
+    private final AtomicLong totalRetainedBytes = new AtomicLong();
+    private final ExecutorService executor;
+    private final ScheduledExecutorService sweeper;
+    private final QueryAdmissionControl admission;
 
     public AsyncQueryService(
             QueryExecutionService queryExecutionService,
             QueryActivityTracker activityTracker,
-            ClusterConfig config) {
+            ClusterConfig config,
+            QueryAdmissionControl admission) {
         this.queryExecutionService = queryExecutionService;
         this.activityTracker = activityTracker;
+        this.admission = admission;
         this.resultTtlMs = config.asyncResultTtlMs();
         this.maxStoredJobs = config.asyncMaxStoredJobs();
         this.maxStoredBytes = config.asyncMaxStoredBytes();
+        this.executor = Executors.newFixedThreadPool(
+                Math.max(1, config.maxAsyncQueryThreads()),
+                r -> {
+                    Thread thread = new Thread(r, "async-query");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+        this.sweeper = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread thread = new Thread(r, "async-query-sweeper");
+            thread.setDaemon(true);
+            return thread;
+        });
+        long sweepMs = Math.max(30_000L, config.asyncResultTtlMs() / 4);
+        sweeper.scheduleAtFixedRate(this::purgeExpiredAndOverCapacity, sweepMs, sweepMs, TimeUnit.MILLISECONDS);
     }
 
-    public String submit(String sql) {
+    public Optional<String> trySubmit(String sql) {
         if (sql == null || sql.isBlank()) {
             throw new IllegalArgumentException("sql is required");
+        }
+        if (!admission.tryAcquire()) {
+            return Optional.empty();
         }
         purgeExpiredAndOverCapacity();
         String queryId = UUID.randomUUID().toString();
         AsyncQueryJob job = new AsyncQueryJob();
         jobs.put(queryId, new AsyncQueryJobEntry(job, System.currentTimeMillis()));
         executor.submit(() -> runQuery(queryId, sql.strip(), job));
-        return queryId;
+        return Optional.of(queryId);
+    }
+
+    public String submit(String sql) {
+        return trySubmit(sql).orElseThrow(() -> new QueryRejectedException("too many concurrent queries"));
+    }
+
+    public boolean cancel(String queryId) {
+        AsyncQueryJobEntry entry = jobs.get(queryId);
+        if (entry == null) {
+            return false;
+        }
+        AsyncQueryJob job = entry.job;
+        if (isTerminal(job.status()) || job.status() == AsyncQueryJob.Status.CANCELLED) {
+            return false;
+        }
+        boolean wasQueued = job.status() == AsyncQueryJob.Status.QUEUED;
+        job.cancel("cancelled by client");
+        queryExecutionService.cancelQuery(queryId);
+        if (wasQueued) {
+            admission.release();
+            markCompleted(queryId, null);
+        }
+        return true;
     }
 
     public Optional<StatusView> status(String queryId) {
@@ -104,14 +147,39 @@ public final class AsyncQueryService {
     }
 
     private void runQuery(String queryId, String sql, AsyncQueryJob job) {
+        if (job.status() == AsyncQueryJob.Status.CANCELLED) {
+            admission.release();
+            markCompleted(queryId, null);
+            return;
+        }
         job.markRunning();
+        if (job.status() == AsyncQueryJob.Status.CANCELLED) {
+            admission.release();
+            markCompleted(queryId, null);
+            return;
+        }
         try {
-            QueryResult result = queryExecutionService.execute(queryId, sql);
+            QueryResult result = queryExecutionService.execute(queryId, sql, false);
+            if (job.status() == AsyncQueryJob.Status.CANCELLED) {
+                markCompleted(queryId, null);
+                return;
+            }
             job.complete(result);
             markCompleted(queryId, result);
+        } catch (QueryCancelledException cancelled) {
+            if (job.status() != AsyncQueryJob.Status.CANCELLED) {
+                job.cancel(cancelled.getMessage());
+            }
+            markCompleted(queryId, null);
         } catch (RuntimeException exception) {
+            if (job.status() == AsyncQueryJob.Status.CANCELLED) {
+                markCompleted(queryId, null);
+                return;
+            }
             job.fail(exception.getMessage());
             markCompleted(queryId, null);
+        } finally {
+            admission.release();
         }
     }
 
@@ -123,7 +191,7 @@ public final class AsyncQueryService {
         entry.completedAtEpochMs = System.currentTimeMillis();
         if (result != null) {
             entry.retainedBytes = QueryResultSizeEstimator.estimateBytes(result);
-            totalRetainedBytes += entry.retainedBytes;
+            totalRetainedBytes.addAndGet(entry.retainedBytes);
         }
     }
 
@@ -165,7 +233,7 @@ public final class AsyncQueryService {
     }
 
     private void expireByCapacity(long now) {
-        while (jobs.size() > maxStoredJobs || totalRetainedBytes > maxStoredBytes) {
+        while (jobs.size() > maxStoredJobs || totalRetainedBytes.get() > maxStoredBytes) {
             Optional<String> oldest = jobs.entrySet().stream()
                     .filter(entry -> isTerminal(entry.getValue().job.status()))
                     .filter(entry -> entry.getValue().completedAtEpochMs > 0)
@@ -191,7 +259,7 @@ public final class AsyncQueryService {
         if (entry == null || entry.job.status() == AsyncQueryJob.Status.EXPIRED) {
             return;
         }
-        totalRetainedBytes = Math.max(0, totalRetainedBytes - entry.retainedBytes);
+        totalRetainedBytes.addAndGet(-entry.retainedBytes);
         entry.retainedBytes = 0;
         entry.job.expire();
         if (entry.completedAtEpochMs < 0) {
@@ -202,6 +270,7 @@ public final class AsyncQueryService {
     private static boolean isTerminal(AsyncQueryJob.Status status) {
         return status == AsyncQueryJob.Status.SUCCEEDED
                 || status == AsyncQueryJob.Status.FAILED
-                || status == AsyncQueryJob.Status.EXPIRED;
+                || status == AsyncQueryJob.Status.EXPIRED
+                || status == AsyncQueryJob.Status.CANCELLED;
     }
 }
