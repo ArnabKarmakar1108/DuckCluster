@@ -10,6 +10,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class WorkerRegistry {
     public enum WorkerStatus {
         HEALTHY,
+        SUSPECT,
         UNHEALTHY
     }
 
@@ -53,6 +54,31 @@ public final class WorkerRegistry {
 
     public boolean removeWorker(String workerId) {
         return workers.remove(workerId) != null;
+    }
+
+    public boolean isSchedulable(String workerId) {
+        return getWorker(workerId).map(worker -> worker.status() == WorkerStatus.HEALTHY).orElse(false);
+    }
+
+    public Optional<WorkerRecord> markSuspect(String workerId) {
+        WorkerRecord existing = workers.get(workerId);
+        if (existing == null) {
+            return Optional.empty();
+        }
+        if (existing.status() == WorkerStatus.SUSPECT) {
+            return Optional.of(existing);
+        }
+        WorkerRecord updated = new WorkerRecord(
+                existing.workerId(),
+                existing.host(),
+                existing.port(),
+                existing.numThreads(),
+                WorkerStatus.SUSPECT,
+                existing.registeredAt(),
+                existing.lastHeartbeatAt(),
+                existing.load());
+        workers.put(workerId, updated);
+        return Optional.of(updated);
     }
 
     public Optional<WorkerRecord> getWorker(String workerId) {

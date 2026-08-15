@@ -1,6 +1,8 @@
 package io.duckcluster.coordinator.catalog;
 
 import io.duckcluster.common.model.ClusterCatalog;
+import io.duckcluster.common.model.TableColumn;
+import io.duckcluster.common.model.TableShardConfig;
 import io.duckcluster.common.routing.ConsistentHashRing;
 import io.duckcluster.proto.v1.ShardOwnership;
 import org.slf4j.Logger;
@@ -21,6 +23,7 @@ public final class ShardCatalog {
     private final ClusterCatalog clusterCatalog;
     private final Map<String, Set<String>> actualOwnership = new ConcurrentHashMap<>();
     private final Map<String, Set<String>> shardCache = new ConcurrentHashMap<>();
+    private final Map<String, Long> rowsByShardKey = new ConcurrentHashMap<>();
 
     public ShardCatalog(ConsistentHashRing ring, int replicationFactor, ClusterCatalog clusterCatalog) {
         this.ring = ring;
@@ -49,9 +52,38 @@ public final class ShardCatalog {
         for (ShardOwnership shard : shards) {
             keys.add(shardKey(shard.getTableName(), shard.getShardId()));
             clusterCatalog.registerTable(shard.getTableName(), shard.getShardId() + 1);
+            if (shard.getRowCount() > 0) {
+                String rowKey = shardKey(shard.getTableName(), shard.getShardId());
+                rowsByShardKey.merge(rowKey, shard.getRowCount(), Math::max);
+            }
+            if (!shard.getColumnsList().isEmpty()) {
+                List<TableColumn> columns = shard.getColumnsList().stream()
+                        .map(col -> new TableColumn(col.getName(), col.getType()))
+                        .toList();
+                if (!clusterCatalog.updateTableSchemaIfCompatible(shard.getTableName(), columns)) {
+                    LOG.warn(
+                            "Schema drift for table {} reported by worker {} (shard {}); keeping first registered schema",
+                            shard.getTableName(),
+                            workerId,
+                            shard.getShardId());
+                }
+            }
         }
         actualOwnership.put(workerId, keys);
+        refreshEstimatedRowCounts();
         LOG.debug("Worker {} reports {} shards", workerId, shards.size());
+    }
+
+    private void refreshEstimatedRowCounts() {
+        Map<String, Long> totals = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, Long> entry : rowsByShardKey.entrySet()) {
+            String[] parts = entry.getKey().split(":", 2);
+            if (parts.length != 2) {
+                continue;
+            }
+            totals.merge(parts[0], entry.getValue(), Long::sum);
+        }
+        clusterCatalog.replaceEstimatedRowCounts(totals);
     }
 
     public List<String> getOwners(String tableName, int shardId) {
@@ -125,6 +157,29 @@ public final class ShardCatalog {
 
     public int getReplicationFactor() {
         return replicationFactor;
+    }
+
+    public Map<String, Set<String>> exportOwnership() {
+        Map<String, Set<String>> copy = new ConcurrentHashMap<>();
+        actualOwnership.forEach((workerId, keys) -> copy.put(workerId, Set.copyOf(keys)));
+        return copy;
+    }
+
+    public void restoreFromSnapshot(List<TableShardConfig> tables, Map<String, Set<String>> ownership) {
+        if (tables != null) {
+            for (TableShardConfig table : tables) {
+                clusterCatalog.restoreTable(table);
+            }
+        }
+        if (ownership != null && !ownership.isEmpty()) {
+            actualOwnership.clear();
+            ownership.forEach((workerId, keys) -> actualOwnership.put(workerId, new HashSet<>(keys)));
+            LOG.info("Restored shard ownership for {} workers from metadata snapshot", ownership.size());
+        }
+    }
+
+    public ClusterCatalog clusterCatalog() {
+        return clusterCatalog;
     }
 
     private static String shardKey(String tableName, int shardId) {

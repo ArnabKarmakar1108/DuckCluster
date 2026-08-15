@@ -22,17 +22,26 @@ public final class HeartbeatMonitor implements AutoCloseable {
     private final ShardCatalog shardCatalog;
     private final ShardReplicator shardReplicator;
     private final WorkerChannelPool channelPool;
-    private final Duration heartbeatTimeout;
+    private final Duration heartbeatInterval;
+    private final Duration suspectTimeout;
+    private final Duration deadTimeout;
     private final ScheduledExecutorService executor;
 
-    public HeartbeatMonitor(WorkerRegistry registry, ShardCatalog shardCatalog,
-                            ShardReplicator shardReplicator, WorkerChannelPool channelPool,
-                            Duration heartbeatInterval, int missThreshold) {
+    public HeartbeatMonitor(
+            WorkerRegistry registry,
+            ShardCatalog shardCatalog,
+            ShardReplicator shardReplicator,
+            WorkerChannelPool channelPool,
+            Duration heartbeatInterval,
+            int suspectMissThreshold,
+            int deadMissThreshold) {
         this.registry = registry;
         this.shardCatalog = shardCatalog;
         this.shardReplicator = shardReplicator;
         this.channelPool = channelPool;
-        this.heartbeatTimeout = heartbeatInterval.multipliedBy(missThreshold);
+        this.heartbeatInterval = heartbeatInterval;
+        this.suspectTimeout = heartbeatInterval.multipliedBy(suspectMissThreshold);
+        this.deadTimeout = heartbeatInterval.multipliedBy(deadMissThreshold);
         this.executor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "heartbeat-monitor");
             t.setDaemon(true);
@@ -41,24 +50,37 @@ public final class HeartbeatMonitor implements AutoCloseable {
     }
 
     public void start() {
-        long checkIntervalMs = heartbeatTimeout.toMillis();
+        long checkIntervalMs = heartbeatInterval.toMillis();
         executor.scheduleWithFixedDelay(this::checkWorkers, checkIntervalMs, checkIntervalMs, TimeUnit.MILLISECONDS);
-        LOG.info("HeartbeatMonitor started (timeout={}s)", heartbeatTimeout.toSeconds());
+        LOG.info(
+                "HeartbeatMonitor started (suspect={}s, dead={}s)",
+                suspectTimeout.toSeconds(),
+                deadTimeout.toSeconds());
     }
 
     private void checkWorkers() {
         try {
-            Instant deadline = Instant.now().minus(heartbeatTimeout);
+            Instant now = Instant.now();
+            Instant suspectDeadline = now.minus(suspectTimeout);
+            Instant deadDeadline = now.minus(deadTimeout);
             List<String> toRemove = new ArrayList<>();
 
             for (WorkerRegistry.WorkerRecord worker : registry.listWorkers()) {
-                if (worker.lastHeartbeatAt().isBefore(deadline)) {
+                Instant lastHeartbeat = worker.lastHeartbeatAt();
+                if (lastHeartbeat.isBefore(deadDeadline)) {
                     toRemove.add(worker.workerId());
+                } else if (lastHeartbeat.isBefore(suspectDeadline)
+                        && worker.status() == WorkerRegistry.WorkerStatus.HEALTHY) {
+                    registry.markSuspect(worker.workerId());
+                    LOG.warn(
+                            "Worker {} marked SUSPECT (last heartbeat {}s ago)",
+                            worker.workerId(),
+                            Duration.between(lastHeartbeat, now).toSeconds());
                 }
             }
 
             for (String workerId : toRemove) {
-                LOG.warn("Worker {} missed heartbeat deadline, removing from cluster", workerId);
+                LOG.warn("Worker {} missed dead heartbeat deadline, removing from cluster", workerId);
                 registry.removeWorker(workerId);
                 shardCatalog.onWorkerRemoved(workerId);
                 channelPool.removeChannel(workerId);
@@ -68,7 +90,7 @@ public final class HeartbeatMonitor implements AutoCloseable {
                 LOG.info("Removed {} dead workers, triggered reconciliation", toRemove.size());
                 shardReplicator.triggerReconcile();
             } else {
-                LOG.debug("Heartbeat check: {} workers healthy", registry.workerCount());
+                LOG.debug("Heartbeat check: {} workers tracked", registry.workerCount());
             }
         } catch (Exception e) {
             LOG.warn("HeartbeatMonitor check error: {}", e.getMessage());
