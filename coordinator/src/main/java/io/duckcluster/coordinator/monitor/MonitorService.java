@@ -2,6 +2,7 @@ package io.duckcluster.coordinator.monitor;
 
 import io.duckcluster.common.config.ClusterConfig;
 import io.duckcluster.common.model.ClusterCatalog;
+import io.duckcluster.common.model.TableColumn;
 import io.duckcluster.common.model.TableShardConfig;
 import io.duckcluster.coordinator.catalog.ShardCatalog;
 import io.duckcluster.coordinator.execution.QueryExecutionService;
@@ -40,6 +41,33 @@ public final class MonitorService {
         this.queryExecutionService = queryExecutionService;
         this.heartbeatTimeout =
                 config.heartbeatInterval().multipliedBy(config.heartbeatMissThreshold());
+    }
+
+    public Map<String, Object> catalogTables() {
+        List<Map<String, Object>> tables = new ArrayList<>();
+        for (TableShardConfig table : clusterCatalog.listTables()) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("name", table.tableName());
+            entry.put("shardCount", table.shardCount());
+            entry.put("shardKey", table.shardKey());
+            entry.put("estimatedRowCount", clusterCatalog.estimatedRowCount(table.tableName()));
+            List<Map<String, String>> columns = new ArrayList<>();
+            for (TableColumn column : clusterCatalog.tableColumns(table.tableName())) {
+                Map<String, String> columnView = new LinkedHashMap<>();
+                columnView.put("name", column.name());
+                columnView.put("type", column.type());
+                columns.add(columnView);
+            }
+            if (!columns.isEmpty()) {
+                entry.put("columns", columns);
+            }
+            tables.add(entry);
+        }
+        return Map.of("tables", tables);
+    }
+
+    public boolean isReady() {
+        return registry.workerCount() > 0 && !clusterCatalog.getShardedTableNames().isEmpty();
     }
 
     public Map<String, Object> summary() {
