@@ -1,8 +1,10 @@
 package io.duckcluster.worker.duckdb;
 
+import io.duckcluster.common.duckdb.DuckDbResourceLimits;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
@@ -15,16 +17,30 @@ public final class DuckDBConnectionPool implements AutoCloseable {
     private final String jdbcUrl;
     private final ArrayBlockingQueue<Connection> pool;
     private final long waitMs;
+    private final long memoryLimitMb;
+    private final Path tempDirectory;
     private volatile boolean closed;
 
     public DuckDBConnectionPool(String dbPath, int poolSize, long waitMs) throws SQLException {
+        this(dbPath, poolSize, waitMs, 0, null);
+    }
+
+    public DuckDBConnectionPool(String dbPath, int poolSize, long waitMs, long memoryLimitMb, Path tempDirectory)
+            throws SQLException {
         this.jdbcUrl = "jdbc:duckdb:" + dbPath;
         this.pool = new ArrayBlockingQueue<>(poolSize);
         this.waitMs = waitMs;
+        this.memoryLimitMb = memoryLimitMb;
+        this.tempDirectory = tempDirectory;
         for (int i = 0; i < poolSize; i++) {
             pool.add(createConnection());
         }
-        LOG.info("Connection pool created: size={}, db={}, waitMs={}", poolSize, dbPath, waitMs);
+        LOG.info(
+                "Connection pool created: size={}, db={}, waitMs={}, memoryLimitMb={}",
+                poolSize,
+                dbPath,
+                waitMs,
+                memoryLimitMb);
     }
 
     public Connection checkout() throws InterruptedException {
@@ -82,7 +98,9 @@ public final class DuckDBConnectionPool implements AutoCloseable {
     }
 
     private Connection createConnection() throws SQLException {
-        return DriverManager.getConnection(jdbcUrl);
+        Connection connection = DriverManager.getConnection(jdbcUrl);
+        DuckDbResourceLimits.apply(connection, memoryLimitMb, 0, tempDirectory);
+        return connection;
     }
 
     private static void closeQuietly(Connection conn) {

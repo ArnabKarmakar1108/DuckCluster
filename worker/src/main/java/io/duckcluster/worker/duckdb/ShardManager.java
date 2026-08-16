@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
@@ -38,9 +39,7 @@ public final class ShardManager implements AutoCloseable {
         }
         String sql = String.format("ATTACH '%s' AS %s",
                 meta.filePath().toAbsolutePath(), catalogName);
-        try (Statement stmt = adminConnection.createStatement()) {
-            stmt.execute(sql);
-        }
+        executeAttach(sql, meta.filePath());
         attachedShards.put(catalogName, meta);
         LOG.info("Attached shard: {} -> {}", catalogName, meta.filePath());
     }
@@ -85,6 +84,25 @@ public final class ShardManager implements AutoCloseable {
         return count;
     }
 
+    private void executeAttach(String sql, Path filePath) throws SQLException {
+        try (Statement stmt = adminConnection.createStatement()) {
+            stmt.execute(sql);
+        } catch (SQLException e) {
+            String message = e.getMessage();
+            if (message != null
+                    && (message.toLowerCase().contains("serialization")
+                            || message.toLowerCase().contains("storage")
+                            || message.toLowerCase().contains("version"))) {
+                throw new SQLException(
+                        "DuckDB shard file may be incompatible with this worker JDBC driver: "
+                                + filePath.toAbsolutePath()
+                                + " (" + message + ")",
+                        e);
+            }
+            throw e;
+        }
+    }
+
     public synchronized void attachCachedShard(ShardFileMetadata meta) throws SQLException {
         String catalogName = meta.catalogName();
         if (cachedShards.containsKey(catalogName) || attachedShards.containsKey(catalogName)) {
@@ -92,9 +110,7 @@ public final class ShardManager implements AutoCloseable {
         }
         String sql = String.format("ATTACH '%s' AS %s (READ_ONLY)",
                 meta.filePath().toAbsolutePath(), catalogName);
-        try (Statement stmt = adminConnection.createStatement()) {
-            stmt.execute(sql);
-        }
+        executeAttach(sql, meta.filePath());
         cachedShards.put(catalogName, meta);
         LOG.info("Attached cached shard: {} -> {}", catalogName, meta.filePath());
     }
@@ -147,6 +163,45 @@ public final class ShardManager implements AutoCloseable {
     public Path getDataDir() {
         return dataDir;
     }
+
+    public long estimateRowCount(ShardFileMetadata meta) {
+        if (!attachedShards.containsKey(meta.catalogName())) {
+            return 0L;
+        }
+        String qualified = meta.catalogName() + "." + meta.tableName();
+        try (Statement statement = adminConnection.createStatement();
+                ResultSet resultSet = statement.executeQuery("SELECT COUNT(*) FROM " + qualified)) {
+            if (resultSet.next()) {
+                return resultSet.getLong(1);
+            }
+        } catch (SQLException e) {
+            LOG.debug("Could not estimate row count for {}: {}", qualified, e.getMessage());
+        }
+        return 0L;
+    }
+
+    public List<ShardColumnMetadata> describeTable(ShardFileMetadata meta) {
+        if (!attachedShards.containsKey(meta.catalogName())) {
+            return List.of();
+        }
+        String qualified = meta.catalogName() + "." + meta.tableName();
+        List<ShardColumnMetadata> columns = new ArrayList<>();
+        try (Statement statement = adminConnection.createStatement();
+                ResultSet resultSet = statement.executeQuery("DESCRIBE " + qualified)) {
+            while (resultSet.next()) {
+                String name = resultSet.getString("column_name");
+                String type = resultSet.getString("column_type");
+                if (name != null && !name.isBlank()) {
+                    columns.add(new ShardColumnMetadata(name, type != null ? type : "UNKNOWN"));
+                }
+            }
+        } catch (SQLException e) {
+            LOG.debug("Could not describe {}: {}", qualified, e.getMessage());
+        }
+        return columns;
+    }
+
+    public record ShardColumnMetadata(String name, String type) {}
 
     @Override
     public synchronized void close() {

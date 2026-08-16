@@ -1,8 +1,11 @@
 package io.duckcluster.coordinator.merger;
 
+import io.duckcluster.common.duckdb.DuckDbResourceLimits;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -20,26 +23,55 @@ import java.util.concurrent.TimeUnit;
 final class CoordinatorDuckDbPool implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(CoordinatorDuckDbPool.class);
     private static final String JDBC_URL = "jdbc:duckdb:";
-    private static final int DEFAULT_POOL_SIZE = 4;
     private static final long CHECKOUT_WAIT_MS = 30_000L;
 
-    private static final CoordinatorDuckDbPool INSTANCE = new CoordinatorDuckDbPool(DEFAULT_POOL_SIZE);
+    private static volatile CoordinatorDuckDbPool instance;
 
     static CoordinatorDuckDbPool get() {
-        return INSTANCE;
+        CoordinatorDuckDbPool pool = instance;
+        if (pool == null) {
+            synchronized (CoordinatorDuckDbPool.class) {
+                pool = instance;
+                if (pool == null) {
+                    pool = new CoordinatorDuckDbPool(4, 2048, null);
+                    instance = pool;
+                }
+            }
+        }
+        return pool;
+    }
+
+    static void initialize(int poolSize, long memoryLimitMb, Path tempDirectory) {
+        synchronized (CoordinatorDuckDbPool.class) {
+            if (instance != null) {
+                instance.close();
+            }
+            instance = new CoordinatorDuckDbPool(poolSize, memoryLimitMb, tempDirectory);
+        }
     }
 
     private final ArrayBlockingQueue<Connection> pool;
+    private final long memoryLimitMb;
+    private final Path tempDirectory;
     private volatile boolean closed;
 
-    private CoordinatorDuckDbPool(int poolSize) {
+    private CoordinatorDuckDbPool(int poolSize, long memoryLimitMb, Path tempDirectory) {
+        this.memoryLimitMb = memoryLimitMb;
+        this.tempDirectory = tempDirectory;
         this.pool = new ArrayBlockingQueue<>(poolSize);
         try {
+            if (tempDirectory != null) {
+                Files.createDirectories(tempDirectory);
+            }
             for (int i = 0; i < poolSize; i++) {
                 pool.add(createConnection());
             }
-            LOG.info("Coordinator merge DuckDB pool ready (size={})", poolSize);
-        } catch (SQLException e) {
+            LOG.info(
+                    "Coordinator merge DuckDB pool ready (size={}, memoryLimitMb={}, tempDir={})",
+                    poolSize,
+                    memoryLimitMb,
+                    tempDirectory);
+        } catch (Exception e) {
             throw new IllegalStateException("Failed to initialize coordinator DuckDB pool", e);
         }
     }
@@ -122,8 +154,10 @@ final class CoordinatorDuckDbPool implements AutoCloseable {
         }
     }
 
-    private static Connection createConnection() throws SQLException {
-        return DriverManager.getConnection(JDBC_URL);
+    private Connection createConnection() throws SQLException {
+        Connection connection = DriverManager.getConnection(JDBC_URL);
+        DuckDbResourceLimits.apply(connection, memoryLimitMb, 0, tempDirectory);
+        return connection;
     }
 
     private static void closeQuietly(Connection connection) {

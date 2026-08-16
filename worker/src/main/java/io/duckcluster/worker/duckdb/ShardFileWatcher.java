@@ -101,13 +101,7 @@ public final class ShardFileWatcher implements AutoCloseable {
 
     private void notifyCoordinator() {
         try {
-            List<ShardOwnership> ownedShards = shardManager.getAttachedShards().stream()
-                    .map(meta -> ShardOwnership.newBuilder()
-                            .setTableName(meta.tableName())
-                            .setShardId(meta.shardId())
-                            .setRowCount(0)
-                            .build())
-                    .toList();
+            var ownedShards = ShardOwnershipReporter.toOwnership(shardManager, shardManager.getAttachedShards());
             coordinatorClient.updateShardOwnership(workerId, ownedShards);
         } catch (Exception e) {
             LOG.warn("Failed to notify coordinator of ownership change: {}", e.getMessage());

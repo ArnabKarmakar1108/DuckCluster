@@ -1,13 +1,14 @@
 package io.duckcluster.worker;
 
 import io.duckcluster.common.config.ClusterConfig;
-import io.duckcluster.proto.v1.ShardOwnership;
 import io.duckcluster.worker.client.CoordinatorClient;
 import io.duckcluster.worker.duckdb.BroadcastMaterializer;
 import io.duckcluster.worker.duckdb.DuckDBConnectionPool;
 import io.duckcluster.worker.duckdb.FragmentExecutor;
+import io.duckcluster.worker.duckdb.RunningFragmentRegistry;
 import io.duckcluster.worker.duckdb.ShardFileWatcher;
 import io.duckcluster.worker.duckdb.ShardManager;
+import io.duckcluster.worker.duckdb.ShardOwnershipReporter;
 import io.duckcluster.worker.duckdb.TempShardCache;
 import io.duckcluster.worker.grpc.WorkerGrpcServer;
 import org.slf4j.Logger;
@@ -46,23 +47,39 @@ public final class WorkerMain {
             shardManager.scanAndAttachDimensions(dimensionsDir);
         }
 
-        DuckDBConnectionPool pool = new DuckDBConnectionPool(dbPath, config.poolSize(), config.poolWaitMs());
-        FragmentExecutor fragmentExecutor = new FragmentExecutor(pool);
+        Path duckdbTempDir = dataDir.resolve(".duckdb-tmp");
+        Files.createDirectories(duckdbTempDir);
+        DuckDBConnectionPool pool = new DuckDBConnectionPool(
+                dbPath, config.poolSize(), config.poolWaitMs(), config.workerMemoryLimitMb(), duckdbTempDir);
+        RunningFragmentRegistry runningFragments = new RunningFragmentRegistry();
+        FragmentExecutor fragmentExecutor = new FragmentExecutor(pool, runningFragments);
         BroadcastMaterializer broadcastMaterializer = new BroadcastMaterializer(pool);
         CoordinatorClient coordinatorClient = new CoordinatorClient(config);
 
         Path cacheDir = dataDir.resolve(".cache");
+        Path transferTempDir = dataDir.resolve(".transfer-tmp");
+        Files.createDirectories(transferTempDir);
         TempShardCache tempShardCache = new TempShardCache(
-                shardManager, coordinatorClient, workerId, cacheDir, config.cacheMaxShards());
+                shardManager, coordinatorClient, workerId, cacheDir, config.cacheMaxShards(), config.shardPinLeaseMs());
 
         WorkerGrpcServer workerServer = new WorkerGrpcServer(
-                workerId, host, port, fragmentExecutor, shardManager, tempShardCache, broadcastMaterializer);
+                workerId, host, port, fragmentExecutor, runningFragments, shardManager, tempShardCache,
+                broadcastMaterializer, transferTempDir, config.grpcMaxInboundMessageBytes());
 
         ShardFileWatcher watcher = new ShardFileWatcher(
                 dataDir, shardManager, coordinatorClient, workerId, config.watcherIntervalMs());
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Shutting down worker {}", workerId);
+            long drainDeadline = System.currentTimeMillis() + 30_000;
+            while (fragmentExecutor.inFlightCount() > 0 && System.currentTimeMillis() < drainDeadline) {
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
             watcher.close();
             tempShardCache.close();
             workerServer.stop();
@@ -72,21 +89,27 @@ public final class WorkerMain {
 
         workerServer.start();
 
-        List<ShardOwnership> ownedShards = shardManager.getAttachedShards().stream()
-                .map(meta -> ShardOwnership.newBuilder()
-                        .setTableName(meta.tableName())
-                        .setShardId(meta.shardId())
-                        .setRowCount(0)
-                        .build())
-                .toList();
-        coordinatorClient.registerWorker(workerId, host, port, numThreads, ownedShards);
-        coordinatorClient.startHeartbeat(workerId, config.heartbeatInterval());
+        coordinatorClient.setReconnectHandler(() -> registerWithCoordinator(
+                coordinatorClient, shardManager, workerId, host, port, numThreads));
+        registerWithCoordinator(coordinatorClient, shardManager, workerId, host, port, numThreads);
+        coordinatorClient.startHeartbeat(
+                workerId, config.heartbeatInterval(), () -> fragmentExecutor.loadFactor(numThreads));
 
         LOG.info("Worker {} ready at {}:{} (pool size={}, shards={}, coordinator gRPC {}:{})",
-                workerId, host, port, config.poolSize(), ownedShards.size(),
+                workerId, host, port, config.poolSize(), shardManager.getAttachedShards().size(),
                 config.coordinatorHost(), config.coordinatorGrpcPort());
 
         Thread.currentThread().join();
     }
 
+    private static void registerWithCoordinator(
+            CoordinatorClient coordinatorClient,
+            ShardManager shardManager,
+            String workerId,
+            String host,
+            int port,
+            int numThreads) {
+        var ownedShards = ShardOwnershipReporter.toOwnership(shardManager, shardManager.getAttachedShards());
+        coordinatorClient.registerWorker(workerId, host, port, numThreads, ownedShards);
+    }
 }
