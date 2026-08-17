@@ -3,6 +3,7 @@ package io.duckcluster.coordinator.merger;
 import io.duckcluster.common.merger.FragmentResult;
 import io.duckcluster.common.merger.MergeContext;
 import io.duckcluster.common.merger.RowBatchData;
+import io.duckcluster.common.model.PlannedQuery;
 import io.duckcluster.common.model.QueryAnalysis;
 import io.duckcluster.common.planner.MergeSqlBuilder;
 
@@ -11,6 +12,14 @@ import java.util.List;
 
 final class MergeSqlColumns {
     private MergeSqlColumns() {}
+
+    static List<String> fromPlannedQuery(PlannedQuery plan) {
+        List<String> columns = MergeSqlBuilder.tempTableColumns(plan.analysis());
+        if (isValid(columns)) {
+            return columns;
+        }
+        throw new IllegalStateException("Cannot stream merge without known temp table columns from the plan");
+    }
 
     static List<String> fromContext(MergeContext context) {
         List<String> columns = MergeSqlBuilder.tempTableColumns(context.plan().analysis());
