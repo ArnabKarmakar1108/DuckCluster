@@ -10,7 +10,7 @@ WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl python3 python3-pip \
-    && pip3 install --no-cache-dir duckdb \
+    && pip3 install --no-cache-dir 'duckdb==1.1.3' \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /build/coordinator/target/duckcluster-coordinator-0.1.0-SNAPSHOT.jar /app/coordinator.jar

@@ -17,3 +17,4 @@ benchmark/dependency-reduced-pom.xml
 __pycache__/
 *.py[cod]
 .pytest_cache/
+docs/study-guide
