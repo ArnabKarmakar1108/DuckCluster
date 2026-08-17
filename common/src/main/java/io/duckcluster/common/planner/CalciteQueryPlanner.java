@@ -43,17 +43,17 @@ public final class CalciteQueryPlanner implements QueryPlanner {
             .withConformance(SqlConformanceEnum.PRAGMATIC_2003);
 
     @Override
-    public PlannedQuery plan(String sql, ClusterCatalog catalog) {
+    public PlannedQuery plan(String sql, ClusterCatalog catalog, String queryId) {
         SqlNode parsed = parse(sql);
         SqlWith with = extractWith(parsed);
         if (with != null) {
-            return planWithCte(sql, parsed, with, catalog);
+            return planWithCte(sql, parsed, with, catalog, queryId);
         }
         SqlSelect select = asSelect(parsed);
 
         Optional<NestedDerivedTableDetector.Match> nested = NestedDerivedTableDetector.detect(select, parsed);
         if (nested.isPresent()) {
-            return planNestedDerivedTable(sql, parsed, nested.get(), catalog);
+            return planNestedDerivedTable(sql, parsed, nested.get(), catalog, queryId);
         }
 
         TableClassification classification = classifyTables(select, catalog);
@@ -74,15 +74,15 @@ public final class CalciteQueryPlanner implements QueryPlanner {
                 select, catalog, classification.broadcastTables(), drivingTable);
         List<String> correlatedCoPartition = correlatedCoPartitionTables(
                 select, catalog, classification.broadcastTables(), subqueryBroadcasts, drivingTable);
-        Set<String> materializedBroadcastTables = materializedBroadcastTables(
-                classification.broadcastTables(), subqueryBroadcasts);
+        BroadcastScope broadcastScope = BroadcastScope.of(
+                materializedBroadcastTables(classification.broadcastTables(), subqueryBroadcasts), queryId);
 
         List<FragmentSpec> fragments = new ArrayList<>(shardCount);
         for (int shardId = 0; shardId < shardCount; shardId++) {
         TopKSpec fragmentTopK = MergePushdownPlanner.fragmentTopK(analysis, topK, shardCount);
             String fragmentSql = FragmentSqlGenerator.generate(
                     select, shardId, analysis, drivingTable, broadcastShardCounts,
-                    catalogTableShardCounts, fragmentTopK, materializedBroadcastTables);
+                    catalogTableShardCounts, fragmentTopK, broadcastScope);
             fragments.add(new FragmentSpec(shardId, shardId, fragmentSql, mergeStrategy));
         }
 
@@ -91,7 +91,8 @@ public final class CalciteQueryPlanner implements QueryPlanner {
                 correlatedCoPartition);
     }
 
-    private PlannedQuery planWithCte(String sql, SqlNode parsed, SqlWith with, ClusterCatalog catalog) {
+    private PlannedQuery planWithCte(
+            String sql, SqlNode parsed, SqlWith with, ClusterCatalog catalog, String queryId) {
         SqlSelect cteSelect = WithClauseExpander.firstCteSelect(with);
         if (cteSelect.getGroup() == null || cteSelect.getGroup().isEmpty()) {
             throw new IllegalArgumentException("WITH CTE body must include GROUP BY for distributed planning");
@@ -129,11 +130,12 @@ public final class CalciteQueryPlanner implements QueryPlanner {
                 outerTopK);
 
         List<FragmentSpec> fragments = new ArrayList<>(shardCount);
-        Set<String> materializedBroadcastTables = materializedBroadcastTables(classification.broadcastTables());
+        BroadcastScope broadcastScope = BroadcastScope.of(
+                materializedBroadcastTables(classification.broadcastTables()), queryId);
         for (int shardId = 0; shardId < shardCount; shardId++) {
             String fragmentSql = FragmentSqlGenerator.generate(
                     cteSelect, shardId, innerAnalysis, drivingTable, broadcastShardCounts,
-                    catalogTableShardCounts, TopKSpec.none(), materializedBroadcastTables);
+                    catalogTableShardCounts, TopKSpec.none(), broadcastScope);
             fragments.add(new FragmentSpec(shardId, shardId, fragmentSql, MergeStrategyType.WITH_CTE_MERGE));
         }
 
@@ -146,7 +148,8 @@ public final class CalciteQueryPlanner implements QueryPlanner {
             String sql,
             SqlNode parsed,
             NestedDerivedTableDetector.Match nested,
-            ClusterCatalog catalog) {
+            ClusterCatalog catalog,
+            String queryId) {
         SqlSelect innerSelect = nested.innerSelect();
 
         TableClassification classification = classifyTables(innerSelect, catalog);
@@ -172,14 +175,14 @@ public final class CalciteQueryPlanner implements QueryPlanner {
                 innerSelect, catalog, classification.broadcastTables(), drivingTable);
         List<String> correlatedCoPartition = correlatedCoPartitionTables(
                 innerSelect, catalog, classification.broadcastTables(), subqueryBroadcasts, drivingTable);
-        Set<String> materializedBroadcastTables = materializedBroadcastTables(
-                classification.broadcastTables(), subqueryBroadcasts);
+        BroadcastScope broadcastScope = BroadcastScope.of(
+                materializedBroadcastTables(classification.broadcastTables(), subqueryBroadcasts), queryId);
 
         List<FragmentSpec> fragments = new ArrayList<>(shardCount);
         for (int shardId = 0; shardId < shardCount; shardId++) {
             String fragmentSql = FragmentSqlGenerator.generate(
                     innerSelect, shardId, innerAnalysis, drivingTable, broadcastShardCounts,
-                    catalogTableShardCounts, TopKSpec.none(), materializedBroadcastTables);
+                    catalogTableShardCounts, TopKSpec.none(), broadcastScope);
             fragments.add(new FragmentSpec(shardId, shardId, fragmentSql, mergeStrategy));
         }
 
@@ -247,6 +250,17 @@ public final class CalciteQueryPlanner implements QueryPlanner {
             if (count >= maxShards) {
                 drivingTable = t;
                 maxShards = count;
+            }
+        }
+        long bestRowEstimate = catalog.estimatedRowCount(drivingTable);
+        for (String t : allTables) {
+            if (catalog.table(t).shardCount() != maxShards) {
+                continue;
+            }
+            long rowEstimate = catalog.estimatedRowCount(t);
+            if (rowEstimate > bestRowEstimate) {
+                bestRowEstimate = rowEstimate;
+                drivingTable = t;
             }
         }
 

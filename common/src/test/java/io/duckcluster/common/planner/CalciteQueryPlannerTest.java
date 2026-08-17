@@ -145,6 +145,23 @@ class CalciteQueryPlannerTest {
     }
 
     @Test
+    void planScopesBroadcastTempTablesToQueryId() {
+        ClusterCatalog joinCatalog = ClusterCatalog.withTables(Map.of(
+                "lineitem", new TableShardConfig("lineitem", 4, "l_orderkey"),
+                "orders", new TableShardConfig("orders", 4, "o_orderkey")));
+
+        PlannedQuery planned = planner.plan(
+                "SELECT o.o_orderpriority, COUNT(*) FROM lineitem l JOIN orders o ON l.l_orderkey = o.o_orderkey GROUP BY o.o_orderpriority",
+                joinCatalog,
+                "query-42");
+
+        String sql0 = planned.fragments().get(0).sql();
+        assertTrue(sql0.contains("__dc_bcast_query-42_lineitem"),
+                "Broadcast table is query-scoped: " + sql0);
+        assertTrue(!sql0.contains("UNION ALL"), "Broadcast avoids per-fragment UNION ALL: " + sql0);
+    }
+
+    @Test
     void planHandlesDifferentShardCounts() {
         ClusterCatalog joinCatalog = ClusterCatalog.withTables(Map.of(
                 "lineitem", new TableShardConfig("lineitem", 6, "l_orderkey"),
@@ -201,6 +218,22 @@ class CalciteQueryPlannerTest {
         assertTrue(sql0.contains("\"lineitem_shard0\".\"lineitem\""), "Driving table: " + sql0);
         assertTrue(sql0.contains("\"supplier_shard0\".\"supplier\""), "Broadcast supplier: " + sql0);
         assertTrue(sql0.contains("\"nation_shard0\".\"nation\""), "Broadcast nation: " + sql0);
+    }
+
+    @Test
+    void drivingTablePrefersLargerRowEstimateAmongSameShardCount() {
+        ClusterCatalog joinCatalog = ClusterCatalog.withTables(Map.of(
+                "orders", new TableShardConfig("orders", 3, "o_orderkey"),
+                "lineitem", new TableShardConfig("lineitem", 3, "l_orderkey")));
+        joinCatalog.replaceEstimatedRowCounts(Map.of("orders", 1_000L, "lineitem", 50_000L));
+
+        PlannedQuery planned = planner.plan(
+                "SELECT o.o_orderkey, l.l_linenumber FROM orders o JOIN lineitem l ON o.o_orderkey = l.l_orderkey",
+                joinCatalog);
+
+        assertEquals("lineitem", planned.tableName());
+        assertEquals(1, planned.broadcastTables().size());
+        assertEquals("orders", planned.broadcastTables().get(0).tableName());
     }
 
     @Test
