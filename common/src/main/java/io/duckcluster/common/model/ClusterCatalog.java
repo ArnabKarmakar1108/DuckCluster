@@ -13,6 +13,24 @@ public final class ClusterCatalog {
 
     public ClusterCatalog() {}
 
+    public synchronized void declareTable(TableShardConfig config) {
+        if (config == null) {
+            throw new IllegalArgumentException("table config is required");
+        }
+        tables.put(config.tableName().toLowerCase(), config);
+    }
+
+    public synchronized boolean removeTable(String tableName) {
+        if (tableName == null || tableName.isBlank()) {
+            return false;
+        }
+        String key = tableName.toLowerCase();
+        boolean removed = tables.remove(key) != null;
+        estimatedRowCounts.remove(key);
+        tableColumns.remove(key);
+        return removed;
+    }
+
     public synchronized void registerTable(String tableName, int shardCount) {
         String key = tableName.toLowerCase();
         TableShardConfig existing = tables.get(key);
