@@ -1,5 +1,6 @@
 package io.duckcluster.coordinator.replication;
 
+import io.duckcluster.common.config.ClusterConfig;
 import io.duckcluster.common.registry.WorkerRegistry;
 import io.duckcluster.coordinator.catalog.ShardCatalog;
 import io.duckcluster.coordinator.worker.WorkerNodeClient;
@@ -17,32 +18,34 @@ import java.util.concurrent.TimeUnit;
 
 public final class ShardReplicator implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(ShardReplicator.class);
-    private static final int MAX_CONCURRENT_REPLICATIONS = 2;
-    private static final long RECONCILE_INTERVAL_SECONDS = 30;
+    private final int maxConcurrentReplications;
+    private final long reconcileIntervalMs;
 
     private final ShardCatalog shardCatalog;
     private final WorkerRegistry registry;
     private final WorkerNodeClient workerClient;
     private final ScheduledExecutorService executor;
-    private final Semaphore replicationSlots = new Semaphore(MAX_CONCURRENT_REPLICATIONS);
+    private final Semaphore replicationSlots;
 
-    public ShardReplicator(ShardCatalog shardCatalog, WorkerRegistry registry,
+    public ShardReplicator(ClusterConfig config, ShardCatalog shardCatalog, WorkerRegistry registry,
                            WorkerNodeClient workerClient) {
+        this.maxConcurrentReplications = config.replicationMaxConcurrent();
+        this.reconcileIntervalMs = config.replicationReconcileIntervalMs();
         this.shardCatalog = shardCatalog;
         this.registry = registry;
         this.workerClient = workerClient;
-        this.executor = Executors.newScheduledThreadPool(MAX_CONCURRENT_REPLICATIONS + 1, r -> {
+        this.executor = Executors.newScheduledThreadPool(maxConcurrentReplications + 1, r -> {
             Thread thread = new Thread(r, "shard-replicator");
             thread.setDaemon(true);
             return thread;
         });
+        this.replicationSlots = new Semaphore(maxConcurrentReplications);
     }
 
     public void start() {
-        executor.scheduleWithFixedDelay(
-                this::reconcile, RECONCILE_INTERVAL_SECONDS, RECONCILE_INTERVAL_SECONDS, TimeUnit.SECONDS);
-        LOG.info("ShardReplicator started (interval={}s, maxConcurrent={})",
-                RECONCILE_INTERVAL_SECONDS, MAX_CONCURRENT_REPLICATIONS);
+        long intervalSec = Math.max(1, reconcileIntervalMs / 1000);
+        executor.scheduleWithFixedDelay(this::reconcile, intervalSec, intervalSec, TimeUnit.SECONDS);
+        LOG.info("ShardReplicator started (interval={}s, maxConcurrent={})", intervalSec, maxConcurrentReplications);
     }
 
     public void triggerReconcile() {
