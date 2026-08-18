@@ -6,6 +6,7 @@ import io.duckcluster.common.planner.CalciteQueryPlanner;
 import io.duckcluster.common.registry.WorkerRegistry;
 import io.duckcluster.common.routing.ConsistentHashRing;
 import io.duckcluster.coordinator.catalog.ShardCatalog;
+import io.duckcluster.coordinator.config.EffectiveClusterConfigLogger;
 import io.duckcluster.coordinator.execution.AsyncQueryService;
 import io.duckcluster.coordinator.execution.QueryAdmissionControl;
 import io.duckcluster.coordinator.execution.QueryExecutionService;
@@ -13,6 +14,7 @@ import io.duckcluster.coordinator.grpc.CoordinatorGrpcServer;
 import io.duckcluster.coordinator.health.HeartbeatMonitor;
 import io.duckcluster.coordinator.http.CoordinatorHttpServer;
 import io.duckcluster.coordinator.merger.CoordinatorMergeRuntime;
+import io.duckcluster.coordinator.merger.MergeExecutionService;
 import io.duckcluster.coordinator.merger.MergeStrategyRegistry;
 import io.duckcluster.coordinator.metadata.MetadataSnapshotService;
 import io.duckcluster.coordinator.monitor.CoordinatorMetrics;
@@ -31,6 +33,7 @@ public final class CoordinatorMain {
 
     public static void main(String[] args) throws Exception {
         ClusterConfig config = ClusterConfig.fromEnvironment();
+        EffectiveClusterConfigLogger.log(config);
         WorkerRegistry registry = new WorkerRegistry();
         ClusterCatalog catalog = new ClusterCatalog();
 
@@ -45,6 +48,7 @@ public final class CoordinatorMain {
 
         QueryActivityTracker activityTracker = new QueryActivityTracker();
         QueryAdmissionControl admission = new QueryAdmissionControl(config.maxConcurrentQueries());
+        MergeExecutionService mergeExecutionService = new MergeExecutionService(config.mergePoolSize());
         QueryExecutionService queryExecutionService = new QueryExecutionService(
                 new CalciteQueryPlanner(),
                 catalog,
@@ -54,7 +58,8 @@ public final class CoordinatorMain {
                 shardCatalog,
                 config,
                 activityTracker,
-                admission);
+                admission,
+                mergeExecutionService);
 
         MonitorService monitorService = new MonitorService(
                 config, registry, shardCatalog, catalog, activityTracker, queryExecutionService);
@@ -62,7 +67,7 @@ public final class CoordinatorMain {
         AsyncQueryService asyncQueryService =
                 new AsyncQueryService(queryExecutionService, activityTracker, config, admission);
 
-        ShardReplicator shardReplicator = new ShardReplicator(shardCatalog, registry, workerClient);
+        ShardReplicator shardReplicator = new ShardReplicator(config, shardCatalog, registry, workerClient);
         HeartbeatMonitor heartbeatMonitor = new HeartbeatMonitor(
                 registry, shardCatalog, shardReplicator, channelPool,
                 config.heartbeatInterval(),
@@ -100,6 +105,7 @@ public final class CoordinatorMain {
             httpServer.stop();
             grpcServer.stop();
             channelPool.close();
+            mergeExecutionService.close();
             CoordinatorMergeRuntime.shutdown();
         }));
 

@@ -14,6 +14,7 @@ import io.duckcluster.common.model.QueryResult;
 import io.duckcluster.common.planner.QueryPlanner;
 import io.duckcluster.common.registry.WorkerRegistry;
 import io.duckcluster.coordinator.catalog.ShardCatalog;
+import io.duckcluster.coordinator.merger.MergeExecutionService;
 import io.duckcluster.coordinator.merger.MergeStreamRegistry;
 import io.duckcluster.coordinator.merger.MergeStrategyRegistry;
 import io.duckcluster.coordinator.monitor.QueryActivityTracker;
@@ -64,6 +65,7 @@ public final class QueryExecutionService {
     private final long queryTimeoutMs;
     private final QueryAdmissionControl admission;
     private final QueryActivityTracker activityTracker;
+    private final MergeExecutionService mergeExecutionService;
     private final ConcurrentHashMap<String, ActiveQueryHandle> activeQueries = new ConcurrentHashMap<>();
     private static final int PREFETCH_MAX_ATTEMPTS = 3;
 
@@ -77,9 +79,34 @@ public final class QueryExecutionService {
             ClusterConfig config,
             QueryActivityTracker activityTracker,
             QueryAdmissionControl admission) {
+        this(
+                planner,
+                catalog,
+                registry,
+                workerClient,
+                mergeStrategyRegistry,
+                shardCatalog,
+                config,
+                activityTracker,
+                admission,
+                new MergeExecutionService(config.mergePoolSize()));
+    }
+
+    public QueryExecutionService(
+            QueryPlanner planner,
+            ClusterCatalog catalog,
+            WorkerRegistry registry,
+            WorkerNodeClient workerClient,
+            MergeStrategyRegistry mergeStrategyRegistry,
+            ShardCatalog shardCatalog,
+            ClusterConfig config,
+            QueryActivityTracker activityTracker,
+            QueryAdmissionControl admission,
+            MergeExecutionService mergeExecutionService) {
         this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog,
                 config.fragmentWaitMs(), config.logFragmentSql(), config.shardPinLeaseMs(),
-                config.maxConcurrentFragments(), config.queryTimeoutMs(), activityTracker, admission);
+                config.maxConcurrentFragments(), config.queryTimeoutMs(), activityTracker, admission,
+                mergeExecutionService);
     }
 
     QueryExecutionService(
@@ -91,7 +118,8 @@ public final class QueryExecutionService {
             ShardCatalog shardCatalog,
             long fragmentWaitMs) {
         this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog, fragmentWaitMs, false,
-                TimeUnit.MINUTES.toMillis(10), 64, 0, null, new QueryAdmissionControl(32));
+                TimeUnit.MINUTES.toMillis(10), 64, 0, null, new QueryAdmissionControl(32),
+                new MergeExecutionService(4));
     }
 
     QueryExecutionService(
@@ -105,7 +133,7 @@ public final class QueryExecutionService {
             boolean logFragmentSql) {
         this(planner, catalog, registry, workerClient, mergeStrategyRegistry, shardCatalog,
                 fragmentWaitMs, logFragmentSql, TimeUnit.MINUTES.toMillis(10), 64, 0, null,
-                new QueryAdmissionControl(32));
+                new QueryAdmissionControl(32), new MergeExecutionService(4));
     }
 
     QueryExecutionService(
@@ -121,7 +149,8 @@ public final class QueryExecutionService {
             int maxConcurrentFragments,
             long queryTimeoutMs,
             QueryActivityTracker activityTracker,
-            QueryAdmissionControl admission) {
+            QueryAdmissionControl admission,
+            MergeExecutionService mergeExecutionService) {
         this.planner = planner;
         this.catalog = catalog;
         this.registry = registry;
@@ -135,6 +164,7 @@ public final class QueryExecutionService {
         this.queryTimeoutMs = queryTimeoutMs;
         this.admission = admission;
         this.activityTracker = activityTracker;
+        this.mergeExecutionService = mergeExecutionService;
         int poolSize = Math.max(1, maxConcurrentFragments);
         this.fragmentAdmission = new Semaphore(poolSize);
         this.fragmentExecutor = Executors.newFixedThreadPool(poolSize, r -> {
@@ -151,6 +181,14 @@ public final class QueryExecutionService {
                 .orElse(0.0);
     }
 
+    public PlannedQuery explainPlan(String sql) {
+        try {
+            return planner.plan(sql, catalog, UUID.randomUUID().toString());
+        } catch (IllegalArgumentException planningError) {
+            throw new ApiException(ApiErrorCode.PLANNING_ERROR, planningError.getMessage(), planningError);
+        }
+    }
+
     public QueryResult execute(String sql) {
         return execute(UUID.randomUUID().toString(), sql);
     }
@@ -160,6 +198,10 @@ public final class QueryExecutionService {
     }
 
     public QueryResult execute(String queryId, String sql, boolean acquireAdmission) {
+        return execute(queryId, sql, acquireAdmission, null);
+    }
+
+    public QueryResult execute(String queryId, String sql, boolean acquireAdmission, QueryResultSpool spool) {
         if (acquireAdmission && !admission.tryAcquire()) {
             throw new QueryRejectedException("too many concurrent queries");
         }
@@ -267,16 +309,40 @@ public final class QueryExecutionService {
                         outcome.workerId,
                         outcome.durationMs,
                         outcome.batches));
+                if (spool != null && plan.mergeStrategy() == MergeStrategyType.CONCATENATE) {
+                    for (RowBatchData batch : outcome.batches) {
+                        spool.appendBatch(batch);
+                    }
+                }
                 LOG.debug("Query [{}] fragment {} completed on {} ({}ms)",
                         queryId, fragment.fragmentId(), outcome.workerId, outcome.durationMs);
                 trackFragmentDone(queryId);
             }
 
             long durationMs = System.currentTimeMillis() - startMs;
+            if (spool != null && plan.mergeStrategy() == MergeStrategyType.CONCATENATE) {
+                QueryResult.QueryStats stats = new QueryResult.QueryStats(
+                        MergeStrategyType.CONCATENATE,
+                        workerDurationsMs.size(),
+                        fragmentResults.size(),
+                        durationMs,
+                        workerDurationsMs);
+                QueryResult streamed = new QueryResult(queryId, spool.columns(), List.of(), stats);
+                LOG.info("Query [{}] complete (streamed concat): {}ms, {} fragments, {} workers",
+                        queryId, durationMs, plan.fragments().size(), workerDurationsMs.size());
+                QueryResult timed = withTiming(streamed, durationMs, workerDurationsMs);
+                trackComplete(queryId, timed);
+                return timed;
+            }
+
             Map<String, RowBatchData> coordinatorTables = fetchCoordinatorTables(queryId, plan);
             MergeContext context = new MergeContext(queryId, plan, fragmentResults, durationMs, coordinatorTables);
             trackPhase(queryId, QueryActivityTracker.Phase.MERGE);
-            QueryResult merged = mergeStrategy.merge(context);
+            QueryResult merged = mergeExecutionService.run(() -> mergeStrategy.merge(context));
+            if (spool != null && !merged.rows().isEmpty()) {
+                spool.writeAll(merged.columns(), merged.rows());
+                merged = new QueryResult(merged.queryId(), merged.columns(), List.of(), merged.stats());
+            }
             LOG.info("Query [{}] complete: {}ms, {} fragments, {} workers",
                     queryId, durationMs, plan.fragments().size(), workerDurationsMs.size());
             QueryResult timed = withTiming(merged, durationMs, workerDurationsMs);
