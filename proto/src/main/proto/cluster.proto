@@ -34,6 +34,7 @@ message RegisterWorkerRequest {
   int32 port = 3;
   int32 num_threads = 4;
   repeated ShardOwnership owned_shards = 5;
+  uint32 protocol_version = 6;
 }
 
 message ColumnSchema {
@@ -61,6 +62,7 @@ message RegisterWorkerResponse {
   bool accepted = 1;
   string message = 2;
   uint64 coordinator_boot_epoch = 3;
+  uint32 coordinator_protocol_version = 4;
 }
 
 message HeartbeatRequest {
