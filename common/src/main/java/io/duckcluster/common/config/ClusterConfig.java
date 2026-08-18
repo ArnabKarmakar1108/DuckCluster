@@ -34,6 +34,10 @@ public final class ClusterConfig {
     private final long mergeMemoryLimitMb;
     private final long workerMemoryLimitMb;
     private final long metadataSnapshotIntervalMs;
+    private final int replicationMaxConcurrent;
+    private final long replicationReconcileIntervalMs;
+    private final int fragmentBatchRows;
+    private final int shardTransferChunkBytes;
     private final int grpcMaxInboundMessageBytes;
     private final boolean grpcUseCompression;
 
@@ -68,6 +72,10 @@ public final class ClusterConfig {
             long mergeMemoryLimitMb,
             long workerMemoryLimitMb,
             long metadataSnapshotIntervalMs,
+            int replicationMaxConcurrent,
+            long replicationReconcileIntervalMs,
+            int fragmentBatchRows,
+            int shardTransferChunkBytes,
             int grpcMaxInboundMessageBytes,
             boolean grpcUseCompression) {
         this.coordinatorHost = Objects.requireNonNull(coordinatorHost, "coordinatorHost");
@@ -101,6 +109,10 @@ public final class ClusterConfig {
         this.mergeMemoryLimitMb = mergeMemoryLimitMb;
         this.workerMemoryLimitMb = workerMemoryLimitMb;
         this.metadataSnapshotIntervalMs = metadataSnapshotIntervalMs;
+        this.replicationMaxConcurrent = Math.max(1, replicationMaxConcurrent);
+        this.replicationReconcileIntervalMs = Math.max(5_000L, replicationReconcileIntervalMs);
+        this.fragmentBatchRows = Math.max(1, fragmentBatchRows);
+        this.shardTransferChunkBytes = Math.max(4096, shardTransferChunkBytes);
         this.grpcMaxInboundMessageBytes = Math.max(1024 * 1024, grpcMaxInboundMessageBytes);
         this.grpcUseCompression = grpcUseCompression;
     }
@@ -127,6 +139,8 @@ public final class ClusterConfig {
                 Duration.ofMinutes(30).toMillis(), 200, 64L * 1024 * 1024,
                 Duration.ofMinutes(10).toMillis(), Duration.ofMinutes(2).toMillis(), 64, 8,
                 2, 32, Duration.ofMinutes(5).toMillis(), 4, 2048, 4096, Duration.ofMinutes(5).toMillis(),
+                2, Duration.ofSeconds(30).toMillis(),
+                1024, 64 * 1024,
                 32 * 1024 * 1024,
                 true);
     }
@@ -164,8 +178,31 @@ public final class ClusterConfig {
                 parseLong("DUCKCLUSTER_MERGE_MEMORY_LIMIT_MB", 2048),
                 parseLong("DUCKCLUSTER_WORKER_MEMORY_LIMIT_MB", 4096),
                 Duration.ofSeconds(parseInt("DUCKCLUSTER_METADATA_SNAPSHOT_INTERVAL_SEC", 300)).toMillis(),
+                parseInt("DUCKCLUSTER_REPLICATION_MAX_CONCURRENT", 2),
+                Duration.ofSeconds(parseInt("DUCKCLUSTER_REPLICATION_RECONCILE_INTERVAL_SEC", 30)).toMillis(),
+                parseInt("DUCKCLUSTER_FRAGMENT_BATCH_ROWS", 1024),
+                parseInt("DUCKCLUSTER_SHARD_TRANSFER_CHUNK_BYTES", 64 * 1024),
                 parseInt("DUCKCLUSTER_GRPC_MAX_INBOUND_MB", 32) * 1024 * 1024,
-                parseBoolean("DUCKCLUSTER_GRPC_COMPRESSION", true));
+                parseBoolean("DUCKCLUSTER_GRPC_COMPRESSION", true)).validate();
+    }
+
+    public ClusterConfig validate() {
+        if (coordinatorGrpcPort < 1 || coordinatorGrpcPort > 65535) {
+            throw new IllegalArgumentException("invalid coordinator gRPC port: " + coordinatorGrpcPort);
+        }
+        if (coordinatorHttpPort < 1 || coordinatorHttpPort > 65535) {
+            throw new IllegalArgumentException("invalid coordinator HTTP port: " + coordinatorHttpPort);
+        }
+        if (replicationFactor < 1) {
+            throw new IllegalArgumentException("replication factor must be >= 1");
+        }
+        if (maxConcurrentQueries < 1) {
+            throw new IllegalArgumentException("max concurrent queries must be >= 1");
+        }
+        if (mergePoolSize < 1) {
+            throw new IllegalArgumentException("merge pool size must be >= 1");
+        }
+        return this;
     }
 
     public String coordinatorHost() {
@@ -286,6 +323,22 @@ public final class ClusterConfig {
 
     public long metadataSnapshotIntervalMs() {
         return metadataSnapshotIntervalMs;
+    }
+
+    public int replicationMaxConcurrent() {
+        return replicationMaxConcurrent;
+    }
+
+    public long replicationReconcileIntervalMs() {
+        return replicationReconcileIntervalMs;
+    }
+
+    public int fragmentBatchRows() {
+        return fragmentBatchRows;
+    }
+
+    public int shardTransferChunkBytes() {
+        return shardTransferChunkBytes;
     }
 
     public int grpcMaxInboundMessageBytes() {
