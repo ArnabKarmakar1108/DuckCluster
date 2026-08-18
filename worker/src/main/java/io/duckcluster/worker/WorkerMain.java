@@ -52,7 +52,8 @@ public final class WorkerMain {
         DuckDBConnectionPool pool = new DuckDBConnectionPool(
                 dbPath, config.poolSize(), config.poolWaitMs(), config.workerMemoryLimitMb(), duckdbTempDir);
         RunningFragmentRegistry runningFragments = new RunningFragmentRegistry();
-        FragmentExecutor fragmentExecutor = new FragmentExecutor(pool, runningFragments);
+        FragmentExecutor fragmentExecutor =
+                new FragmentExecutor(pool, runningFragments, config.fragmentBatchRows());
         BroadcastMaterializer broadcastMaterializer = new BroadcastMaterializer(pool);
         CoordinatorClient coordinatorClient = new CoordinatorClient(config);
 
@@ -64,7 +65,8 @@ public final class WorkerMain {
 
         WorkerGrpcServer workerServer = new WorkerGrpcServer(
                 workerId, host, port, fragmentExecutor, runningFragments, shardManager, tempShardCache,
-                broadcastMaterializer, transferTempDir, config.grpcMaxInboundMessageBytes());
+                broadcastMaterializer, transferTempDir, config.grpcMaxInboundMessageBytes(),
+                config.shardTransferChunkBytes());
 
         ShardFileWatcher watcher = new ShardFileWatcher(
                 dataDir, shardManager, coordinatorClient, workerId, config.watcherIntervalMs());

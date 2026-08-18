@@ -1,6 +1,7 @@
 package io.duckcluster.worker.client;
 
 import io.duckcluster.common.config.ClusterConfig;
+import io.duckcluster.common.config.ClusterProtocol;
 import io.duckcluster.proto.v1.CoordinatorServiceGrpc;
 import io.duckcluster.proto.v1.HeartbeatRequest;
 import io.duckcluster.proto.v1.HeartbeatResponse;
@@ -58,6 +59,7 @@ public final class CoordinatorClient implements AutoCloseable {
                 .setPort(port)
                 .setNumThreads(numThreads)
                 .addAllOwnedShards(ownedShards)
+                .setProtocolVersion(ClusterProtocol.CURRENT)
                 .build();
         RegisterWorkerResponse response = blockingStub.registerWorker(request);
         if (!response.getAccepted()) {

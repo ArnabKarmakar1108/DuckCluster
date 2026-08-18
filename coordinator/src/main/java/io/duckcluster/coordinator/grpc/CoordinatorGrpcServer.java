@@ -1,6 +1,7 @@
 package io.duckcluster.coordinator.grpc;
 
 import io.duckcluster.common.config.ClusterConfig;
+import io.duckcluster.common.config.ClusterProtocol;
 import io.duckcluster.common.registry.WorkerRegistry;
 import io.duckcluster.coordinator.catalog.ShardCatalog;
 import io.duckcluster.proto.v1.CoordinatorServiceGrpc;
@@ -75,6 +76,21 @@ public final class CoordinatorGrpcServer {
     private final class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorServiceImplBase {
         @Override
         public void registerWorker(RegisterWorkerRequest request, StreamObserver<RegisterWorkerResponse> responseObserver) {
+            if (request.getProtocolVersion() != 0
+                    && request.getProtocolVersion() != ClusterProtocol.CURRENT) {
+                RegisterWorkerResponse response = RegisterWorkerResponse.newBuilder()
+                        .setAccepted(false)
+                        .setMessage("unsupported protocol version "
+                                + request.getProtocolVersion()
+                                + "; coordinator expects "
+                                + ClusterProtocol.CURRENT)
+                        .setCoordinatorProtocolVersion(ClusterProtocol.CURRENT)
+                        .setCoordinatorBootEpoch(coordinatorBootEpoch)
+                        .build();
+                responseObserver.onNext(response);
+                responseObserver.onCompleted();
+                return;
+            }
             channelPool.removeChannel(request.getWorkerId());
             registry.register(
                     request.getWorkerId(),
@@ -99,6 +115,7 @@ public final class CoordinatorGrpcServer {
                     .setAccepted(true)
                     .setMessage("registered")
                     .setCoordinatorBootEpoch(coordinatorBootEpoch)
+                    .setCoordinatorProtocolVersion(ClusterProtocol.CURRENT)
                     .build();
             responseObserver.onNext(response);
             responseObserver.onCompleted();
