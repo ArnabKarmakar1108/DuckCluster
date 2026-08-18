@@ -20,15 +20,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public final class FragmentExecutor {
     private static final Logger LOG = LoggerFactory.getLogger(FragmentExecutor.class);
-    private static final int BATCH_SIZE = 1024;
-
+    private final int batchSize;
     private final DuckDBConnectionPool pool;
     private final RunningFragmentRegistry runningFragments;
     private final AtomicInteger inFlightFragments = new AtomicInteger();
 
-    public FragmentExecutor(DuckDBConnectionPool pool, RunningFragmentRegistry runningFragments) {
+    public FragmentExecutor(DuckDBConnectionPool pool, RunningFragmentRegistry runningFragments, int batchSize) {
         this.pool = pool;
         this.runningFragments = runningFragments;
+        this.batchSize = Math.max(1, batchSize);
     }
 
     public int inFlightCount() {
@@ -91,7 +91,7 @@ public final class FragmentExecutor {
                     }
                 }
                 rowsInBatch++;
-                if (rowsInBatch >= BATCH_SIZE) {
+                if (rowsInBatch >= batchSize) {
                     emitBatch(responseObserver, columnNames, columnBuilders, rowsInBatch);
                     totalRows += rowsInBatch;
                     batchCount++;

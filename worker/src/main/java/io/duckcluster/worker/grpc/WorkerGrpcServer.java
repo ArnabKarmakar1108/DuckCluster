@@ -39,7 +39,6 @@ import java.util.concurrent.TimeUnit;
 
 public final class WorkerGrpcServer {
     private static final Logger LOG = LoggerFactory.getLogger(WorkerGrpcServer.class);
-    private static final int CHUNK_SIZE = 64 * 1024;
 
     private final String workerId;
     private final String host;
@@ -51,13 +50,14 @@ public final class WorkerGrpcServer {
     private final BroadcastMaterializer broadcastMaterializer;
     private final Path transferTempDir;
     private final int maxInboundMessageBytes;
+    private final int shardTransferChunkBytes;
     private Server server;
 
     public WorkerGrpcServer(String workerId, String host, int port,
                             FragmentExecutor fragmentExecutor, RunningFragmentRegistry runningFragments,
                             ShardManager shardManager, TempShardCache tempShardCache,
                             BroadcastMaterializer broadcastMaterializer, Path transferTempDir,
-                            int maxInboundMessageBytes) {
+                            int maxInboundMessageBytes, int shardTransferChunkBytes) {
         this.workerId = workerId;
         this.host = host;
         this.port = port;
@@ -68,6 +68,7 @@ public final class WorkerGrpcServer {
         this.broadcastMaterializer = broadcastMaterializer;
         this.transferTempDir = transferTempDir;
         this.maxInboundMessageBytes = maxInboundMessageBytes;
+        this.shardTransferChunkBytes = Math.max(4096, shardTransferChunkBytes);
     }
 
     public void start() throws IOException {
@@ -147,7 +148,7 @@ public final class WorkerGrpcServer {
             Path filePath = meta.get().filePath();
             LOG.info("Streaming shard file {} for replication", filePath);
             try (FileInputStream fis = new FileInputStream(filePath.toFile())) {
-                byte[] buffer = new byte[CHUNK_SIZE];
+                byte[] buffer = new byte[shardTransferChunkBytes];
                 CRC32 crc = ShardTransferChecksum.newCrc();
                 long totalBytes = 0;
                 int bytesRead;
@@ -205,7 +206,9 @@ public final class WorkerGrpcServer {
                             ShardNameValidator.validateShardId(shardId);
                             String fileName = tableName + "_shard" + shardId + ".duckdb";
                             finalPath = shardManager.getDataDir().resolve(fileName);
+                            ShardNameValidator.validatePathUnderBase(shardManager.getDataDir(), finalPath);
                             tempPath = transferTempDir.resolve(fileName + ".tmp");
+                            ShardNameValidator.validatePathUnderBase(transferTempDir, tempPath);
                             outputStream = new FileOutputStream(tempPath.toFile());
                             LOG.info("Receiving shard: {}_shard{}", tableName, shardId);
                         }

@@ -54,7 +54,7 @@ class FragmentExecutorPoolTest {
     @Test
     void execute_returnsResourceExhausted_whenPoolExhausted() throws Exception {
         pool = new DuckDBConnectionPool(dbPath, 1, 50);
-        executor = new FragmentExecutor(pool, new RunningFragmentRegistry());
+        executor = new FragmentExecutor(pool, new RunningFragmentRegistry(), 1024);
 
         Connection held = pool.checkout();
         assertNotNull(held);
@@ -80,7 +80,7 @@ class FragmentExecutorPoolTest {
     @Test
     void execute_concurrentFragments_correctResults() throws Exception {
         pool = new DuckDBConnectionPool(dbPath, 2, 500);
-        executor = new FragmentExecutor(pool, new RunningFragmentRegistry());
+        executor = new FragmentExecutor(pool, new RunningFragmentRegistry(), 1024);
 
         int threadCount = 4;
         ExecutorService threadPool = Executors.newFixedThreadPool(threadCount);
