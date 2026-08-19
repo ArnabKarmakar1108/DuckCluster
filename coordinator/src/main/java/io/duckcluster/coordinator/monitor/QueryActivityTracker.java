@@ -6,6 +6,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class QueryActivityTracker {
@@ -122,6 +123,22 @@ public final class QueryActivityTracker {
         synchronized (recentLock) {
             return List.copyOf(recent);
         }
+    }
+
+    public Optional<ActiveQuery> findActive(String queryId) {
+        MutableActive entry = active.get(queryId);
+        return entry == null ? Optional.empty() : Optional.of(entry.snapshot());
+    }
+
+    public Optional<RecentQuery> findRecent(String queryId) {
+        synchronized (recentLock) {
+            for (RecentQuery record : recent) {
+                if (record.queryId().equals(queryId)) {
+                    return Optional.of(record);
+                }
+            }
+        }
+        return Optional.empty();
     }
 
     private void appendRecent(RecentQuery record) {

@@ -5,6 +5,7 @@ import io.duckcluster.common.model.ClusterCatalog;
 import io.duckcluster.common.model.TableColumn;
 import io.duckcluster.common.model.TableShardConfig;
 import io.duckcluster.coordinator.catalog.ShardCatalog;
+import io.duckcluster.coordinator.execution.AsyncQueryService;
 import io.duckcluster.coordinator.execution.QueryExecutionService;
 import io.duckcluster.common.registry.WorkerRegistry;
 
@@ -14,6 +15,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 
@@ -43,6 +45,14 @@ public final class MonitorService {
                 config.heartbeatInterval().multipliedBy(config.heartbeatMissThreshold());
     }
 
+    public void declareCatalogTable(String name, int shardCount, String shardKey) {
+        clusterCatalog.declareTable(new TableShardConfig(name, shardCount, shardKey));
+    }
+
+    public boolean dropCatalogTable(String name) {
+        return clusterCatalog.removeTable(name);
+    }
+
     public Map<String, Object> catalogTables() {
         List<Map<String, Object>> tables = new ArrayList<>();
         for (TableShardConfig table : clusterCatalog.listTables()) {
@@ -68,6 +78,46 @@ public final class MonitorService {
 
     public boolean isReady() {
         return registry.workerCount() > 0 && !clusterCatalog.getShardedTableNames().isEmpty();
+    }
+
+    public Optional<Map<String, Object>> queryProfile(String queryId, AsyncQueryService asyncQueryService) {
+        Optional<QueryActivityTracker.ActiveQuery> active = activityTracker.findActive(queryId);
+        if (active.isPresent()) {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("queryId", queryId);
+            body.put("state", "RUNNING");
+            body.put("active", toActiveView(active.get()));
+            return Optional.of(body);
+        }
+
+        Optional<AsyncQueryService.StatusView> asyncStatus = asyncQueryService.status(queryId);
+        if (asyncStatus.isPresent()) {
+            AsyncQueryService.StatusView status = asyncStatus.get();
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("queryId", queryId);
+            body.put("state", status.status().name());
+            body.put("phase", status.phase() != null ? status.phase().name() : null);
+            body.put("fragmentsDone", status.fragmentsDone());
+            body.put("fragmentsTotal", status.fragmentsTotal());
+            body.put("elapsedMs", status.elapsedMs());
+            body.put("error", status.error());
+            if (status.stats() != null) {
+                body.put("mergeStrategy", status.stats().mergeStrategy().name());
+                body.put("durationMs", status.stats().durationMs());
+                body.put("workersUsed", status.stats().workersUsed());
+                body.put("fragmentsExecuted", status.stats().fragmentsExecuted());
+                body.put("workerDurationsMs", status.stats().workerDurationsMs());
+            }
+            return Optional.of(body);
+        }
+
+        return activityTracker.findRecent(queryId).map(recent -> {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("queryId", queryId);
+            body.put("state", "FINISHED");
+            body.put("recent", toRecentView(recent));
+            return body;
+        });
     }
 
     public Map<String, Object> summary() {

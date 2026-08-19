@@ -19,6 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 
 public final class CoordinatorHttpServer {
     private static final Logger LOG = LoggerFactory.getLogger(CoordinatorHttpServer.class);
@@ -54,6 +55,19 @@ public final class CoordinatorHttpServer {
                         staticFiles.directory = "dashboard";
                         staticFiles.location = Location.CLASSPATH;
                     });
+                })
+                .post("/v1/query/explain", ctx -> {
+                    QueryRequest request = ctx.bodyAsClass(QueryRequest.class);
+                    if (request.sql == null || request.sql.isBlank()) {
+                        ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", "sql is required"));
+                        return;
+                    }
+                    try {
+                        var plan = queryExecutionService.explainPlan(request.sql);
+                        ctx.json(QueryPlanMapper.toExplainResponse(UUID.randomUUID().toString(), plan));
+                    } catch (ApiException apiError) {
+                        ctx.status(apiError.code().httpStatus()).json(ApiErrorMapper.body(apiError));
+                    }
                 })
                 .post("/v1/query", ctx -> {
                     QueryRequest request = ctx.bodyAsClass(QueryRequest.class);
@@ -127,6 +141,15 @@ public final class CoordinatorHttpServer {
                             },
                             () -> ctx.status(HttpStatus.NOT_FOUND).json(Map.of("error", "unknown query id")));
                 })
+                .get("/v1/query/{queryId}/profile", ctx -> {
+                    String queryId = ctx.pathParam("queryId");
+                    monitorService
+                            .queryProfile(queryId, asyncQueryService)
+                            .ifPresentOrElse(
+                                    ctx::json,
+                                    () -> ctx.status(HttpStatus.NOT_FOUND)
+                                            .json(Map.of("error", "unknown query id")));
+                })
                 .get("/v1/query/{queryId}/results", ctx -> {
                     String queryId = ctx.pathParam("queryId");
                     int offset = parseIntQuery(ctx, "offset", 0);
@@ -138,7 +161,8 @@ public final class CoordinatorHttpServer {
                                 chunk.offset(),
                                 chunk.limit(),
                                 chunk.rows(),
-                                chunk.nextOffset()));
+                                chunk.nextOffset(),
+                                chunk.totalRowCount()));
                     } catch (AsyncQueryExpiredException exception) {
                         ctx.status(HttpStatus.GONE)
                                 .json(Map.of(
@@ -168,6 +192,37 @@ public final class CoordinatorHttpServer {
                     ctx.json(body);
                 })
                 .get("/v1/catalog/tables", ctx -> ctx.json(monitorService.catalogTables()))
+                .post("/v1/catalog/tables", ctx -> {
+                    CatalogTableRequest request = ctx.bodyAsClass(CatalogTableRequest.class);
+                    if (request.name == null || request.name.isBlank()) {
+                        ctx.status(HttpStatus.BAD_REQUEST)
+                                .json(Map.of("code", ApiErrorCode.BAD_REQUEST.name(), "error", "name is required"));
+                        return;
+                    }
+                    if (request.shardCount < 1) {
+                        ctx.status(HttpStatus.BAD_REQUEST)
+                                .json(Map.of(
+                                        "code", ApiErrorCode.BAD_REQUEST.name(),
+                                        "error", "shardCount must be >= 1"));
+                        return;
+                    }
+                    String shardKey = request.shardKey == null || request.shardKey.isBlank()
+                            ? "rowid"
+                            : request.shardKey;
+                    monitorService.declareCatalogTable(request.name, request.shardCount, shardKey);
+                    ctx.status(HttpStatus.CREATED).json(Map.of("name", request.name, "shardCount", request.shardCount));
+                })
+                .delete("/v1/catalog/tables/{tableName}", ctx -> {
+                    String tableName = ctx.pathParam("tableName");
+                    if (!monitorService.dropCatalogTable(tableName)) {
+                        ctx.status(HttpStatus.NOT_FOUND)
+                                .json(Map.of(
+                                        "code", ApiErrorCode.NOT_FOUND.name(),
+                                        "error", "unknown table: " + tableName));
+                        return;
+                    }
+                    ctx.json(Map.of("dropped", tableName));
+                })
                 .get("/metrics", ctx -> ctx.contentType("text/plain; version=0.0.4").result(metrics.prometheusText()))
                 .get("/v1/cluster/workers", ctx -> {
                     List<Map<String, Object>> workers = registry.listWorkers().stream()
@@ -262,5 +317,11 @@ public final class CoordinatorHttpServer {
 
     private static final class QueryRequest {
         public String sql;
+    }
+
+    private static final class CatalogTableRequest {
+        public String name;
+        public int shardCount;
+        public String shardKey;
     }
 }
