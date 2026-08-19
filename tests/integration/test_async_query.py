@@ -64,3 +64,10 @@ def test_async_query_matches_sync_baseline(cluster_manager, demo_csv) -> None:
 
     async_result = {"columns": columns, "rows": rows}
     assert_result_matches(async_result, {"columns": sync["columns"], "rows": sync["rows"]})
+
+    profile = requests.get(
+        f"{cluster_manager.config.http_base_url}/v1/query/{query_id}/profile",
+        timeout=10,
+    )
+    assert profile.status_code == 200
+    assert profile.json()["queryId"] == query_id

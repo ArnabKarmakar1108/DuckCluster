@@ -65,6 +65,16 @@ _INTEGRATION_TEST_BASE_PORTS: tuple[int, ...] = (
     39601,
     39602,
     39603,
+    38680,
+    39690,
+    39701,
+    39702,
+    39703,
+    38780,
+    39790,
+    39801,
+    39802,
+    39803,
 )
 
 
@@ -184,6 +194,19 @@ class ClusterManager:
             check=False,
         )
         time.sleep(0.3)
+
+    def restart_coordinator(self) -> None:
+        """Stop and start only the coordinator; workers stay up and should re-register."""
+        if self._coordinator is not None:
+            self._terminate(self._coordinator)
+            self._coordinator = None
+        env = self._base_env()
+        coordinator_jar = (
+            self.config.root / "coordinator/target/duckcluster-coordinator-0.1.0-SNAPSHOT.jar"
+        )
+        self._coordinator = self._spawn(["java", "-jar", str(coordinator_jar)], env)
+        self._wait_for_coordinator()
+        self._wait_for_workers(len(self._workers), timeout_sec=90)
 
     def kill_worker(self, worker_id: str) -> None:
         process = self._workers.get(worker_id)
