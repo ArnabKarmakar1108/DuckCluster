@@ -29,16 +29,24 @@ final class QueryResponseMapper {
     }
 
     static Map<String, Object> toResultChunk(
-            QueryResult result, int offset, int limit, List<List<Object>> rows, Integer nextOffset) {
+            QueryResult result,
+            int offset,
+            int limit,
+            List<List<Object>> rows,
+            Integer nextOffset,
+            long totalRowCount) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("queryId", result.queryId());
         body.put("columns", result.columns());
         body.put("rows", rows);
         body.put("offset", offset);
         body.put("limit", limit);
-        body.put("rowCount", result.rows().size());
+        long rowCount = totalRowCount >= 0 ? totalRowCount : result.rows().size();
+        body.put("rowCount", rowCount);
         body.put("nextOffset", nextOffset);
-        body.put("stats", toStatsMap(result.stats()));
+        if (result.stats() != null) {
+            body.put("stats", toStatsMap(result.stats()));
+        }
         return body;
     }
 }

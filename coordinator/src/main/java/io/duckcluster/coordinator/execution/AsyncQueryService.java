@@ -32,7 +32,12 @@ public final class AsyncQueryService {
             QueryResult.QueryStats stats) {}
 
     public record ResultChunk(
-            QueryResult result, int offset, int limit, List<List<Object>> rows, Integer nextOffset) {}
+            QueryResult result,
+            int offset,
+            int limit,
+            List<List<Object>> rows,
+            Integer nextOffset,
+            long totalRowCount) {}
 
     private final QueryExecutionService queryExecutionService;
     private final QueryActivityTracker activityTracker;
@@ -82,7 +87,8 @@ public final class AsyncQueryService {
         purgeExpiredAndOverCapacity();
         String queryId = UUID.randomUUID().toString();
         AsyncQueryJob job = new AsyncQueryJob();
-        jobs.put(queryId, new AsyncQueryJobEntry(job, System.currentTimeMillis()));
+        QueryResultSpool spool = QueryResultSpool.open(queryId);
+        jobs.put(queryId, new AsyncQueryJobEntry(job, spool, System.currentTimeMillis()));
         executor.submit(() -> runQuery(queryId, sql.strip(), job));
         return Optional.of(queryId);
     }
@@ -132,18 +138,27 @@ public final class AsyncQueryService {
         if (job.status() == AsyncQueryJob.Status.FAILED) {
             throw new IllegalStateException(job.errorMessage().orElse("query failed"));
         }
-        if (job.status() != AsyncQueryJob.Status.SUCCEEDED) {
+        boolean partialConcat =
+                job.status() == AsyncQueryJob.Status.RUNNING && entry.spool != null && entry.spool.hasColumns();
+        if (job.status() != AsyncQueryJob.Status.SUCCEEDED && !partialConcat) {
             throw new IllegalStateException("query is not finished");
         }
-        QueryResult result = job.result().orElseThrow(() -> new AsyncQueryExpiredException(queryId));
+        QueryResult result = job.result().orElseGet(() -> partialResultShell(queryId, entry));
         int safeOffset = Math.max(0, offset);
         int safeLimit = Math.min(Math.max(1, limit), MAX_RESULT_LIMIT);
+        if (entry.spool != null && (result.rows().isEmpty() || partialConcat)) {
+            long totalRows = entry.spool.rowCount();
+            List<List<Object>> page = entry.spool.readPage(safeOffset, safeLimit);
+            int next = safeOffset + page.size();
+            Integer nextOffset = next < totalRows ? next : null;
+            return new ResultChunk(result, safeOffset, safeLimit, page, nextOffset, totalRows);
+        }
         List<List<Object>> allRows = result.rows();
         int from = Math.min(safeOffset, allRows.size());
         int to = Math.min(from + safeLimit, allRows.size());
         List<List<Object>> page = new ArrayList<>(allRows.subList(from, to));
         Integer nextOffset = to < allRows.size() ? to : null;
-        return new ResultChunk(result, safeOffset, safeLimit, page, nextOffset);
+        return new ResultChunk(result, safeOffset, safeLimit, page, nextOffset, allRows.size());
     }
 
     private void runQuery(String queryId, String sql, AsyncQueryJob job) {
@@ -158,8 +173,10 @@ public final class AsyncQueryService {
             markCompleted(queryId, null);
             return;
         }
+        AsyncQueryJobEntry entry = jobs.get(queryId);
+        QueryResultSpool spool = entry != null ? entry.spool : null;
         try {
-            QueryResult result = queryExecutionService.execute(queryId, sql, false);
+            QueryResult result = queryExecutionService.execute(queryId, sql, false, spool);
             if (job.status() == AsyncQueryJob.Status.CANCELLED) {
                 markCompleted(queryId, null);
                 return;
@@ -190,9 +207,14 @@ public final class AsyncQueryService {
         }
         entry.completedAtEpochMs = System.currentTimeMillis();
         if (result != null) {
-            entry.retainedBytes = QueryResultSizeEstimator.estimateBytes(result);
+            long spoolBytes = entry.spool != null ? entry.spool.retainedBytes() : 0L;
+            entry.retainedBytes = QueryResultSizeEstimator.estimateBytes(result, spoolBytes);
             totalRetainedBytes.addAndGet(entry.retainedBytes);
         }
+    }
+
+    private static QueryResult partialResultShell(String queryId, AsyncQueryJobEntry entry) {
+        return new QueryResult(queryId, entry.spool.columns(), List.of(), null);
     }
 
     private StatusView buildStatusView(String queryId, AsyncQueryJob job) {
@@ -234,15 +256,20 @@ public final class AsyncQueryService {
 
     private void expireByCapacity(long now) {
         while (jobs.size() > maxStoredJobs || totalRetainedBytes.get() > maxStoredBytes) {
-            Optional<String> oldest = jobs.entrySet().stream()
+            Optional<Map.Entry<String, AsyncQueryJobEntry>> oldest = jobs.entrySet().stream()
                     .filter(entry -> isTerminal(entry.getValue().job.status()))
                     .filter(entry -> entry.getValue().completedAtEpochMs > 0)
-                    .min(Comparator.comparingLong(entry -> entry.getValue().completedAtEpochMs))
-                    .map(Map.Entry::getKey);
+                    .min(Comparator.comparingLong(entry -> entry.getValue().completedAtEpochMs));
             if (oldest.isEmpty()) {
                 break;
             }
-            expireEntry(oldest.get(), jobs.get(oldest.get()));
+            String queryId = oldest.get().getKey();
+            AsyncQueryJobEntry entry = oldest.get().getValue();
+            if (entry.job.status() == AsyncQueryJob.Status.EXPIRED) {
+                jobs.remove(queryId);
+                continue;
+            }
+            evictForCapacity(queryId, entry);
         }
         // Drop long-expired tombstones so unknown vs expired stays meaningful for a while only.
         jobs.entrySet().removeIf(entry -> {
@@ -255,12 +282,27 @@ public final class AsyncQueryService {
         });
     }
 
+    private void evictForCapacity(String queryId, AsyncQueryJobEntry entry) {
+        if (entry == null) {
+            return;
+        }
+        totalRetainedBytes.addAndGet(-entry.retainedBytes);
+        entry.retainedBytes = 0;
+        if (entry.spool != null) {
+            entry.spool.close();
+        }
+        jobs.remove(queryId);
+    }
+
     private void expireEntry(String queryId, AsyncQueryJobEntry entry) {
         if (entry == null || entry.job.status() == AsyncQueryJob.Status.EXPIRED) {
             return;
         }
         totalRetainedBytes.addAndGet(-entry.retainedBytes);
         entry.retainedBytes = 0;
+        if (entry.spool != null) {
+            entry.spool.close();
+        }
         entry.job.expire();
         if (entry.completedAtEpochMs < 0) {
             entry.completedAtEpochMs = System.currentTimeMillis();

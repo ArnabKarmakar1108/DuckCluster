@@ -10,8 +10,15 @@ final class QueryResultSizeEstimator {
     private QueryResultSizeEstimator() {}
 
     static long estimateBytes(QueryResult result) {
+        return estimateBytes(result, 0L);
+    }
+
+    static long estimateBytes(QueryResult result, long spoolBytes) {
         if (result == null) {
             return 0;
+        }
+        if (spoolBytes > 0) {
+            return spoolBytes + BASE_OVERHEAD_BYTES;
         }
         long bytes = BASE_OVERHEAD_BYTES;
         for (String column : result.columns()) {
