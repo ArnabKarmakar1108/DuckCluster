@@ -26,6 +26,11 @@ service WorkerService {
   rpc MaterializeBroadcast(MaterializeBroadcastRequest) returns (MaterializeBroadcastResponse);
   rpc ClearBroadcastTables(ClearBroadcastTablesRequest) returns (ClearBroadcastTablesResponse);
   rpc CancelQuery(CancelQueryRequest) returns (CancelQueryResponse);
+  rpc ActivateTableVersion(ActivateTableVersionRequest) returns (ActivateTableVersionResponse);
+  // Coordinator -> source worker: hash-repartition local shards and push buckets to target workers.
+  rpc ShuffleTable(ShuffleTableRequest) returns (ShuffleTableResponse);
+  // Worker -> worker: one Parquet file holding a bucket's rows from one source shard.
+  rpc ReceiveShufflePiece(stream ShufflePieceChunk) returns (ShufflePieceResponse);
 }
 
 message RegisterWorkerRequest {
@@ -132,6 +137,8 @@ message ShardDataChunk {
   string query_id = 5;
   uint64 content_length = 6;
   uint32 crc32 = 7;
+  // When > 0, ReceiveShard writes under dataDir/.staging/v{staging_version}/ instead of live data.
+  uint64 staging_version = 8;
 }
 
 message ReceiveShardResponse {
@@ -165,6 +172,8 @@ message MaterializeBroadcastRequest {
   string query_id = 1;
   string table_name = 2;
   uint32 shard_count = 3;
+  // Active catalog data version; enables shared dimension materialization across queries (4.3).
+  uint64 table_data_version = 4;
 }
 
 message MaterializeBroadcastResponse {
@@ -196,4 +205,55 @@ message UpdateShardCacheRequest {
 
 message UpdateShardCacheResponse {
   bool accepted = 1;
+}
+
+message ActivateTableVersionRequest {
+  string table_name = 1;
+  uint64 version = 2;
+}
+
+message ActivateTableVersionResponse {
+  bool accepted = 1;
+  string message = 2;
+  uint32 shards_activated = 3;
+}
+
+message ShuffleTarget {
+  uint32 bucket = 1;
+  string worker_id = 2;
+  string host = 3;
+  int32 port = 4;
+}
+
+message ShuffleTableRequest {
+  string query_id = 1;
+  string table_name = 2;
+  repeated uint32 source_shard_ids = 3;
+  string join_column = 4;
+  // Join column is cast to this type before hashing so buckets line up with the driving table's shards.
+  string join_key_type = 5;
+  uint32 bucket_count = 6;
+  repeated ShuffleTarget targets = 7;
+}
+
+message ShuffleTableResponse {
+  bool accepted = 1;
+  uint64 rows_shuffled = 2;
+  uint32 pieces_sent = 3;
+  uint64 bytes_sent = 4;
+}
+
+message ShufflePieceChunk {
+  string query_id = 1;
+  string table_name = 2;
+  uint32 bucket = 3;
+  uint32 source_shard = 4;
+  bytes data = 5;
+  uint64 content_length = 6;
+  uint32 crc32 = 7;
+}
+
+message ShufflePieceResponse {
+  bool accepted = 1;
+  uint64 rows_loaded = 2;
 }
