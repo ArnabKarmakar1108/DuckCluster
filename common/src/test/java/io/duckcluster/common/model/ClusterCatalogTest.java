@@ -20,4 +20,12 @@ class ClusterCatalogTest {
         assertFalse(catalog.hasTable("events"));
         assertFalse(catalog.removeTable("missing"));
     }
+
+    @Test
+    void tracksActiveDataVersion() {
+        ClusterCatalog catalog = new ClusterCatalog();
+        catalog.declareTable(new TableShardConfig("events", 2, "id"));
+        catalog.setActiveDataVersion("events", 3);
+        assertEquals(3, catalog.activeDataVersion("events"));
+    }
 }

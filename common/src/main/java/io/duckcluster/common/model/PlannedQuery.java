@@ -14,7 +14,9 @@ public record PlannedQuery(
         NestedDerivedTableSpec nestedDerivedTable,
         WithCteSpec withCte,
         List<BroadcastTable> subqueryBroadcastTables,
-        List<String> correlatedCoPartitionTables) {
+        List<String> correlatedCoPartitionTables,
+        List<String> coPartitionJoinTables,
+        List<ShuffleJoinTable> shuffleJoinTables) {
 
     public PlannedQuery(
             String originalSql,
@@ -26,7 +28,7 @@ public record PlannedQuery(
             List<ColumnDef> schema,
             TopKSpec topK) {
         this(originalSql, shardedTables, broadcastTables, fragments, mergeStrategy,
-                analysis, schema, topK, null, null, List.of(), List.of());
+                analysis, schema, topK, null, null, List.of(), List.of(), List.of(), List.of());
     }
 
     public PlannedQuery(
@@ -40,7 +42,7 @@ public record PlannedQuery(
             TopKSpec topK,
             NestedDerivedTableSpec nestedDerivedTable) {
         this(originalSql, shardedTables, broadcastTables, fragments, mergeStrategy,
-                analysis, schema, topK, nestedDerivedTable, null, List.of(), List.of());
+                analysis, schema, topK, nestedDerivedTable, null, List.of(), List.of(), List.of(), List.of());
     }
 
     public PlannedQuery(
@@ -55,7 +57,8 @@ public record PlannedQuery(
             NestedDerivedTableSpec nestedDerivedTable,
             List<BroadcastTable> subqueryBroadcastTables) {
         this(originalSql, shardedTables, broadcastTables, fragments, mergeStrategy,
-                analysis, schema, topK, nestedDerivedTable, null, subqueryBroadcastTables, List.of());
+                analysis, schema, topK, nestedDerivedTable, null, subqueryBroadcastTables,
+                List.of(), List.of(), List.of());
     }
 
     public String tableName() {

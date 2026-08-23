@@ -13,7 +13,6 @@ import io.duckcluster.common.model.ClusterCatalog;
 
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -77,23 +76,24 @@ public final class SubqueryAnalyzer {
 
     /** Multi-shard tables referenced by predicate subqueries that use global UNION ALL rewrite. */
     public static Set<String> uncorrelatedMultiShardTables(
-            SqlSelect select, ClusterCatalog catalog, String drivingTable) {
+            SqlSelect select, ClusterCatalog catalog, String drivingTable, Set<String> coPartitionedTables) {
         FromScope outer = FromScope.of(select.getFrom());
         Set<String> tables = new LinkedHashSet<>();
+        SubqueryVisit visit = new SubqueryVisit(drivingTable, catalog, coPartitionedTables, tables);
         collectFromEmbeddedSelects(select.getFrom(), embedded -> {
             FromScope embeddedScope = outer.union(FromScope.of(embedded.getFrom()));
             if (embedded.getWhere() != null) {
-                collectGlobalSubqueryTables(embedded.getWhere(), embeddedScope, drivingTable, catalog, tables);
+                collectGlobalSubqueryTables(embedded.getWhere(), embeddedScope, visit);
             }
             if (embedded.getHaving() != null) {
-                collectGlobalSubqueryTables(embedded.getHaving(), embeddedScope, drivingTable, catalog, tables);
+                collectGlobalSubqueryTables(embedded.getHaving(), embeddedScope, visit);
             }
         });
         if (select.getWhere() != null) {
-            collectGlobalSubqueryTables(select.getWhere(), outer, drivingTable, catalog, tables);
+            collectGlobalSubqueryTables(select.getWhere(), outer, visit);
         }
         if (select.getHaving() != null) {
-            collectGlobalSubqueryTables(select.getHaving(), outer, drivingTable, catalog, tables);
+            collectGlobalSubqueryTables(select.getHaving(), outer, visit);
         }
         return tables;
     }
@@ -102,25 +102,24 @@ public final class SubqueryAnalyzer {
      * Multi-shard inner tables from correlated EXISTS that must be co-located with the driving shard.
      */
     public static Set<String> correlatedCoPartitionTables(
-            SqlSelect select, ClusterCatalog catalog, String drivingTable) {
+            SqlSelect select, ClusterCatalog catalog, String drivingTable, Set<String> coPartitionedTables) {
         FromScope outer = FromScope.of(select.getFrom());
         Set<String> tables = new LinkedHashSet<>();
+        SubqueryVisit visit = new SubqueryVisit(drivingTable, catalog, coPartitionedTables, tables);
         collectFromEmbeddedSelects(select.getFrom(), embedded -> {
             FromScope embeddedScope = outer.union(FromScope.of(embedded.getFrom()));
             if (embedded.getWhere() != null) {
-                collectCorrelatedCoPartitionTables(
-                        embedded.getWhere(), embeddedScope, drivingTable, catalog, tables);
+                collectCorrelatedCoPartitionTables(embedded.getWhere(), embeddedScope, visit);
             }
             if (embedded.getHaving() != null) {
-                collectCorrelatedCoPartitionTables(
-                        embedded.getHaving(), embeddedScope, drivingTable, catalog, tables);
+                collectCorrelatedCoPartitionTables(embedded.getHaving(), embeddedScope, visit);
             }
         });
         if (select.getWhere() != null) {
-            collectCorrelatedCoPartitionTables(select.getWhere(), outer, drivingTable, catalog, tables);
+            collectCorrelatedCoPartitionTables(select.getWhere(), outer, visit);
         }
         if (select.getHaving() != null) {
-            collectCorrelatedCoPartitionTables(select.getHaving(), outer, drivingTable, catalog, tables);
+            collectCorrelatedCoPartitionTables(select.getHaving(), outer, visit);
         }
         return tables;
     }
@@ -129,19 +128,18 @@ public final class SubqueryAnalyzer {
         return call.getKind() == SqlKind.EXISTS;
     }
 
-    /** Co-located EXISTS rewrite is valid only when driving and inner tables share shard parallelism. */
-    static boolean canCoLocateSubquery(SqlSelect subquery, String drivingTable, Map<String, Integer> catalogTableShardCounts) {
-        int drivingShards = catalogTableShardCounts.getOrDefault(drivingTable.toLowerCase(), 1);
-        if (drivingShards > 1) {
-            return true;
-        }
-        for (String tableName : CalciteQueryPlanner.collectTableNames(subquery.getFrom())) {
-            int innerShards = catalogTableShardCounts.getOrDefault(tableName.toLowerCase(), 1);
-            if (innerShards > 1) {
-                return false;
-            }
-        }
-        return true;
+    /** Shared rule for fragment rewrite and prefetch planning: both must agree on co-location. */
+    static boolean isCoLocatedExists(
+            SqlCall call,
+            SqlSelect subquery,
+            FromScope enclosing,
+            String drivingTable,
+            ClusterCatalog catalog,
+            Set<String> coPartitionedTables) {
+        return isExistsSubquery(call)
+                && isCorrelated(subquery, enclosing)
+                && JoinPlacementAnalyzer.canCoLocateSubquery(
+                        subquery, enclosing, drivingTable, catalog, coPartitionedTables);
     }
 
     public static SqlCall replaceSubqueryOperand(SqlCall call, SqlSelect rewritten) {
@@ -152,93 +150,64 @@ public final class SubqueryAnalyzer {
         };
     }
 
-    private static void collectGlobalSubqueryTables(
-            SqlNode node,
-            FromScope enclosing,
-            String drivingTable,
-            ClusterCatalog catalog,
-            Set<String> tables) {
-        Map<String, Integer> shardCounts = catalogShardCounts(catalog);
-        node.accept(new SqlShuttle() {
-            @Override
-            public SqlNode visit(SqlCall call) {
-                if (isPredicateSubquery(call)) {
-                    SqlSelect subquery = operandSubquery(call);
-                    boolean coLocated = isCorrelated(subquery, enclosing)
-                            && isExistsSubquery(call)
-                            && canCoLocateSubquery(subquery, drivingTable, shardCounts);
-                    if (!coLocated) {
-                        for (String tableName : CalciteQueryPlanner.collectTableNames(subquery.getFrom())) {
-                            if (catalog.hasTable(tableName) && catalog.table(tableName).shardCount() > 1) {
-                                tables.add(tableName.toLowerCase());
-                            }
-                        }
-                    }
-                    FromScope subqueryScope = enclosing.union(FromScope.of(subquery.getFrom()));
-                    if (subquery.getWhere() != null) {
-                        collectGlobalSubqueryTables(subquery.getWhere(), subqueryScope, drivingTable, catalog, tables);
-                    }
-                    if (subquery.getHaving() != null) {
-                        collectGlobalSubqueryTables(subquery.getHaving(), subqueryScope, drivingTable, catalog, tables);
-                    }
-                    return call;
+    private record SubqueryVisit(
+            String drivingTable, ClusterCatalog catalog, Set<String> coPartitionedTables, Set<String> tables) {
+
+        void addMultiShardTables(SqlSelect subquery) {
+            for (String tableName : CalciteQueryPlanner.collectTableNames(subquery.getFrom())) {
+                if (catalog.hasTable(tableName) && catalog.table(tableName).shardCount() > 1) {
+                    tables.add(tableName.toLowerCase());
                 }
-                return super.visit(call);
             }
-        });
-    }
-
-    private static void collectUncorrelatedMultiShardTables(
-            SqlNode node,
-            Set<String> enclosingTableNames,
-            ClusterCatalog catalog,
-            Set<String> tables) {
-        collectGlobalSubqueryTables(node, FromScope.ofTables(enclosingTableNames), "", catalog, tables);
-    }
-
-    private static void collectCorrelatedCoPartitionTables(
-            SqlNode node,
-            FromScope enclosing,
-            String drivingTable,
-            ClusterCatalog catalog,
-            Set<String> tables) {
-        Map<String, Integer> shardCounts = catalogShardCounts(catalog);
-        node.accept(new SqlShuttle() {
-            @Override
-            public SqlNode visit(SqlCall call) {
-                if (isPredicateSubquery(call)) {
-                    SqlSelect subquery = operandSubquery(call);
-                    if (isExistsSubquery(call)
-                            && isCorrelated(subquery, enclosing)
-                            && canCoLocateSubquery(subquery, drivingTable, shardCounts)) {
-                        for (String tableName : CalciteQueryPlanner.collectTableNames(subquery.getFrom())) {
-                            if (catalog.hasTable(tableName) && catalog.table(tableName).shardCount() > 1) {
-                                tables.add(tableName.toLowerCase());
-                            }
-                        }
-                    }
-                    FromScope subqueryScope = enclosing.union(FromScope.of(subquery.getFrom()));
-                    if (subquery.getWhere() != null) {
-                        collectCorrelatedCoPartitionTables(
-                                subquery.getWhere(), subqueryScope, drivingTable, catalog, tables);
-                    }
-                    if (subquery.getHaving() != null) {
-                        collectCorrelatedCoPartitionTables(
-                                subquery.getHaving(), subqueryScope, drivingTable, catalog, tables);
-                    }
-                    return call;
-                }
-                return super.visit(call);
-            }
-        });
-    }
-
-    private static Map<String, Integer> catalogShardCounts(ClusterCatalog catalog) {
-        Map<String, Integer> counts = new LinkedHashMap<>();
-        for (String tableName : catalog.getShardedTableNames()) {
-            counts.put(tableName.toLowerCase(), catalog.table(tableName).shardCount());
         }
-        return counts;
+    }
+
+    private static void collectGlobalSubqueryTables(SqlNode node, FromScope enclosing, SubqueryVisit visit) {
+        node.accept(new SqlShuttle() {
+            @Override
+            public SqlNode visit(SqlCall call) {
+                if (isPredicateSubquery(call)) {
+                    SqlSelect subquery = operandSubquery(call);
+                    if (!isCoLocatedExists(call, subquery, enclosing, visit.drivingTable(), visit.catalog(),
+                            visit.coPartitionedTables())) {
+                        visit.addMultiShardTables(subquery);
+                    }
+                    FromScope subqueryScope = enclosing.union(FromScope.of(subquery.getFrom()));
+                    if (subquery.getWhere() != null) {
+                        collectGlobalSubqueryTables(subquery.getWhere(), subqueryScope, visit);
+                    }
+                    if (subquery.getHaving() != null) {
+                        collectGlobalSubqueryTables(subquery.getHaving(), subqueryScope, visit);
+                    }
+                    return call;
+                }
+                return super.visit(call);
+            }
+        });
+    }
+
+    private static void collectCorrelatedCoPartitionTables(SqlNode node, FromScope enclosing, SubqueryVisit visit) {
+        node.accept(new SqlShuttle() {
+            @Override
+            public SqlNode visit(SqlCall call) {
+                if (isPredicateSubquery(call)) {
+                    SqlSelect subquery = operandSubquery(call);
+                    if (isCoLocatedExists(call, subquery, enclosing, visit.drivingTable(), visit.catalog(),
+                            visit.coPartitionedTables())) {
+                        visit.addMultiShardTables(subquery);
+                    }
+                    FromScope subqueryScope = enclosing.union(FromScope.of(subquery.getFrom()));
+                    if (subquery.getWhere() != null) {
+                        collectCorrelatedCoPartitionTables(subquery.getWhere(), subqueryScope, visit);
+                    }
+                    if (subquery.getHaving() != null) {
+                        collectCorrelatedCoPartitionTables(subquery.getHaving(), subqueryScope, visit);
+                    }
+                    return call;
+                }
+                return super.visit(call);
+            }
+        });
     }
 
     private static void collectFromEmbeddedSelects(SqlNode from, java.util.function.Consumer<SqlSelect> visitor) {

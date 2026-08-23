@@ -239,11 +239,9 @@ public final class FragmentSqlGenerator {
             public SqlNode visit(SqlCall call) {
                 if (SubqueryAnalyzer.isPredicateSubquery(call)) {
                     SqlSelect subquery = SubqueryAnalyzer.operandSubquery(call);
-                    boolean correlated = SubqueryAnalyzer.isCorrelated(subquery, enclosingScope);
-                    boolean coLocated = correlated
-                            && SubqueryAnalyzer.isExistsSubquery(call)
-                            && SubqueryAnalyzer.canCoLocateSubquery(
-                                    subquery, drivingTable, catalogTableShardCounts);
+                    boolean coLocated = SubqueryAnalyzer.isCoLocatedExists(
+                            call, subquery, enclosingScope, drivingTable,
+                            broadcastScope.catalog(), broadcastScope.coPartitionedTableNames());
                     SqlSelect rewrittenSubquery = rewriteSubqueryBody(
                             subquery, shardId, drivingTable, broadcastShardCounts, catalogTableShardCounts,
                             coLocated, enclosingScope, broadcastScope);
@@ -321,6 +319,9 @@ public final class FragmentSqlGenerator {
                 return materializedBroadcastRef(broadcastScope, tableNameLower);
             }
             return buildUnionAll(tableNameLower, broadcastShardCounts.get(tableNameLower));
+        } else if (broadcastScope.isShuffled(tableNameLower)) {
+            return new SqlIdentifier(
+                    List.of(broadcastScope.shuffleTableName(tableNameLower, shardId)), SqlParserPos.ZERO);
         } else if (catalogTableShardCounts.containsKey(tableNameLower)) {
             int tableShardCount = catalogTableShardCounts.get(tableNameLower);
             if (tableShardCount == 1) {

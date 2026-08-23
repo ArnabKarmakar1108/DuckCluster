@@ -8,6 +8,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class ClusterCatalog {
 
     private final ConcurrentHashMap<String, TableShardConfig> tables = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> activeDataVersions = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Long> estimatedRowCounts = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, List<TableColumn>> tableColumns = new ConcurrentHashMap<>();
 
@@ -26,16 +27,34 @@ public final class ClusterCatalog {
         }
         String key = tableName.toLowerCase();
         boolean removed = tables.remove(key) != null;
+        activeDataVersions.remove(key);
         estimatedRowCounts.remove(key);
         tableColumns.remove(key);
         return removed;
     }
 
+    public long activeDataVersion(String tableName) {
+        return activeDataVersions.getOrDefault(tableName.toLowerCase(), 0L);
+    }
+
+    public void setActiveDataVersion(String tableName, long version) {
+        if (version < 0) {
+            throw new IllegalArgumentException("version must be >= 0");
+        }
+        String key = tableName.toLowerCase();
+        if (!tables.containsKey(key)) {
+            throw new IllegalArgumentException("Unknown table: " + tableName);
+        }
+        activeDataVersions.put(key, version);
+    }
+
     public synchronized void registerTable(String tableName, int shardCount) {
         String key = tableName.toLowerCase();
         TableShardConfig existing = tables.get(key);
-        if (existing == null || existing.shardCount() < shardCount) {
-            tables.put(key, new TableShardConfig(tableName, shardCount, "rowid"));
+        if (existing == null) {
+            tables.put(key, new TableShardConfig(tableName, shardCount, TableShardConfig.UNDECLARED_SHARD_KEY));
+        } else if (existing.shardCount() < shardCount) {
+            tables.put(key, new TableShardConfig(existing.tableName(), shardCount, existing.shardKey()));
         }
     }
 

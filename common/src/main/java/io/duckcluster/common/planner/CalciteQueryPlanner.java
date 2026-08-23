@@ -7,6 +7,7 @@ import io.duckcluster.common.model.MergeStrategyType;
 import io.duckcluster.common.model.PlannedQuery;
 import io.duckcluster.common.model.NestedDerivedTableSpec;
 import io.duckcluster.common.model.QueryAnalysis;
+import io.duckcluster.common.model.ShuffleJoinTable;
 import io.duckcluster.common.model.TableShardConfig;
 import io.duckcluster.common.model.TopKSpec;
 import org.apache.calcite.config.Lex;
@@ -34,13 +35,22 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.Set;
 
 public final class CalciteQueryPlanner implements QueryPlanner {
     static final SqlParser.Config PARSER_CONFIG = SqlParser.config()
             .withLex(Lex.JAVA)
             .withQuoting(Quoting.DOUBLE_QUOTE)
             .withConformance(SqlConformanceEnum.PRAGMATIC_2003);
+
+    private final PlannerOptions options;
+
+    public CalciteQueryPlanner() {
+        this(PlannerOptions.DEFAULT);
+    }
+
+    public CalciteQueryPlanner(PlannerOptions options) {
+        this.options = options;
+    }
 
     @Override
     public PlannedQuery plan(String sql, ClusterCatalog catalog, String queryId) {
@@ -56,7 +66,7 @@ public final class CalciteQueryPlanner implements QueryPlanner {
             return planNestedDerivedTable(sql, parsed, nested.get(), catalog, queryId);
         }
 
-        TableClassification classification = classifyTables(select, catalog);
+        TableClassification classification = classifyTables(select, catalog, options);
         int shardCount = classification.shardCount();
 
         MergeStrategyType mergeStrategy = detectMergeStrategy(parsed);
@@ -71,11 +81,12 @@ public final class CalciteQueryPlanner implements QueryPlanner {
         }
         Map<String, Integer> catalogTableShardCounts = catalogTableShardCounts(catalog);
         List<BroadcastTable> subqueryBroadcasts = subqueryBroadcastTables(
-                select, catalog, classification.broadcastTables(), drivingTable);
+                select, catalog, classification, drivingTable);
         List<String> correlatedCoPartition = correlatedCoPartitionTables(
-                select, catalog, classification.broadcastTables(), subqueryBroadcasts, drivingTable);
-        BroadcastScope broadcastScope = BroadcastScope.of(
-                materializedBroadcastTables(classification.broadcastTables(), subqueryBroadcasts), queryId);
+                select, catalog, classification, subqueryBroadcasts, drivingTable);
+        BroadcastScope broadcastScope = broadcastScope(
+                classification, materializedBroadcastTables(classification.broadcastTables(), subqueryBroadcasts),
+                queryId, catalog);
 
         List<FragmentSpec> fragments = new ArrayList<>(shardCount);
         for (int shardId = 0; shardId < shardCount; shardId++) {
@@ -88,7 +99,7 @@ public final class CalciteQueryPlanner implements QueryPlanner {
 
         return new PlannedQuery(sql, List.of(drivingTable), classification.broadcastTables(),
                 fragments, mergeStrategy, analysis, List.of(), topK, null, null, subqueryBroadcasts,
-                correlatedCoPartition);
+                correlatedCoPartition, classification.coPartitionJoinTables(), classification.shuffleJoinTables());
     }
 
     private PlannedQuery planWithCte(
@@ -102,7 +113,7 @@ public final class CalciteQueryPlanner implements QueryPlanner {
         SqlNode outerNode = outerQueryNode(parsed, with);
         SqlSelect outerSelect = asSelect(outerNode);
 
-        TableClassification classification = classifyTables(cteSelect, catalog);
+        TableClassification classification = classifyTables(cteSelect, catalog, options);
         int shardCount = classification.shardCount();
 
         QueryAnalysis innerAnalysis = QueryAnalysisExtractor.withMergeColumnNames(
@@ -130,8 +141,8 @@ public final class CalciteQueryPlanner implements QueryPlanner {
                 outerTopK);
 
         List<FragmentSpec> fragments = new ArrayList<>(shardCount);
-        BroadcastScope broadcastScope = BroadcastScope.of(
-                materializedBroadcastTables(classification.broadcastTables()), queryId);
+        BroadcastScope broadcastScope = broadcastScope(
+                classification, materializedBroadcastTables(classification.broadcastTables()), queryId, catalog);
         for (int shardId = 0; shardId < shardCount; shardId++) {
             String fragmentSql = FragmentSqlGenerator.generate(
                     cteSelect, shardId, innerAnalysis, drivingTable, broadcastShardCounts,
@@ -141,7 +152,8 @@ public final class CalciteQueryPlanner implements QueryPlanner {
 
         return new PlannedQuery(sql, List.of(drivingTable), classification.broadcastTables(),
                 fragments, MergeStrategyType.WITH_CTE_MERGE, innerAnalysis, List.of(), TopKSpec.none(),
-                null, withCteSpec, List.of(), List.of());
+                null, withCteSpec, List.of(), List.of(), classification.coPartitionJoinTables(),
+                classification.shuffleJoinTables());
     }
 
     private PlannedQuery planNestedDerivedTable(
@@ -152,7 +164,7 @@ public final class CalciteQueryPlanner implements QueryPlanner {
             String queryId) {
         SqlSelect innerSelect = nested.innerSelect();
 
-        TableClassification classification = classifyTables(innerSelect, catalog);
+        TableClassification classification = classifyTables(innerSelect, catalog, options);
         int shardCount = classification.shardCount();
 
         QueryAnalysis innerAnalysis = QueryAnalysisExtractor.withMergeColumnNames(
@@ -172,11 +184,12 @@ public final class CalciteQueryPlanner implements QueryPlanner {
                 outerAnalysis, derivedColumnNames(nested, innerAnalysis), nested.outerTopK());
 
         List<BroadcastTable> subqueryBroadcasts = subqueryBroadcastTables(
-                innerSelect, catalog, classification.broadcastTables(), drivingTable);
+                innerSelect, catalog, classification, drivingTable);
         List<String> correlatedCoPartition = correlatedCoPartitionTables(
-                innerSelect, catalog, classification.broadcastTables(), subqueryBroadcasts, drivingTable);
-        BroadcastScope broadcastScope = BroadcastScope.of(
-                materializedBroadcastTables(classification.broadcastTables(), subqueryBroadcasts), queryId);
+                innerSelect, catalog, classification, subqueryBroadcasts, drivingTable);
+        BroadcastScope broadcastScope = broadcastScope(
+                classification, materializedBroadcastTables(classification.broadcastTables(), subqueryBroadcasts),
+                queryId, catalog);
 
         List<FragmentSpec> fragments = new ArrayList<>(shardCount);
         for (int shardId = 0; shardId < shardCount; shardId++) {
@@ -188,7 +201,8 @@ public final class CalciteQueryPlanner implements QueryPlanner {
 
         return new PlannedQuery(sql, List.of(drivingTable), classification.broadcastTables(),
                 fragments, mergeStrategy, innerAnalysis, List.of(), TopKSpec.none(),
-                nestedSpec, null, subqueryBroadcasts, correlatedCoPartition);
+                nestedSpec, null, subqueryBroadcasts, correlatedCoPartition, classification.coPartitionJoinTables(),
+                classification.shuffleJoinTables());
     }
 
     private static List<String> derivedColumnNames(
@@ -230,7 +244,7 @@ public final class CalciteQueryPlanner implements QueryPlanner {
         return MergeStrategyType.CONCATENATE;
     }
 
-    static TableClassification classifyTables(SqlSelect select, ClusterCatalog catalog) {
+    static TableClassification classifyTables(SqlSelect select, ClusterCatalog catalog, PlannerOptions options) {
         List<String> allTables = collectTableNames(select.getFrom());
         if (allTables.isEmpty()) {
             throw new IllegalArgumentException("No tables found in FROM clause");
@@ -242,6 +256,8 @@ public final class CalciteQueryPlanner implements QueryPlanner {
                         + ". Known tables: " + catalog.getShardedTableNames());
             }
         }
+
+        JoinPlacementAnalyzer.validateSelfJoins(select, catalog);
 
         String drivingTable = allTables.get(0);
         int maxShards = catalog.table(drivingTable).shardCount();
@@ -264,14 +280,20 @@ public final class CalciteQueryPlanner implements QueryPlanner {
             }
         }
 
+        JoinPlacementAnalyzer.Placement placement =
+                JoinPlacementAnalyzer.analyze(select, catalog, drivingTable, options);
+        Set<String> shuffled = placement.shuffledTableNames();
         List<BroadcastTable> broadcast = new ArrayList<>();
         for (String t : allTables) {
-            if (!t.equalsIgnoreCase(drivingTable)) {
-                broadcast.add(new BroadcastTable(t, catalog.table(t).shardCount()));
+            String lower = t.toLowerCase();
+            if (t.equalsIgnoreCase(drivingTable) || placement.coPartitioned().contains(lower) || shuffled.contains(lower)) {
+                continue;
             }
+            broadcast.add(new BroadcastTable(t, catalog.table(t).shardCount()));
         }
 
-        return new TableClassification(drivingTable, broadcast, maxShards);
+        return new TableClassification(
+                drivingTable, broadcast, maxShards, List.copyOf(placement.coPartitioned()), placement.shuffled());
     }
 
     static List<String> collectTableNames(SqlNode from) {
@@ -368,7 +390,28 @@ public final class CalciteQueryPlanner implements QueryPlanner {
         }
     }
 
-    record TableClassification(String drivingTable, List<BroadcastTable> broadcastTables, int shardCount) {}
+    record TableClassification(
+            String drivingTable,
+            List<BroadcastTable> broadcastTables,
+            int shardCount,
+            List<String> coPartitionJoinTables,
+            List<ShuffleJoinTable> shuffleJoinTables) {
+
+        Set<String> shuffledTableNames() {
+            Set<String> names = new LinkedHashSet<>();
+            for (ShuffleJoinTable table : shuffleJoinTables) {
+                names.add(table.tableName());
+            }
+            return names;
+        }
+    }
+
+    private static BroadcastScope broadcastScope(
+            TableClassification classification, Set<String> materialized, String queryId, ClusterCatalog catalog) {
+        return BroadcastScope.of(
+                materialized, queryId, catalog, classification.shuffledTableNames(),
+                Set.copyOf(classification.coPartitionJoinTables()));
+    }
 
     private static Map<String, Integer> catalogTableShardCounts(ClusterCatalog catalog) {
         Map<String, Integer> counts = new HashMap<>();
@@ -381,14 +424,15 @@ public final class CalciteQueryPlanner implements QueryPlanner {
     private static List<BroadcastTable> subqueryBroadcastTables(
             SqlSelect select,
             ClusterCatalog catalog,
-            List<BroadcastTable> mainBroadcastTables,
+            TableClassification classification,
             String drivingTable) {
         Set<String> alreadyBroadcast = new LinkedHashSet<>();
-        for (BroadcastTable broadcastTable : mainBroadcastTables) {
+        for (BroadcastTable broadcastTable : classification.broadcastTables()) {
             alreadyBroadcast.add(broadcastTable.tableName().toLowerCase());
         }
         List<BroadcastTable> subqueryBroadcasts = new ArrayList<>();
-        for (String tableName : SubqueryAnalyzer.uncorrelatedMultiShardTables(select, catalog, drivingTable)) {
+        for (String tableName : SubqueryAnalyzer.uncorrelatedMultiShardTables(
+                select, catalog, drivingTable, Set.copyOf(classification.coPartitionJoinTables()))) {
             if (!alreadyBroadcast.contains(tableName)) {
                 subqueryBroadcasts.add(new BroadcastTable(tableName, catalog.table(tableName).shardCount()));
             }
@@ -399,18 +443,19 @@ public final class CalciteQueryPlanner implements QueryPlanner {
     private static List<String> correlatedCoPartitionTables(
             SqlSelect select,
             ClusterCatalog catalog,
-            List<BroadcastTable> mainBroadcastTables,
+            TableClassification classification,
             List<BroadcastTable> subqueryBroadcastTables,
             String drivingTable) {
         Set<String> alreadyCovered = new LinkedHashSet<>();
-        for (BroadcastTable broadcastTable : mainBroadcastTables) {
+        for (BroadcastTable broadcastTable : classification.broadcastTables()) {
             alreadyCovered.add(broadcastTable.tableName().toLowerCase());
         }
         for (BroadcastTable broadcastTable : subqueryBroadcastTables) {
             alreadyCovered.add(broadcastTable.tableName().toLowerCase());
         }
         List<String> tables = new ArrayList<>();
-        for (String tableName : SubqueryAnalyzer.correlatedCoPartitionTables(select, catalog, drivingTable)) {
+        for (String tableName : SubqueryAnalyzer.correlatedCoPartitionTables(
+                select, catalog, drivingTable, Set.copyOf(classification.coPartitionJoinTables()))) {
             if (!alreadyCovered.contains(tableName)) {
                 tables.add(tableName);
             }

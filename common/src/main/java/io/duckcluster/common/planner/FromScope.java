@@ -46,6 +46,10 @@ final class FromScope {
         return tableNames;
     }
 
+    Map<String, String> aliasToTableName() {
+        return aliasToTableName;
+    }
+
     boolean hasAlias(String alias) {
         return aliasToTableName.containsKey(alias.toLowerCase());
     }

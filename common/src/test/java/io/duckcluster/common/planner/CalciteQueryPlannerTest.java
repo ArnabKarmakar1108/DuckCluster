@@ -135,28 +135,29 @@ class CalciteQueryPlannerTest {
         assertEquals(4, planned.fragments().size());
         // Tied shard counts: last table in FROM traversal order drives.
         assertEquals("orders", planned.tableName());
-        assertEquals(1, planned.broadcastTables().size());
-        assertEquals("lineitem", planned.broadcastTables().get(0).tableName());
+        assertTrue(planned.broadcastTables().isEmpty());
+        assertTrue(planned.coPartitionJoinTables().contains("lineitem"));
 
         String sql0 = planned.fragments().get(0).sql();
         assertTrue(sql0.contains("\"orders_shard0\".\"orders\""), "Driving table: " + sql0);
-        assertTrue(sql0.contains("__dc_bcast_lineitem"), "Lineitem is materialized broadcast: " + sql0);
-        assertTrue(!sql0.contains("UNION ALL"), "Broadcast avoids per-fragment UNION ALL: " + sql0);
+        assertTrue(sql0.contains("\"lineitem_shard0\""), "Co-partitioned lineitem shard: " + sql0);
+        assertTrue(!sql0.contains("__dc_bcast_"), "No broadcast for co-partition join: " + sql0);
     }
 
     @Test
     void planScopesBroadcastTempTablesToQueryId() {
         ClusterCatalog joinCatalog = ClusterCatalog.withTables(Map.of(
-                "lineitem", new TableShardConfig("lineitem", 4, "l_orderkey"),
-                "orders", new TableShardConfig("orders", 4, "o_orderkey")));
+                "lineitem", new TableShardConfig("lineitem", 6, "l_orderkey"),
+                "customer", new TableShardConfig("customer", 2, "c_custkey")));
 
         PlannedQuery planned = planner.plan(
-                "SELECT o.o_orderpriority, COUNT(*) FROM lineitem l JOIN orders o ON l.l_orderkey = o.o_orderkey GROUP BY o.o_orderpriority",
+                "SELECT c.c_name, SUM(l.l_extendedprice) FROM lineitem l "
+                        + "JOIN customer c ON l.l_custkey = c.c_custkey GROUP BY c.c_name",
                 joinCatalog,
                 "query-42");
 
         String sql0 = planned.fragments().get(0).sql();
-        assertTrue(sql0.contains("__dc_bcast_query-42_lineitem"),
+        assertTrue(sql0.contains("__dc_bcast_query-42_customer"),
                 "Broadcast table is query-scoped: " + sql0);
         assertTrue(!sql0.contains("UNION ALL"), "Broadcast avoids per-fragment UNION ALL: " + sql0);
     }
@@ -232,8 +233,24 @@ class CalciteQueryPlannerTest {
                 joinCatalog);
 
         assertEquals("lineitem", planned.tableName());
-        assertEquals(1, planned.broadcastTables().size());
-        assertEquals("orders", planned.broadcastTables().get(0).tableName());
+        assertTrue(planned.broadcastTables().isEmpty());
+        assertTrue(planned.coPartitionJoinTables().contains("orders"));
+    }
+
+    @Test
+    void selfJoinOnShardKeyIsAllowed() {
+        PlannedQuery planned = planner.plan(
+                "SELECT COUNT(*) FROM events e1 JOIN events e2 ON e1.id = e2.id",
+                catalog);
+        assertEquals("events", planned.tableName());
+        assertTrue(planned.fragments().get(0).sql().contains("\"events_shard0\".\"events\""));
+    }
+
+    @Test
+    void selfJoinOnNonKeyColumnIsRejected() {
+        assertThrows(IllegalArgumentException.class, () -> planner.plan(
+                "SELECT COUNT(*) FROM events e1 JOIN events e2 ON e1.category = e2.category",
+                catalog));
     }
 
     @Test
