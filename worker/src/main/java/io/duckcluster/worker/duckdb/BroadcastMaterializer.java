@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Materializes multi-shard broadcast tables once per worker query instead of UNION ALL per fragment. */
 public final class BroadcastMaterializer {
@@ -18,16 +19,37 @@ public final class BroadcastMaterializer {
 
     private final DuckDBConnectionPool pool;
     private final Map<String, Set<String>> tablesByQueryId = new ConcurrentHashMap<>();
+    private final Map<String, SharedBroadcast> sharedByVersion = new ConcurrentHashMap<>();
 
     public BroadcastMaterializer(DuckDBConnectionPool pool) {
         this.pool = pool;
     }
 
-    public String materialize(String queryId, String tableName, int shardCount) throws SQLException, InterruptedException {
+    public String materialize(String queryId, String tableName, int shardCount, long tableDataVersion)
+            throws SQLException, InterruptedException {
         String tempTable = BroadcastSqlNames.tempTable(queryId, tableName);
         if (shardCount <= 1) {
             return tempTable;
         }
+        if (tableDataVersion > 0) {
+            String cacheKey = tableName.toLowerCase() + "@" + tableDataVersion;
+            SharedBroadcast shared = sharedByVersion.computeIfAbsent(
+                    cacheKey, ignored -> createSharedBroadcast(tableName, shardCount, tableDataVersion));
+            shared.refCount.incrementAndGet();
+            tablesByQueryId.computeIfAbsent(queryId, ignored -> ConcurrentHashMap.newKeySet())
+                    .add("__shared__" + cacheKey);
+            LOG.debug("Reusing versioned broadcast {} for query {}", shared.tempTableName, queryId);
+            return shared.tempTableName;
+        }
+        return materializeEphemeral(queryId, tableName, shardCount, tempTable);
+    }
+
+    public String materialize(String queryId, String tableName, int shardCount) throws SQLException, InterruptedException {
+        return materialize(queryId, tableName, shardCount, 0L);
+    }
+
+    private String materializeEphemeral(String queryId, String tableName, int shardCount, String tempTable)
+            throws SQLException, InterruptedException {
         Connection connection = pool.checkout();
         if (connection == null) {
             throw new SQLException("Connection pool exhausted while materializing broadcast " + tableName);
@@ -49,16 +71,67 @@ public final class BroadcastMaterializer {
         if (tables == null || tables.isEmpty()) {
             return;
         }
+        Set<String> ephemeral = ConcurrentHashMap.newKeySet();
+        for (String entry : tables) {
+            if (entry.startsWith("__shared__")) {
+                String cacheKey = entry.substring("__shared__".length());
+                SharedBroadcast shared = sharedByVersion.get(cacheKey);
+                if (shared != null && shared.refCount.decrementAndGet() <= 0) {
+                    sharedByVersion.remove(cacheKey, shared);
+                    ephemeral.add(shared.tempTableName);
+                }
+                continue;
+            }
+            ephemeral.add(entry);
+        }
+        if (ephemeral.isEmpty()) {
+            return;
+        }
         Connection connection = pool.checkout();
         if (connection == null) {
             return;
         }
         try (Statement statement = connection.createStatement()) {
-            for (String tableName : List.copyOf(tables)) {
+            for (String tableName : List.copyOf(ephemeral)) {
                 statement.execute("DROP TABLE IF EXISTS " + quote(tableName));
             }
         } finally {
             pool.checkin(connection);
+        }
+    }
+
+    private SharedBroadcast createSharedBroadcast(String tableName, int shardCount, long tableDataVersion) {
+        String tempTable = BroadcastSqlNames.versionedTable(tableDataVersion, tableName);
+        try {
+            materializeIntoTable(tempTable, tableName, shardCount);
+            return new SharedBroadcast(tempTable, new AtomicInteger(0));
+        } catch (SQLException | InterruptedException e) {
+            throw new IllegalStateException("Failed to create shared broadcast for " + tableName, e);
+        }
+    }
+
+    private void materializeIntoTable(String tempTable, String tableName, int shardCount)
+            throws SQLException, InterruptedException {
+        Connection connection = pool.checkout();
+        if (connection == null) {
+            throw new SQLException("Connection pool exhausted while materializing broadcast " + tableName);
+        }
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("DROP TABLE IF EXISTS " + quote(tempTable));
+            statement.execute("CREATE TABLE " + quote(tempTable) + " AS (" + unionAllSql(tableName, shardCount) + ")");
+            LOG.info("Materialized shared broadcast {} ({} shards, table {})", tempTable, shardCount, tableName);
+        } finally {
+            pool.checkin(connection);
+        }
+    }
+
+    private static final class SharedBroadcast {
+        final String tempTableName;
+        final AtomicInteger refCount;
+
+        SharedBroadcast(String tempTableName, AtomicInteger refCount) {
+            this.tempTableName = tempTableName;
+            this.refCount = refCount;
         }
     }
 

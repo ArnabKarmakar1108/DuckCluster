@@ -1,6 +1,7 @@
 package io.duckcluster.worker.duckdb;
 
 import io.duckcluster.proto.v1.RowBatch;
+import io.duckcluster.proto.v1.SqlValueType;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
@@ -52,9 +53,39 @@ class FragmentExecutorPoolTest {
     }
 
     @Test
+    void execute_returnsUnavailable_whenDraining() throws Exception {
+        pool = new DuckDBConnectionPool(dbPath, 2, 500);
+        executor = new FragmentExecutor(pool, new RunningFragmentRegistry(), 1024, 512 * 1024);
+        executor.beginDrain();
+
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        CountDownLatch done = new CountDownLatch(1);
+        executor.execute("SELECT 1", "drain-q", 0, new StreamObserver<>() {
+            @Override
+            public void onNext(RowBatch value) {
+                fail("Should not receive data");
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                error.set(t);
+                done.countDown();
+            }
+
+            @Override
+            public void onCompleted() {
+                fail("Should not complete");
+            }
+        });
+        done.await();
+        assertInstanceOf(StatusRuntimeException.class, error.get());
+        assertEquals(Status.UNAVAILABLE.getCode(), ((StatusRuntimeException) error.get()).getStatus().getCode());
+    }
+
+    @Test
     void execute_returnsResourceExhausted_whenPoolExhausted() throws Exception {
         pool = new DuckDBConnectionPool(dbPath, 1, 50);
-        executor = new FragmentExecutor(pool, new RunningFragmentRegistry(), 1024);
+        executor = new FragmentExecutor(pool, new RunningFragmentRegistry(), 1024, 512 * 1024);
 
         Connection held = pool.checkout();
         assertNotNull(held);
@@ -78,9 +109,31 @@ class FragmentExecutorPoolTest {
     }
 
     @Test
+    void execute_reportsHugeintSumAsBigintOnWire() throws Exception {
+        pool = new DuckDBConnectionPool(dbPath, 2, 500);
+        executor = new FragmentExecutor(pool, new RunningFragmentRegistry(), 1024, 512 * 1024);
+
+        List<RowBatch> batches = Collections.synchronizedList(new ArrayList<>());
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        CountDownLatch done = new CountDownLatch(1);
+        executor.execute(
+                "SELECT category, SUM(CASE WHEN value > 10 THEN 1 ELSE 0 END) AS high FROM events GROUP BY category",
+                "hugeint-q", 0, new StreamObserver<>() {
+                    @Override public void onNext(RowBatch value) { batches.add(value); }
+                    @Override public void onError(Throwable t) { error.set(t); done.countDown(); }
+                    @Override public void onCompleted() { done.countDown(); }
+                });
+        done.await();
+
+        assertNull(error.get());
+        assertEquals(SqlValueType.SQL_VARCHAR, batches.get(0).getColumnValues(0).getType());
+        assertEquals(SqlValueType.SQL_BIGINT, batches.get(0).getColumnValues(1).getType());
+    }
+
+    @Test
     void execute_concurrentFragments_correctResults() throws Exception {
         pool = new DuckDBConnectionPool(dbPath, 2, 500);
-        executor = new FragmentExecutor(pool, new RunningFragmentRegistry(), 1024);
+        executor = new FragmentExecutor(pool, new RunningFragmentRegistry(), 1024, 512 * 1024);
 
         int threadCount = 4;
         ExecutorService threadPool = Executors.newFixedThreadPool(threadCount);

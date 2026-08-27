@@ -21,14 +21,18 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class FragmentExecutor {
     private static final Logger LOG = LoggerFactory.getLogger(FragmentExecutor.class);
     private final int batchSize;
+    private final int maxBatchBytes;
     private final DuckDBConnectionPool pool;
     private final RunningFragmentRegistry runningFragments;
     private final AtomicInteger inFlightFragments = new AtomicInteger();
+    private volatile boolean acceptingFragments = true;
 
-    public FragmentExecutor(DuckDBConnectionPool pool, RunningFragmentRegistry runningFragments, int batchSize) {
+    public FragmentExecutor(
+            DuckDBConnectionPool pool, RunningFragmentRegistry runningFragments, int batchSize, int maxBatchBytes) {
         this.pool = pool;
         this.runningFragments = runningFragments;
         this.batchSize = Math.max(1, batchSize);
+        this.maxBatchBytes = Math.max(64 * 1024, maxBatchBytes);
     }
 
     public int inFlightCount() {
@@ -39,7 +43,17 @@ public final class FragmentExecutor {
         return (double) inFlightFragments.get() / Math.max(1, numThreads);
     }
 
+    public void beginDrain() {
+        acceptingFragments = false;
+    }
+
     public void execute(String sql, String queryId, int fragmentId, StreamObserver<RowBatch> responseObserver) {
+        if (!acceptingFragments) {
+            responseObserver.onError(Status.UNAVAILABLE
+                    .withDescription("worker is draining and not accepting new fragments")
+                    .asRuntimeException());
+            return;
+        }
         String runKey = queryId + ":" + fragmentId;
         inFlightFragments.incrementAndGet();
         long startMs = System.currentTimeMillis();
@@ -70,7 +84,8 @@ public final class FragmentExecutor {
             List<SqlValueType> columnTypes = new ArrayList<>(columnCount);
             for (int columnIndex = 1; columnIndex <= columnCount; columnIndex++) {
                 columnNames.add(metadata.getColumnName(columnIndex));
-                columnTypes.add(SqlJdbcTypes.toProtoType(metadata.getColumnType(columnIndex)));
+                columnTypes.add(SqlJdbcTypes.toProtoType(
+                        metadata.getColumnType(columnIndex), metadata.getColumnTypeName(columnIndex)));
             }
 
             List<Column.Builder> columnBuilders = newColumnBuilders(columnNames, columnTypes);
@@ -91,7 +106,7 @@ public final class FragmentExecutor {
                     }
                 }
                 rowsInBatch++;
-                if (rowsInBatch >= batchSize) {
+                if (rowsInBatch >= batchSize || estimatedBatchBytes(columnBuilders) >= maxBatchBytes) {
                     emitBatch(responseObserver, columnNames, columnBuilders, rowsInBatch);
                     totalRows += rowsInBatch;
                     batchCount++;
@@ -137,6 +152,16 @@ public final class FragmentExecutor {
                     .setType(columnTypes.get(i)));
         }
         return builders;
+    }
+
+    private static int estimatedBatchBytes(List<Column.Builder> columnBuilders) {
+        int bytes = 0;
+        for (Column.Builder builder : columnBuilders) {
+            for (String value : builder.getValuesList()) {
+                bytes += value.length();
+            }
+        }
+        return bytes;
     }
 
     private static void emitBatch(

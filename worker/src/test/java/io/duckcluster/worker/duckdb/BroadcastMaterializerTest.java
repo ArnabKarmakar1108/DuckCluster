@@ -36,6 +36,30 @@ class BroadcastMaterializerTest {
     }
 
     @Test
+    void versionedBroadcastIsSharedAcrossQueries() throws Exception {
+        String tableA = materializer.materialize("query-a", "events", 2, 2L);
+        String tableB = materializer.materialize("query-b", "events", 2, 2L);
+        assertEquals(tableA, tableB);
+        assertTrue(tableA.startsWith("__dc_bcast_v2_"));
+
+        materializer.clearQuery("query-a");
+        Connection connection = pool.checkout();
+        try (Statement statement = connection.createStatement()) {
+            assertTableRowCount(statement, tableA, 2);
+        } finally {
+            pool.checkin(connection);
+        }
+
+        materializer.clearQuery("query-b");
+        Connection connectionAfter = pool.checkout();
+        try (Statement statement = connectionAfter.createStatement()) {
+            assertTableMissing(statement, tableA);
+        } finally {
+            pool.checkin(connectionAfter);
+        }
+    }
+
+    @Test
     void clearQueryDropsOnlyThatQueriesTables() throws Exception {
         String tableA = materializer.materialize("query-a", "events", 2);
         String tableB = materializer.materialize("query-b", "events", 2);

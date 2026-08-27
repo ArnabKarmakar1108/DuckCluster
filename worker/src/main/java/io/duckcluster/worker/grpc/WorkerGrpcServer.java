@@ -1,13 +1,29 @@
 package io.duckcluster.worker.grpc;
 
+import io.duckcluster.proto.v1.ActivateTableVersionRequest;
+import io.duckcluster.proto.v1.ActivateTableVersionResponse;
+import io.duckcluster.proto.v1.BeginShardPinRequest;
+import io.duckcluster.proto.v1.BeginShardPinResponse;
+import io.duckcluster.proto.v1.CancelQueryRequest;
+import io.duckcluster.proto.v1.CancelQueryResponse;
+import io.duckcluster.proto.v1.ClearBroadcastTablesRequest;
+import io.duckcluster.proto.v1.ClearBroadcastTablesResponse;
+import io.duckcluster.proto.v1.EndShardPinRequest;
+import io.duckcluster.proto.v1.EndShardPinResponse;
 import io.duckcluster.proto.v1.FragmentRequest;
 import io.duckcluster.proto.v1.LoadTempDataResponse;
+import io.duckcluster.proto.v1.MaterializeBroadcastRequest;
+import io.duckcluster.proto.v1.MaterializeBroadcastResponse;
 import io.duckcluster.proto.v1.PingRequest;
 import io.duckcluster.proto.v1.PingResponse;
 import io.duckcluster.proto.v1.ReadShardRequest;
 import io.duckcluster.proto.v1.ReceiveShardResponse;
 import io.duckcluster.proto.v1.RowBatch;
 import io.duckcluster.proto.v1.ShardDataChunk;
+import io.duckcluster.proto.v1.ShufflePieceChunk;
+import io.duckcluster.proto.v1.ShufflePieceResponse;
+import io.duckcluster.proto.v1.ShuffleTableRequest;
+import io.duckcluster.proto.v1.ShuffleTableResponse;
 import io.duckcluster.proto.v1.WorkerServiceGrpc;
 import io.duckcluster.common.shard.ShardNameValidator;
 import io.duckcluster.common.shard.ShardTransferChecksum;
@@ -16,7 +32,11 @@ import io.duckcluster.worker.duckdb.FragmentExecutor;
 import io.duckcluster.worker.duckdb.RunningFragmentRegistry;
 import io.duckcluster.worker.duckdb.ShardFileMetadata;
 import io.duckcluster.worker.duckdb.ShardManager;
+import io.duckcluster.worker.duckdb.ShardVersionActivator;
+import io.duckcluster.worker.duckdb.ShardOwnershipReporter;
 import io.duckcluster.worker.duckdb.TempShardCache;
+import io.duckcluster.worker.client.CoordinatorClient;
+import io.duckcluster.worker.shuffle.ShuffleExchange;
 import com.google.protobuf.ByteString;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
@@ -51,13 +71,16 @@ public final class WorkerGrpcServer {
     private final Path transferTempDir;
     private final int maxInboundMessageBytes;
     private final int shardTransferChunkBytes;
+    private final CoordinatorClient coordinatorClient;
+    private final ShuffleExchange shuffleExchange;
     private Server server;
 
     public WorkerGrpcServer(String workerId, String host, int port,
                             FragmentExecutor fragmentExecutor, RunningFragmentRegistry runningFragments,
                             ShardManager shardManager, TempShardCache tempShardCache,
                             BroadcastMaterializer broadcastMaterializer, Path transferTempDir,
-                            int maxInboundMessageBytes, int shardTransferChunkBytes) {
+                            int maxInboundMessageBytes, int shardTransferChunkBytes,
+                            CoordinatorClient coordinatorClient, ShuffleExchange shuffleExchange) {
         this.workerId = workerId;
         this.host = host;
         this.port = port;
@@ -69,6 +92,8 @@ public final class WorkerGrpcServer {
         this.transferTempDir = transferTempDir;
         this.maxInboundMessageBytes = maxInboundMessageBytes;
         this.shardTransferChunkBytes = Math.max(4096, shardTransferChunkBytes);
+        this.coordinatorClient = coordinatorClient;
+        this.shuffleExchange = shuffleExchange;
     }
 
     public void start() throws IOException {
@@ -116,15 +141,41 @@ public final class WorkerGrpcServer {
         }
 
         @Override
-        public void cancelQuery(
-                io.duckcluster.proto.v1.CancelQueryRequest request,
-                StreamObserver<io.duckcluster.proto.v1.CancelQueryResponse> responseObserver) {
+        public void cancelQuery(CancelQueryRequest request, StreamObserver<CancelQueryResponse> responseObserver) {
             int cancelled = runningFragments.cancelQuery(request.getQueryId());
-            responseObserver.onNext(io.duckcluster.proto.v1.CancelQueryResponse.newBuilder()
+            responseObserver.onNext(CancelQueryResponse.newBuilder()
                     .setAccepted(true)
                     .setCancelledFragments(cancelled)
                     .build());
             responseObserver.onCompleted();
+        }
+
+        @Override
+        public void activateTableVersion(
+                ActivateTableVersionRequest request,
+                StreamObserver<ActivateTableVersionResponse> responseObserver) {
+            try {
+                ShardNameValidator.validateTableName(request.getTableName());
+                if (request.getVersion() < 1) {
+                    throw new IllegalArgumentException("version must be >= 1");
+                }
+                ShardVersionActivator activator = new ShardVersionActivator(shardManager.getDataDir(), shardManager);
+                int shards = activator.activate(request.getTableName(), request.getVersion());
+                if (shards > 0) {
+                    reportShardOwnership();
+                }
+                responseObserver.onNext(ActivateTableVersionResponse.newBuilder()
+                        .setAccepted(true)
+                        .setShardsActivated(shards)
+                        .setMessage("activated " + shards + " shard file(s)")
+                        .build());
+                responseObserver.onCompleted();
+            } catch (IllegalArgumentException e) {
+                responseObserver.onError(Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException());
+            } catch (Exception e) {
+                LOG.error("ActivateTableVersion failed: {}", e.getMessage());
+                responseObserver.onError(Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
+            }
         }
 
         @Override
@@ -205,8 +256,18 @@ public final class WorkerGrpcServer {
                             ShardNameValidator.validateTableName(tableName);
                             ShardNameValidator.validateShardId(shardId);
                             String fileName = tableName + "_shard" + shardId + ".duckdb";
-                            finalPath = shardManager.getDataDir().resolve(fileName);
-                            ShardNameValidator.validatePathUnderBase(shardManager.getDataDir(), finalPath);
+                            long stagingVersion = chunk.getStagingVersion();
+                            if (stagingVersion > 0) {
+                                Path stagingDir = shardManager.getDataDir()
+                                        .resolve(".staging")
+                                        .resolve("v" + stagingVersion);
+                                Files.createDirectories(stagingDir);
+                                finalPath = stagingDir.resolve(fileName);
+                                ShardNameValidator.validatePathUnderBase(stagingDir, finalPath);
+                            } else {
+                                finalPath = shardManager.getDataDir().resolve(fileName);
+                                ShardNameValidator.validatePathUnderBase(shardManager.getDataDir(), finalPath);
+                            }
                             tempPath = transferTempDir.resolve(fileName + ".tmp");
                             ShardNameValidator.validatePathUnderBase(transferTempDir, tempPath);
                             outputStream = new FileOutputStream(tempPath.toFile());
@@ -410,25 +471,27 @@ public final class WorkerGrpcServer {
         }
 
         @Override
-        public void beginShardPin(
-                io.duckcluster.proto.v1.BeginShardPinRequest request,
-                StreamObserver<io.duckcluster.proto.v1.BeginShardPinResponse> responseObserver) {
+        public void beginShardPin(BeginShardPinRequest request, StreamObserver<BeginShardPinResponse> responseObserver) {
             long leaseMs = request.getLeaseTtlSec() > 0
                     ? TimeUnit.SECONDS.toMillis(request.getLeaseTtlSec())
                     : 0L;
             tempShardCache.beginPinSession(request.getQueryId(), leaseMs);
-            responseObserver.onNext(io.duckcluster.proto.v1.BeginShardPinResponse.newBuilder()
+            responseObserver.onNext(BeginShardPinResponse.newBuilder()
                     .setAccepted(true)
                     .build());
             responseObserver.onCompleted();
         }
 
         @Override
-        public void endShardPin(
-                io.duckcluster.proto.v1.EndShardPinRequest request,
-                StreamObserver<io.duckcluster.proto.v1.EndShardPinResponse> responseObserver) {
+        public void endShardPin(EndShardPinRequest request, StreamObserver<EndShardPinResponse> responseObserver) {
+            if (shouldInjectEndPinFailure()) {
+                responseObserver.onError(Status.INTERNAL
+                        .withDescription("injected EndShardPin failure (test hook)")
+                        .asRuntimeException());
+                return;
+            }
             tempShardCache.endPinSession(request.getQueryId());
-            responseObserver.onNext(io.duckcluster.proto.v1.EndShardPinResponse.newBuilder()
+            responseObserver.onNext(EndShardPinResponse.newBuilder()
                     .setAccepted(true)
                     .build());
             responseObserver.onCompleted();
@@ -436,12 +499,15 @@ public final class WorkerGrpcServer {
 
         @Override
         public void materializeBroadcast(
-                io.duckcluster.proto.v1.MaterializeBroadcastRequest request,
-                StreamObserver<io.duckcluster.proto.v1.MaterializeBroadcastResponse> responseObserver) {
+                MaterializeBroadcastRequest request,
+                StreamObserver<MaterializeBroadcastResponse> responseObserver) {
             try {
                 String tempTable = broadcastMaterializer.materialize(
-                        request.getQueryId(), request.getTableName(), request.getShardCount());
-                responseObserver.onNext(io.duckcluster.proto.v1.MaterializeBroadcastResponse.newBuilder()
+                        request.getQueryId(),
+                        request.getTableName(),
+                        request.getShardCount(),
+                        request.getTableDataVersion());
+                responseObserver.onNext(MaterializeBroadcastResponse.newBuilder()
                         .setAccepted(true)
                         .setTempTableName(tempTable)
                         .build());
@@ -456,11 +522,12 @@ public final class WorkerGrpcServer {
 
         @Override
         public void clearBroadcastTables(
-                io.duckcluster.proto.v1.ClearBroadcastTablesRequest request,
-                StreamObserver<io.duckcluster.proto.v1.ClearBroadcastTablesResponse> responseObserver) {
+                ClearBroadcastTablesRequest request,
+                StreamObserver<ClearBroadcastTablesResponse> responseObserver) {
             try {
                 broadcastMaterializer.clearQuery(request.getQueryId());
-                responseObserver.onNext(io.duckcluster.proto.v1.ClearBroadcastTablesResponse.newBuilder()
+                shuffleExchange.clearQuery(request.getQueryId());
+                responseObserver.onNext(ClearBroadcastTablesResponse.newBuilder()
                         .setAccepted(true)
                         .build());
                 responseObserver.onCompleted();
@@ -470,6 +537,36 @@ public final class WorkerGrpcServer {
                         .withDescription(e.getMessage()).asRuntimeException());
             }
         }
+
+        @Override
+        public void shuffleTable(ShuffleTableRequest request, StreamObserver<ShuffleTableResponse> responseObserver) {
+            try {
+                responseObserver.onNext(shuffleExchange.shuffle(request));
+                responseObserver.onCompleted();
+            } catch (IllegalArgumentException e) {
+                responseObserver.onError(Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException());
+            } catch (Exception e) {
+                LOG.error("Shuffle of {} for query {} failed", request.getTableName(), request.getQueryId(), e);
+                responseObserver.onError(Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
+            }
+        }
+
+        @Override
+        public StreamObserver<ShufflePieceChunk> receiveShufflePiece(
+                StreamObserver<ShufflePieceResponse> responseObserver) {
+            return shuffleExchange.receive(responseObserver);
+        }
+
+        private void reportShardOwnership() {
+            coordinatorClient.updateShardOwnership(
+                    workerId,
+                    ShardOwnershipReporter.toOwnership(shardManager, shardManager.getAttachedShards()));
+        }
+    }
+
+    private static boolean shouldInjectEndPinFailure() {
+        return "1".equals(System.getenv("DUCKCLUSTER_TEST_FAIL_END_SHARD_PIN"))
+                || "true".equalsIgnoreCase(System.getenv("DUCKCLUSTER_TEST_FAIL_END_SHARD_PIN"));
     }
 
     private static void verifyTransferChecksum(long bytesWritten, long crcValue, ShardDataChunk chunk)
