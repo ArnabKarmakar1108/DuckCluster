@@ -22,6 +22,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.DoubleSupplier;
 
 public final class CoordinatorClient implements AutoCloseable {
@@ -33,9 +34,12 @@ public final class CoordinatorClient implements AutoCloseable {
     private final CoordinatorServiceGrpc.CoordinatorServiceStub asyncStub;
     private ScheduledExecutorService heartbeatExecutor;
     private volatile StreamObserver<HeartbeatRequest> heartbeatRequestObserver;
-    private volatile long lastCoordinatorBootEpoch;
+    private final AtomicLong lastCoordinatorBootEpoch = new AtomicLong();
     private volatile Runnable reconnectHandler;
     private final AtomicBoolean heartbeatStreamOpen = new AtomicBoolean();
+    private final AtomicBoolean reregistrationPending = new AtomicBoolean();
+    private final Object registrationLock = new Object();
+    private volatile boolean closed;
 
     public CoordinatorClient(ClusterConfig config) {
         this.config = config;
@@ -154,20 +158,15 @@ public final class CoordinatorClient implements AutoCloseable {
     }
 
     private void scheduleReconnect(String workerId) {
-        if (heartbeatExecutor == null) {
+        if (heartbeatExecutor == null || closed) {
             return;
         }
         heartbeatExecutor.schedule(() -> {
-            Runnable handler = reconnectHandler;
-            if (handler != null) {
-                try {
-                    LOG.info("Re-registering worker {} after coordinator reconnect", workerId);
-                    handler.run();
-                } catch (Exception e) {
-                    LOG.warn("Worker re-registration failed for {}: {}", workerId, e.getMessage());
-                }
+            LOG.info("Re-registering worker {} after coordinator reconnect", workerId);
+            runReregistration(workerId);
+            if (!closed) {
+                openHeartbeatStream(workerId);
             }
-            openHeartbeatStream(workerId);
         }, 2, TimeUnit.SECONDS);
     }
 
@@ -175,24 +174,52 @@ public final class CoordinatorClient implements AutoCloseable {
         if (bootEpoch == 0) {
             return;
         }
-        long previous = lastCoordinatorBootEpoch;
-        if (previous != 0 && previous != bootEpoch) {
-            LOG.warn("Coordinator boot epoch changed for {} ({} -> {}), re-registering",
-                    workerId, previous, bootEpoch);
-            Runnable handler = reconnectHandler;
-            if (handler != null) {
-                try {
-                    handler.run();
-                } catch (Exception e) {
-                    LOG.warn("Worker re-registration after boot epoch change failed: {}", e.getMessage());
-                }
+        long previous = lastCoordinatorBootEpoch.getAndSet(bootEpoch);
+        if (previous == 0 || previous == bootEpoch) {
+            return;
+        }
+        LOG.warn("Coordinator boot epoch changed for {} ({} -> {}), re-registering",
+                workerId, previous, bootEpoch);
+        requestReregistration(workerId);
+    }
+
+    /**
+     * Re-registration reads shard metadata through the worker's DuckDB admin connection, so it must
+     * never run on a gRPC callback thread or concurrently with itself.
+     */
+    private void requestReregistration(String workerId) {
+        if (!reregistrationPending.compareAndSet(false, true)) {
+            return;
+        }
+        ScheduledExecutorService executor = heartbeatExecutor;
+        if (executor == null || executor.isShutdown()) {
+            reregistrationPending.set(false);
+            runReregistration(workerId);
+            return;
+        }
+        executor.execute(() -> {
+            reregistrationPending.set(false);
+            runReregistration(workerId);
+        });
+    }
+
+    private void runReregistration(String workerId) {
+        Runnable handler = reconnectHandler;
+        if (handler == null || closed) {
+            return;
+        }
+        synchronized (registrationLock) {
+            try {
+                handler.run();
+            } catch (Exception e) {
+                LOG.warn("Worker re-registration failed for {}: {}", workerId, e.getMessage());
             }
         }
-        lastCoordinatorBootEpoch = bootEpoch;
     }
 
     @Override
     public void close() {
+        closed = true;
         if (heartbeatExecutor != null) {
             heartbeatExecutor.shutdownNow();
         }

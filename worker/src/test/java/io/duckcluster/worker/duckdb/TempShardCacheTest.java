@@ -114,6 +114,22 @@ class TempShardCacheTest {
     }
 
     @Test
+    void expiredPinSession_releasesPinsForEviction() throws Exception {
+        Path pinCacheDir = tempDir.resolve("pin-cache");
+        TempShardCache pinned = new TempShardCache(shardManager, null, "worker-1", pinCacheDir, 2, 1L);
+        pinned.beginPinSession("abandoned-query", 1L);
+        pinned.loadShard("events", 0, createShardFile("events", 0), "abandoned-query");
+        pinned.loadShard("events", 1, createShardFile("events", 1), "abandoned-query");
+
+        Thread.sleep(5);
+        pinned.runPinReaperOnce();
+
+        pinned.loadShard("events", 2, createShardFile("events", 2));
+        assertTrue(pinned.hasShard("events", 2));
+        pinned.close();
+    }
+
+    @Test
     void pinSession_preventsEvictionDuringBroadcastPrefetch() throws Exception {
         cache.beginPinSession("query-pin", 60_000);
         try {

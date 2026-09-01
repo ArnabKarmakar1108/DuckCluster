@@ -54,7 +54,22 @@ public final class TempShardCache implements AutoCloseable {
             thread.setDaemon(true);
             return thread;
         });
-        this.reaper.scheduleAtFixedRate(this::expireAbandonedPins, 30, 30, TimeUnit.SECONDS);
+        long reaperIntervalMs = parseReaperIntervalMs();
+        long initialDelayMs = Math.min(reaperIntervalMs, 30_000L);
+        this.reaper.scheduleAtFixedRate(
+                this::expireAbandonedPins, initialDelayMs, reaperIntervalMs, TimeUnit.MILLISECONDS);
+    }
+
+    private static long parseReaperIntervalMs() {
+        String raw = System.getenv("DUCKCLUSTER_PIN_REAPER_INTERVAL_MS");
+        if (raw == null || raw.isBlank()) {
+            return TimeUnit.SECONDS.toMillis(30);
+        }
+        try {
+            return Math.max(100L, Long.parseLong(raw.trim()));
+        } catch (NumberFormatException e) {
+            return TimeUnit.SECONDS.toMillis(30);
+        }
     }
 
     public synchronized void beginPinSession(String queryId, long leaseMs) {
@@ -159,6 +174,11 @@ public final class TempShardCache implements AutoCloseable {
             LOG.warn("Expiring abandoned shard pin for query {}", queryId);
             endPinSession(queryId);
         }
+    }
+
+    /** Runs the pin reaper once (used by unit tests). */
+    synchronized void runPinReaperOnce() {
+        expireAbandonedPins();
     }
 
     private void makeRoom() {

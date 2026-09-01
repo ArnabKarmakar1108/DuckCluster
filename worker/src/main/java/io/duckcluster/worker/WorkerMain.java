@@ -10,7 +10,9 @@ import io.duckcluster.worker.duckdb.ShardFileWatcher;
 import io.duckcluster.worker.duckdb.ShardManager;
 import io.duckcluster.worker.duckdb.ShardOwnershipReporter;
 import io.duckcluster.worker.duckdb.TempShardCache;
+import io.duckcluster.worker.duckdb.WorkerStorageJanitor;
 import io.duckcluster.worker.grpc.WorkerGrpcServer;
+import io.duckcluster.worker.shuffle.ShuffleExchange;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,6 +39,7 @@ public final class WorkerMain {
         if (!Files.exists(dataDir)) {
             Files.createDirectories(dataDir);
         }
+        WorkerStorageJanitor.cleanupStaleTempFiles(dataDir);
         String dbPath = config.dataDir() + "/worker-" + workerId + ".db";
 
         ShardManager shardManager = new ShardManager(dbPath, dataDir);
@@ -52,8 +55,9 @@ public final class WorkerMain {
         DuckDBConnectionPool pool = new DuckDBConnectionPool(
                 dbPath, config.poolSize(), config.poolWaitMs(), config.workerMemoryLimitMb(), duckdbTempDir);
         RunningFragmentRegistry runningFragments = new RunningFragmentRegistry();
+        int maxBatchBytes = Math.max(256 * 1024, config.grpcMaxInboundMessageBytes() / 2);
         FragmentExecutor fragmentExecutor =
-                new FragmentExecutor(pool, runningFragments, config.fragmentBatchRows());
+                new FragmentExecutor(pool, runningFragments, config.fragmentBatchRows(), maxBatchBytes);
         BroadcastMaterializer broadcastMaterializer = new BroadcastMaterializer(pool);
         CoordinatorClient coordinatorClient = new CoordinatorClient(config);
 
@@ -63,16 +67,22 @@ public final class WorkerMain {
         TempShardCache tempShardCache = new TempShardCache(
                 shardManager, coordinatorClient, workerId, cacheDir, config.cacheMaxShards(), config.shardPinLeaseMs());
 
+        ShuffleExchange shuffleExchange = new ShuffleExchange(
+                workerId, pool, shardManager, dataDir.resolve(".shuffle-tmp"), config.shardTransferChunkBytes(),
+                config.grpcMaxInboundMessageBytes(), config.workerRpcDeadlineMs());
+
         WorkerGrpcServer workerServer = new WorkerGrpcServer(
                 workerId, host, port, fragmentExecutor, runningFragments, shardManager, tempShardCache,
                 broadcastMaterializer, transferTempDir, config.grpcMaxInboundMessageBytes(),
-                config.shardTransferChunkBytes());
+                config.shardTransferChunkBytes(), coordinatorClient, shuffleExchange);
 
         ShardFileWatcher watcher = new ShardFileWatcher(
                 dataDir, shardManager, coordinatorClient, workerId, config.watcherIntervalMs());
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Shutting down worker {}", workerId);
+            coordinatorClient.close();
+            fragmentExecutor.beginDrain();
             long drainDeadline = System.currentTimeMillis() + 30_000;
             while (fragmentExecutor.inFlightCount() > 0 && System.currentTimeMillis() < drainDeadline) {
                 try {
@@ -85,6 +95,7 @@ public final class WorkerMain {
             watcher.close();
             tempShardCache.close();
             workerServer.stop();
+            shuffleExchange.close();
             pool.close();
             shardManager.close();
         }));

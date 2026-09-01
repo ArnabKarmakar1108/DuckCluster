@@ -25,6 +25,7 @@ public final class ShardManager implements AutoCloseable {
     private final Path dataDir;
     private final Map<String, ShardFileMetadata> attachedShards = new ConcurrentHashMap<>();
     private final Map<String, ShardFileMetadata> cachedShards = new ConcurrentHashMap<>();
+    private boolean closed;
 
     public ShardManager(String mainDbPath, Path dataDir) throws SQLException {
         this.adminConnection = DriverManager.getConnection("jdbc:duckdb:" + mainDbPath);
@@ -46,7 +47,7 @@ public final class ShardManager implements AutoCloseable {
 
     public synchronized void detachShard(ShardFileMetadata meta) throws SQLException {
         String catalogName = meta.catalogName();
-        if (!attachedShards.containsKey(catalogName)) {
+        if (closed || !attachedShards.containsKey(catalogName)) {
             return;
         }
         try (Statement stmt = adminConnection.createStatement()) {
@@ -117,7 +118,7 @@ public final class ShardManager implements AutoCloseable {
 
     public synchronized void detachCachedShard(ShardFileMetadata meta) throws SQLException {
         String catalogName = meta.catalogName();
-        if (!cachedShards.containsKey(catalogName)) {
+        if (closed || !cachedShards.containsKey(catalogName)) {
             return;
         }
         try (Statement stmt = adminConnection.createStatement()) {
@@ -164,8 +165,8 @@ public final class ShardManager implements AutoCloseable {
         return dataDir;
     }
 
-    public long estimateRowCount(ShardFileMetadata meta) {
-        if (!attachedShards.containsKey(meta.catalogName())) {
+    public synchronized long estimateRowCount(ShardFileMetadata meta) {
+        if (closed || !attachedShards.containsKey(meta.catalogName())) {
             return 0L;
         }
         String qualified = meta.catalogName() + "." + meta.tableName();
@@ -180,8 +181,8 @@ public final class ShardManager implements AutoCloseable {
         return 0L;
     }
 
-    public List<ShardColumnMetadata> describeTable(ShardFileMetadata meta) {
-        if (!attachedShards.containsKey(meta.catalogName())) {
+    public synchronized List<ShardColumnMetadata> describeTable(ShardFileMetadata meta) {
+        if (closed || !attachedShards.containsKey(meta.catalogName())) {
             return List.of();
         }
         String qualified = meta.catalogName() + "." + meta.tableName();
@@ -205,6 +206,10 @@ public final class ShardManager implements AutoCloseable {
 
     @Override
     public synchronized void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
         try {
             adminConnection.close();
         } catch (SQLException e) {
