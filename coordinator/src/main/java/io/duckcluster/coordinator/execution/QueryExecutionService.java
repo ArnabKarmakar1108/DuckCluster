@@ -13,10 +13,13 @@ import io.duckcluster.common.model.PlannedQuery;
 import io.duckcluster.common.model.QueryResult;
 import io.duckcluster.common.planner.QueryPlanner;
 import io.duckcluster.common.registry.WorkerRegistry;
+import io.duckcluster.coordinator.catalog.CatalogDispatchValidator;
 import io.duckcluster.coordinator.catalog.ShardCatalog;
 import io.duckcluster.coordinator.merger.MergeExecutionService;
 import io.duckcluster.coordinator.merger.MergeStreamRegistry;
 import io.duckcluster.coordinator.merger.MergeStrategyRegistry;
+import io.duckcluster.coordinator.http.ApiErrorCode;
+import io.duckcluster.coordinator.http.ApiException;
 import io.duckcluster.coordinator.monitor.QueryActivityTracker;
 import io.duckcluster.coordinator.worker.WorkerNodeClient;
 import io.duckcluster.proto.v1.ShardDataChunk;
@@ -36,9 +39,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import io.duckcluster.coordinator.http.ApiErrorCode;
-import io.duckcluster.coordinator.http.ApiException;
-
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -66,6 +66,8 @@ public final class QueryExecutionService {
     private final QueryAdmissionControl admission;
     private final QueryActivityTracker activityTracker;
     private final MergeExecutionService mergeExecutionService;
+    private final CatalogDispatchValidator catalogDispatchValidator;
+    private final ShuffleJoinExecutor shuffleJoinExecutor;
     private final ConcurrentHashMap<String, ActiveQueryHandle> activeQueries = new ConcurrentHashMap<>();
     private static final int PREFETCH_MAX_ATTEMPTS = 3;
 
@@ -165,6 +167,7 @@ public final class QueryExecutionService {
         this.admission = admission;
         this.activityTracker = activityTracker;
         this.mergeExecutionService = mergeExecutionService;
+        this.catalogDispatchValidator = new CatalogDispatchValidator(catalog, shardCatalog);
         int poolSize = Math.max(1, maxConcurrentFragments);
         this.fragmentAdmission = new Semaphore(poolSize);
         this.fragmentExecutor = Executors.newFixedThreadPool(poolSize, r -> {
@@ -172,6 +175,7 @@ public final class QueryExecutionService {
             t.setDaemon(true);
             return t;
         });
+        this.shuffleJoinExecutor = new ShuffleJoinExecutor(registry, shardCatalog, workerClient, fragmentExecutor);
     }
 
     public double workerLoad(String workerId) {
@@ -182,11 +186,11 @@ public final class QueryExecutionService {
     }
 
     public PlannedQuery explainPlan(String sql) {
-        try {
-            return planner.plan(sql, catalog, UUID.randomUUID().toString());
-        } catch (IllegalArgumentException planningError) {
-            throw new ApiException(ApiErrorCode.PLANNING_ERROR, planningError.getMessage(), planningError);
-        }
+        return planAndValidate(sql, UUID.randomUUID().toString());
+    }
+
+    public ClusterCatalog clusterCatalog() {
+        return catalog;
     }
 
     public QueryResult execute(String sql) {
@@ -216,16 +220,11 @@ public final class QueryExecutionService {
         try {
             ensureNotCancelled(queryId);
             trackPhase(queryId, QueryActivityTracker.Phase.PLAN);
-            PlannedQuery plan;
-            try {
-                plan = planner.plan(sql, catalog, queryId);
-            } catch (IllegalArgumentException planningError) {
-                throw new ApiException(ApiErrorCode.PLANNING_ERROR, planningError.getMessage(), planningError);
-            }
+            PlannedQuery plan = planAndValidate(sql, queryId);
             trackFragmentsTotal(queryId, plan.fragments().size());
-            LOG.info("Query [{}] planned: table={}, fragments={}, broadcast={}, strategy={}",
-                    queryId, plan.tableName(), plan.fragments().size(),
-                    plan.broadcastTables().size(), plan.mergeStrategy());
+            LOG.info("Query [{}] planned: table={}, fragments={}, broadcast={}, coPartitioned={}, shuffled={}, strategy={}",
+                    queryId, plan.tableName(), plan.fragments().size(), plan.broadcastTables().size(),
+                    plan.coPartitionJoinTables(), plan.shuffleJoinTables().size(), plan.mergeStrategy());
 
             if (registry.workerCount() == 0) {
                 throw new ApiException(ApiErrorCode.NO_WORKERS, "No workers registered");
@@ -238,26 +237,30 @@ public final class QueryExecutionService {
 
             trackPhase(queryId, QueryActivityTracker.Phase.PREFETCH);
             if (!plan.broadcastTables().isEmpty() || !plan.subqueryBroadcastTables().isEmpty()) {
-            Set<String> targetWorkerIds = new HashSet<>(fragmentTargets.values());
-            long prefetchStart = System.currentTimeMillis();
-            int prefetchShards = plan.broadcastTables().stream().mapToInt(BroadcastTable::shardCount).sum()
-                    + plan.subqueryBroadcastTables().stream().mapToInt(BroadcastTable::shardCount).sum();
-            LOG.info("Query [{}] prefetching {} broadcast/subquery shards to {} workers",
-                    queryId, prefetchShards, targetWorkerIds.size());
-            prefetchBroadcastShards(plan.broadcastTables(), targetWorkerIds);
-            prefetchBroadcastShards(plan.subqueryBroadcastTables(), targetWorkerIds);
-            LOG.info("Query [{}] prefetch complete ({}ms)", queryId, System.currentTimeMillis() - prefetchStart);
-        } else {
-            long prefetchStart = System.currentTimeMillis();
-            prefetchDrivingShards(plan, fragmentTargets);
-            LOG.info("Query [{}] driving-shard prefetch complete ({}ms)",
-                    queryId, System.currentTimeMillis() - prefetchStart);
-        }
+                Set<String> targetWorkerIds = new HashSet<>(fragmentTargets.values());
+                long prefetchStart = System.currentTimeMillis();
+                int prefetchShards = plan.broadcastTables().stream().mapToInt(BroadcastTable::shardCount).sum()
+                        + plan.subqueryBroadcastTables().stream().mapToInt(BroadcastTable::shardCount).sum();
+                LOG.info("Query [{}] prefetching {} broadcast/subquery shards to {} workers",
+                        queryId, prefetchShards, targetWorkerIds.size());
+                prefetchBroadcastShards(plan.broadcastTables(), targetWorkerIds);
+                prefetchBroadcastShards(plan.subqueryBroadcastTables(), targetWorkerIds);
+                LOG.info("Query [{}] prefetch complete ({}ms)", queryId, System.currentTimeMillis() - prefetchStart);
+            } else {
+                long prefetchStart = System.currentTimeMillis();
+                prefetchDrivingShards(plan, fragmentTargets);
+                LOG.info("Query [{}] driving-shard prefetch complete ({}ms)",
+                        queryId, System.currentTimeMillis() - prefetchStart);
+            }
 
         Set<String> preparedWorkers = prepareWorkersForQuery(queryId, plan, fragmentTargets);
         activeQuery.setPreparedWorkers(preparedWorkers);
         boolean streamMergeToDuckDb = MergeStreamRegistry.tryStart(queryId, plan);
         try {
+            if (!plan.shuffleJoinTables().isEmpty()) {
+                ensureNotCancelled(queryId);
+                shuffleJoinExecutor.run(queryId, plan, fragmentTargets);
+            }
             ensureNotCancelled(queryId);
             trackPhase(queryId, QueryActivityTracker.Phase.FRAGMENTS);
             List<CompletableFuture<ExecutionOutcome>> futures = new ArrayList<>(plan.fragments().size());
@@ -338,11 +341,16 @@ public final class QueryExecutionService {
             Map<String, RowBatchData> coordinatorTables = fetchCoordinatorTables(queryId, plan);
             MergeContext context = new MergeContext(queryId, plan, fragmentResults, durationMs, coordinatorTables);
             trackPhase(queryId, QueryActivityTracker.Phase.MERGE);
-            QueryResult merged = mergeExecutionService.run(() -> mergeStrategy.merge(context));
-            if (spool != null && !merged.rows().isEmpty()) {
-                spool.writeAll(merged.columns(), merged.rows());
-                merged = new QueryResult(merged.queryId(), merged.columns(), List.of(), merged.stats());
+            if (spool != null) {
+                MergeSpoolHooks.attach(queryId, MergeSpoolHooks.forSpool(spool));
             }
+            QueryResult merged;
+            try {
+                merged = mergeExecutionService.run(() -> mergeStrategy.merge(context));
+            } finally {
+                MergeSpoolHooks.remove(queryId);
+            }
+            merged = AsyncQuerySpoolSupport.toClientResult(spool, merged);
             LOG.info("Query [{}] complete: {}ms, {} fragments, {} workers",
                     queryId, durationMs, plan.fragments().size(), workerDurationsMs.size());
             QueryResult timed = withTiming(merged, durationMs, workerDurationsMs);
@@ -641,6 +649,10 @@ public final class QueryExecutionService {
         if (preferredWorkerId != null) {
             candidates.add(preferredWorkerId);
         }
+        if (!plan.shuffleJoinTables().isEmpty()) {
+            // Shuffled bucket rows exist only on the worker they were sent to.
+            return List.copyOf(candidates);
+        }
         for (String ownerId : shardCatalog.getOwners(plan.tableName(), shardId)) {
             if (registry.getWorker(ownerId).isPresent()) {
                 candidates.add(ownerId);
@@ -690,6 +702,11 @@ public final class QueryExecutionService {
             }
         }
         for (String tableName : plan.correlatedCoPartitionTables()) {
+            if (!workerHasShard(workerId, tableName, drivingShardId)) {
+                prefetchShard(target, tableName, drivingShardId, queryId);
+            }
+        }
+        for (String tableName : plan.coPartitionJoinTables()) {
             if (!workerHasShard(workerId, tableName, drivingShardId)) {
                 prefetchShard(target, tableName, drivingShardId, queryId);
             }
@@ -747,6 +764,31 @@ public final class QueryExecutionService {
         return false;
     }
 
+    private void materializeBroadcastWithRetry(
+            WorkerRegistry.WorkerRecord worker, String queryId, String tableName, int shardCount) {
+        RuntimeException lastFailure = null;
+        for (int attempt = 1; attempt <= PREFETCH_MAX_ATTEMPTS; attempt++) {
+            try {
+                workerClient.materializeBroadcast(
+                        worker, queryId, tableName, shardCount, catalog.activeDataVersion(tableName));
+                return;
+            } catch (RuntimeException e) {
+                lastFailure = e;
+                LOG.warn(
+                        "Broadcast materialize attempt {}/{} failed for {} on {}: {}",
+                        attempt,
+                        PREFETCH_MAX_ATTEMPTS,
+                        tableName,
+                        worker.workerId(),
+                        e.getMessage());
+                sleepQuietly(50L * attempt);
+            }
+        }
+        if (lastFailure != null) {
+            throw lastFailure;
+        }
+    }
+
     private WorkerRegistry.WorkerRecord findSourceWorker(String tableName, int shardId) {
         List<String> sourceOwners = shardCatalog.getActualOwners(tableName, shardId);
         if (sourceOwners.isEmpty()) {
@@ -779,14 +821,36 @@ public final class QueryExecutionService {
                     .orElseThrow(() -> new IllegalStateException("Worker " + workerId + " not available"));
             long leaseTtlSec = TimeUnit.MILLISECONDS.toSeconds(shardPinLeaseMs);
             workerClient.beginShardPin(worker, queryId, leaseTtlSec);
-            for (int shardId : shardIds) {
-                ensureShardsLocal(queryId, plan, workerId, shardId);
+            try {
+                for (int shardId : shardIds) {
+                    ensureShardsLocal(queryId, plan, workerId, shardId);
+                }
+                for (BroadcastTable broadcastTable : broadcastTablesToMaterialize(plan)) {
+                    materializeBroadcastWithRetry(
+                            worker, queryId, broadcastTable.tableName(), broadcastTable.shardCount());
+                }
+                preparedWorkers.add(workerId);
+            } catch (RuntimeException e) {
+                try {
+                    workerClient.clearBroadcastTables(worker, queryId);
+                } catch (Exception cleanupError) {
+                    LOG.warn(
+                            "Query [{}] failed to clear broadcast tables on {} after prep error: {}",
+                            queryId,
+                            workerId,
+                            cleanupError.getMessage());
+                }
+                try {
+                    workerClient.endShardPin(worker, queryId);
+                } catch (Exception cleanupError) {
+                    LOG.warn(
+                            "Query [{}] failed to end shard pin on {} after prep error: {}",
+                            queryId,
+                            workerId,
+                            cleanupError.getMessage());
+                }
+                throw e;
             }
-            for (BroadcastTable broadcastTable : broadcastTablesToMaterialize(plan)) {
-                workerClient.materializeBroadcast(
-                        worker, queryId, broadcastTable.tableName(), broadcastTable.shardCount());
-            }
-            preparedWorkers.add(workerId);
         }
     }
 
@@ -878,6 +942,16 @@ public final class QueryExecutionService {
             tables.put(tableName, batches.get(0));
         }
         return tables;
+    }
+
+    private PlannedQuery planAndValidate(String sql, String queryId) {
+        try {
+            PlannedQuery plan = planner.plan(sql, catalog, queryId);
+            catalogDispatchValidator.validate(plan);
+            return plan;
+        } catch (IllegalArgumentException planningError) {
+            throw new ApiException(ApiErrorCode.PLANNING_ERROR, planningError.getMessage(), planningError);
+        }
     }
 
     private record ExecutionOutcome(String workerId, long durationMs, List<RowBatchData> batches) {}

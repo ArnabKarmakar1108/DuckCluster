@@ -53,6 +53,28 @@ public final class MonitorService {
         return clusterCatalog.removeTable(name);
     }
 
+    public Optional<Map<String, Object>> describeTable(String tableName) {
+        if (!clusterCatalog.hasTable(tableName)) {
+            return Optional.empty();
+        }
+        TableShardConfig table = clusterCatalog.table(tableName);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("name", table.tableName());
+        body.put("shardCount", table.shardCount());
+        body.put("shardKey", table.shardKey());
+        body.put("activeDataVersion", clusterCatalog.activeDataVersion(table.tableName()));
+        body.put("estimatedRowCount", clusterCatalog.estimatedRowCount(table.tableName()));
+        List<Map<String, String>> columns = new ArrayList<>();
+        for (TableColumn column : clusterCatalog.tableColumns(table.tableName())) {
+            Map<String, String> columnView = new LinkedHashMap<>();
+            columnView.put("name", column.name());
+            columnView.put("type", column.type());
+            columns.add(columnView);
+        }
+        body.put("columns", columns);
+        return Optional.of(body);
+    }
+
     public Map<String, Object> catalogTables() {
         List<Map<String, Object>> tables = new ArrayList<>();
         for (TableShardConfig table : clusterCatalog.listTables()) {
@@ -60,6 +82,7 @@ public final class MonitorService {
             entry.put("name", table.tableName());
             entry.put("shardCount", table.shardCount());
             entry.put("shardKey", table.shardKey());
+            entry.put("activeDataVersion", clusterCatalog.activeDataVersion(table.tableName()));
             entry.put("estimatedRowCount", clusterCatalog.estimatedRowCount(table.tableName()));
             List<Map<String, String>> columns = new ArrayList<>();
             for (TableColumn column : clusterCatalog.tableColumns(table.tableName())) {

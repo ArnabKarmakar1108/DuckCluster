@@ -5,6 +5,8 @@ import io.duckcluster.common.merger.RowBatchData;
 import io.duckcluster.common.model.FragmentSpec;
 import io.duckcluster.common.model.MergeStrategyType;
 import io.duckcluster.common.registry.WorkerRegistry;
+import io.duckcluster.proto.v1.ActivateTableVersionRequest;
+import io.duckcluster.proto.v1.ActivateTableVersionResponse;
 import io.duckcluster.proto.v1.FragmentRequest;
 import io.duckcluster.proto.v1.MergeHint;
 import io.duckcluster.proto.v1.ReadShardRequest;
@@ -12,6 +14,8 @@ import io.duckcluster.proto.v1.LoadTempDataResponse;
 import io.duckcluster.proto.v1.ReceiveShardResponse;
 import io.duckcluster.proto.v1.RowBatch;
 import io.duckcluster.proto.v1.ShardDataChunk;
+import io.duckcluster.proto.v1.ShuffleTableRequest;
+import io.duckcluster.proto.v1.ShuffleTableResponse;
 import io.duckcluster.proto.v1.WorkerServiceGrpc;
 import io.duckcluster.coordinator.execution.FragmentExecutionException;
 import io.grpc.ManagedChannel;
@@ -105,13 +109,18 @@ public final class WorkerNodeClient {
     }
 
     public void materializeBroadcast(
-            WorkerRegistry.WorkerRecord worker, String queryId, String tableName, int shardCount) {
+            WorkerRegistry.WorkerRecord worker,
+            String queryId,
+            String tableName,
+            int shardCount,
+            long tableDataVersion) {
         io.duckcluster.proto.v1.MaterializeBroadcastResponse response =
                 blockingStub(worker).materializeBroadcast(
                         io.duckcluster.proto.v1.MaterializeBroadcastRequest.newBuilder()
                                 .setQueryId(queryId)
                                 .setTableName(tableName)
                                 .setShardCount(shardCount)
+                                .setTableDataVersion(tableDataVersion)
                                 .build());
         if (!response.getAccepted()) {
             throw new IllegalStateException(
@@ -231,6 +240,24 @@ public final class WorkerNodeClient {
             Thread.currentThread().interrupt();
             return false;
         }
+    }
+
+    public ShuffleTableResponse shuffleTable(WorkerRegistry.WorkerRecord worker, ShuffleTableRequest request) {
+        ShuffleTableResponse response = blockingStub(worker).shuffleTable(request);
+        if (!response.getAccepted()) {
+            throw new IllegalStateException(
+                    "Worker " + worker.workerId() + " rejected shuffle of " + request.getTableName());
+        }
+        return response;
+    }
+
+    public ActivateTableVersionResponse activateTableVersion(
+            WorkerRegistry.WorkerRecord worker, String tableName, long version) {
+        ActivateTableVersionRequest request = ActivateTableVersionRequest.newBuilder()
+                .setTableName(tableName)
+                .setVersion(version)
+                .build();
+        return blockingStub(worker).activateTableVersion(request);
     }
 
     private static MergeHint toMergeHint(MergeStrategyType mergeStrategy) {

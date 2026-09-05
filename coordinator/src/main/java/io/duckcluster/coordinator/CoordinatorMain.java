@@ -3,9 +3,12 @@ package io.duckcluster.coordinator;
 import io.duckcluster.common.config.ClusterConfig;
 import io.duckcluster.common.model.ClusterCatalog;
 import io.duckcluster.common.planner.CalciteQueryPlanner;
+import io.duckcluster.common.planner.PlannerOptions;
 import io.duckcluster.common.registry.WorkerRegistry;
 import io.duckcluster.common.routing.ConsistentHashRing;
 import io.duckcluster.coordinator.catalog.ShardCatalog;
+import io.duckcluster.coordinator.catalog.ShardIngestService;
+import io.duckcluster.coordinator.catalog.TableVersionService;
 import io.duckcluster.coordinator.config.EffectiveClusterConfigLogger;
 import io.duckcluster.coordinator.execution.AsyncQueryService;
 import io.duckcluster.coordinator.execution.QueryAdmissionControl;
@@ -34,6 +37,9 @@ public final class CoordinatorMain {
     public static void main(String[] args) throws Exception {
         ClusterConfig config = ClusterConfig.fromEnvironment();
         EffectiveClusterConfigLogger.log(config);
+        PlannerOptions plannerOptions = PlannerOptions.fromEnvironment();
+        LOG.info("Join placement: coPartition={}, shuffle={}, shuffleMinRows={}",
+                plannerOptions.coPartitionJoins(), plannerOptions.shuffleJoins(), plannerOptions.shuffleMinRows());
         WorkerRegistry registry = new WorkerRegistry();
         ClusterCatalog catalog = new ClusterCatalog();
 
@@ -50,7 +56,7 @@ public final class CoordinatorMain {
         QueryAdmissionControl admission = new QueryAdmissionControl(config.maxConcurrentQueries());
         MergeExecutionService mergeExecutionService = new MergeExecutionService(config.mergePoolSize());
         QueryExecutionService queryExecutionService = new QueryExecutionService(
-                new CalciteQueryPlanner(),
+                new CalciteQueryPlanner(plannerOptions),
                 catalog,
                 registry,
                 workerClient,
@@ -85,10 +91,23 @@ public final class CoordinatorMain {
                 config.maxConcurrentQueries(),
                 config.heartbeatInterval().multipliedBy(config.heartbeatMissThreshold()));
 
+        TableVersionService tableVersionService = new TableVersionService(catalog, registry, workerClient);
+        ShardIngestService shardIngestService = new ShardIngestService(
+                catalog, shardCatalog, registry, workerClient, config.shardTransferChunkBytes());
+
         CoordinatorGrpcServer grpcServer = new CoordinatorGrpcServer(
                 config, registry, shardCatalog, shardReplicator, channelPool);
         CoordinatorHttpServer httpServer = new CoordinatorHttpServer(
-                config, registry, queryExecutionService, asyncQueryService, monitorService, coordinatorMetrics);
+                config,
+                registry,
+                queryExecutionService,
+                asyncQueryService,
+                monitorService,
+                tableVersionService,
+                shardIngestService,
+                shardReplicator,
+                admission,
+                coordinatorMetrics);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Shutting down coordinator");
