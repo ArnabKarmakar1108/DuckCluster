@@ -49,6 +49,7 @@ public final class AsyncQueryService {
     private final ExecutorService executor;
     private final ScheduledExecutorService sweeper;
     private final QueryAdmissionControl admission;
+    private final String dataDir;
 
     public AsyncQueryService(
             QueryExecutionService queryExecutionService,
@@ -58,6 +59,7 @@ public final class AsyncQueryService {
         this.queryExecutionService = queryExecutionService;
         this.activityTracker = activityTracker;
         this.admission = admission;
+        this.dataDir = config.dataDir();
         this.resultTtlMs = config.asyncResultTtlMs();
         this.maxStoredJobs = config.asyncMaxStoredJobs();
         this.maxStoredBytes = config.asyncMaxStoredBytes();
@@ -87,7 +89,7 @@ public final class AsyncQueryService {
         purgeExpiredAndOverCapacity();
         String queryId = UUID.randomUUID().toString();
         AsyncQueryJob job = new AsyncQueryJob();
-        QueryResultSpool spool = QueryResultSpool.open(queryId);
+        QueryResultSpool spool = QueryResultSpool.open(queryId, java.nio.file.Path.of(dataDir));
         jobs.put(queryId, new AsyncQueryJobEntry(job, spool, System.currentTimeMillis()));
         executor.submit(() -> runQuery(queryId, sql.strip(), job));
         return Optional.of(queryId);
@@ -138,15 +140,16 @@ public final class AsyncQueryService {
         if (job.status() == AsyncQueryJob.Status.FAILED) {
             throw new IllegalStateException(job.errorMessage().orElse("query failed"));
         }
-        boolean partialConcat =
-                job.status() == AsyncQueryJob.Status.RUNNING && entry.spool != null && entry.spool.hasColumns();
-        if (job.status() != AsyncQueryJob.Status.SUCCEEDED && !partialConcat) {
+        boolean partialSpool = job.status() == AsyncQueryJob.Status.RUNNING
+                && entry.spool != null
+                && entry.spool.hasColumns();
+        if (job.status() != AsyncQueryJob.Status.SUCCEEDED && !partialSpool) {
             throw new IllegalStateException("query is not finished");
         }
         QueryResult result = job.result().orElseGet(() -> partialResultShell(queryId, entry));
         int safeOffset = Math.max(0, offset);
         int safeLimit = Math.min(Math.max(1, limit), MAX_RESULT_LIMIT);
-        if (entry.spool != null && (result.rows().isEmpty() || partialConcat)) {
+        if (entry.spool != null && (result.rows().isEmpty() || partialSpool)) {
             long totalRows = entry.spool.rowCount();
             List<List<Object>> page = entry.spool.readPage(safeOffset, safeLimit);
             int next = safeOffset + page.size();

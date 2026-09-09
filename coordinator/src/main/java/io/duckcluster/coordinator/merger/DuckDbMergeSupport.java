@@ -11,6 +11,7 @@ import io.duckcluster.common.model.QueryAnalysis;
 import io.duckcluster.common.model.QueryResult;
 import io.duckcluster.common.model.TopKSpec;
 import io.duckcluster.common.planner.MergePushdownPlanner;
+import io.duckcluster.coordinator.execution.MergeSpoolHooks;
 import io.duckcluster.common.planner.MergeSqlBuilder;
 
 import java.sql.Connection;
@@ -22,6 +23,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 final class DuckDbMergeSupport {
     private static final String TEMP_TABLE = "__merge_temp";
@@ -221,9 +223,21 @@ final class DuckDbMergeSupport {
         MergeStrategyType mergeStrategy = plan.mergeStrategy();
         List<String> types = new ArrayList<>(columns.size());
         for (String column : columns) {
-            types.add(columnType(analysis, column, topK, mergeStrategy, null));
+            types.add(plannedColumnType(analysis, column, topK, mergeStrategy));
         }
         return types;
+    }
+
+    private static String plannedColumnType(
+            QueryAnalysis analysis, String column, TopKSpec topK, MergeStrategyType mergeStrategy) {
+        if (mergeStrategy == MergeStrategyType.TOP_K && topK.hasOrderBy()) {
+            for (OrderByClause clause : topK.orderBy()) {
+                if (clause.column().equals(column) && !analysis.groupByColumns().contains(column)) {
+                    return "DOUBLE";
+                }
+            }
+        }
+        return columnType(analysis, column, topK, mergeStrategy, null);
     }
 
     private static void materializePhase1InDb(Connection connection, String phase1Sql) throws SQLException {
@@ -301,6 +315,21 @@ final class DuckDbMergeSupport {
         List<String> columns = new ArrayList<>(columnCount);
         for (int i = 1; i <= columnCount; i++) {
             columns.add(metadata.getColumnLabel(i));
+        }
+
+        Optional<MergeSpoolHooks.RowConsumer> sink = MergeSpoolHooks.get(queryId);
+        if (sink.isPresent()) {
+            MergeSpoolHooks.RowConsumer writer = sink.get();
+            writer.setColumns(columns);
+            while (resultSet.next()) {
+                List<Object> row = new ArrayList<>(columnCount);
+                for (int i = 1; i <= columnCount; i++) {
+                    row.add(resultSet.getObject(i));
+                }
+                writer.addRow(row);
+            }
+            writer.finish();
+            return new QueryResult(queryId, columns, List.of(), stats);
         }
 
         List<List<Object>> rows = new ArrayList<>();

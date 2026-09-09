@@ -7,6 +7,7 @@ import io.duckcluster.common.model.PlannedQuery;
 
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -21,7 +22,7 @@ final class MergeStreamStaging implements AutoCloseable {
     private final CoordinatorDuckDbPool.Lease lease;
     private final Connection connection;
     private final List<String> tempColumns;
-    private final List<String> columnTypes;
+    private final List<String> plannedColumnTypes;
     private final Map<String, String> wireColumnTypes = new ConcurrentHashMap<>();
     private final Map<Integer, String> fragmentTables = new ConcurrentHashMap<>();
     private final Object connectionLock = new Object();
@@ -33,7 +34,17 @@ final class MergeStreamStaging implements AutoCloseable {
         this.lease = lease;
         this.connection = connection;
         this.tempColumns = MergeSqlColumns.fromPlannedQuery(plan);
-        this.columnTypes = DuckDbMergeSupport.columnTypesForPlannedQuery(plan, tempColumns);
+        this.plannedColumnTypes = DuckDbMergeSupport.columnTypesForPlannedQuery(plan, tempColumns);
+    }
+
+    private List<String> effectiveColumnTypes() {
+        List<String> types = new ArrayList<>(tempColumns.size());
+        for (int i = 0; i < tempColumns.size(); i++) {
+            String column = tempColumns.get(i);
+            String wire = wireColumnTypes.get(column);
+            types.add(wire != null && !wire.isBlank() ? wire : plannedColumnTypes.get(i));
+        }
+        return types;
     }
 
     Connection connection() {
@@ -55,7 +66,7 @@ final class MergeStreamStaging implements AutoCloseable {
             try {
                 String tableName = ensureFragmentTable(fragmentId);
                 DuckDbBulkInserter.appendSingleBatch(
-                        connection, tableName, tempColumns, columnTypes, batch, plan.analysis());
+                        connection, tableName, tempColumns, effectiveColumnTypes(), batch, plan.analysis());
             } catch (SQLException e) {
                 throw new IllegalStateException(
                         "Failed to stage fragment " + fragmentId + " batch for query " + queryId + ": "
@@ -75,7 +86,7 @@ final class MergeStreamStaging implements AutoCloseable {
 
     void assembleInto(Connection targetConnection, String tempTable, MergeContext context) throws SQLException {
         List<String> columns = MergeSqlColumns.fromContext(context);
-        DuckDbMergeSupport.createEmptyTable(targetConnection, tempTable, columns, columnTypes);
+        DuckDbMergeSupport.createEmptyTable(targetConnection, tempTable, columns, effectiveColumnTypes());
         List<FragmentResult> fragments = context.fragmentResults();
         synchronized (connectionLock) {
             for (FragmentResult fragment : fragments) {
@@ -120,7 +131,7 @@ final class MergeStreamStaging implements AutoCloseable {
         return fragmentTables.computeIfAbsent(fragmentId, id -> {
             try {
                 String tableName = "__stg_" + sanitizeQueryId(queryId) + "_f" + id;
-                DuckDbMergeSupport.createEmptyTable(connection, tableName, tempColumns, columnTypes);
+                DuckDbMergeSupport.createEmptyTable(connection, tableName, tempColumns, effectiveColumnTypes());
                 return tableName;
             } catch (SQLException e) {
                 throw new IllegalStateException(e);

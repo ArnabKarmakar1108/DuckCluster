@@ -6,9 +6,13 @@ import io.duckcluster.common.registry.WorkerRegistry;
 import io.duckcluster.coordinator.execution.AsyncQueryExpiredException;
 import io.duckcluster.coordinator.execution.AsyncQueryJob;
 import io.duckcluster.coordinator.execution.AsyncQueryService;
+import io.duckcluster.coordinator.catalog.ShardIngestService;
+import io.duckcluster.coordinator.catalog.TableVersionService;
+import io.duckcluster.coordinator.execution.QueryAdmissionControl;
 import io.duckcluster.coordinator.execution.QueryExecutionService;
 import io.duckcluster.coordinator.monitor.CoordinatorMetrics;
 import io.duckcluster.coordinator.monitor.MonitorService;
+import io.duckcluster.coordinator.replication.ShardReplicator;
 import io.javalin.Javalin;
 import io.javalin.http.HttpStatus;
 import io.javalin.http.staticfiles.Location;
@@ -29,6 +33,10 @@ public final class CoordinatorHttpServer {
     private final QueryExecutionService queryExecutionService;
     private final AsyncQueryService asyncQueryService;
     private final MonitorService monitorService;
+    private final TableVersionService tableVersionService;
+    private final ShardIngestService shardIngestService;
+    private final ShardReplicator shardReplicator;
+    private final QueryAdmissionControl admission;
     private final CoordinatorMetrics metrics;
     private Javalin app;
 
@@ -38,12 +46,20 @@ public final class CoordinatorHttpServer {
             QueryExecutionService queryExecutionService,
             AsyncQueryService asyncQueryService,
             MonitorService monitorService,
+            TableVersionService tableVersionService,
+            ShardIngestService shardIngestService,
+            ShardReplicator shardReplicator,
+            QueryAdmissionControl admission,
             CoordinatorMetrics metrics) {
         this.config = config;
         this.registry = registry;
         this.queryExecutionService = queryExecutionService;
         this.asyncQueryService = asyncQueryService;
         this.monitorService = monitorService;
+        this.tableVersionService = tableVersionService;
+        this.shardIngestService = shardIngestService;
+        this.shardReplicator = shardReplicator;
+        this.admission = admission;
         this.metrics = metrics;
     }
 
@@ -57,41 +73,52 @@ public final class CoordinatorHttpServer {
                     });
                 })
                 .post("/v1/query/explain", ctx -> {
+                    if (rejectIfDraining(ctx)) {
+                        return;
+                    }
                     QueryRequest request = ctx.bodyAsClass(QueryRequest.class);
-                    if (request.sql == null || request.sql.isBlank()) {
-                        ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", "sql is required"));
+                    Optional<String> sql = HttpRequestSupport.sqlOrBadRequest(ctx, request.sql);
+                    if (sql.isEmpty()) {
                         return;
                     }
                     try {
-                        var plan = queryExecutionService.explainPlan(request.sql);
-                        ctx.json(QueryPlanMapper.toExplainResponse(UUID.randomUUID().toString(), plan));
+                        var plan = queryExecutionService.explainPlan(sql.get());
+                        String explainQueryId = UUID.randomUUID().toString();
+                        ctx.json(QueryPlanMapper.toExplainResponse(
+                                explainQueryId, plan, queryExecutionService.clusterCatalog()));
                     } catch (ApiException apiError) {
                         ctx.status(apiError.code().httpStatus()).json(ApiErrorMapper.body(apiError));
                     }
                 })
                 .post("/v1/query", ctx -> {
+                    if (rejectIfDraining(ctx)) {
+                        return;
+                    }
                     QueryRequest request = ctx.bodyAsClass(QueryRequest.class);
-                    if (request.sql == null || request.sql.isBlank()) {
-                        ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", "sql is required"));
+                    Optional<String> sql = HttpRequestSupport.sqlOrBadRequest(ctx, request.sql);
+                    if (sql.isEmpty()) {
                         return;
                     }
                     try {
-                        QueryResult result = queryExecutionService.execute(request.sql);
+                        QueryResult result = queryExecutionService.execute(sql.get());
                         ctx.json(QueryResponseMapper.toFullResponse(result));
                     } catch (ApiException apiError) {
                         ctx.status(apiError.code().httpStatus()).json(ApiErrorMapper.body(apiError));
-                        if (apiError.code() == io.duckcluster.coordinator.http.ApiErrorCode.RESOURCE_EXHAUSTED) {
+                        if (apiError.code() == ApiErrorCode.RESOURCE_EXHAUSTED) {
                             ctx.header("Retry-After", "5");
                         }
                     }
                 })
                 .post("/v1/query/async", ctx -> {
-                    QueryRequest request = ctx.bodyAsClass(QueryRequest.class);
-                    if (request.sql == null || request.sql.isBlank()) {
-                        ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", "sql is required"));
+                    if (rejectIfDraining(ctx)) {
                         return;
                     }
-                    Optional<String> accepted = asyncQueryService.trySubmit(request.sql);
+                    QueryRequest request = ctx.bodyAsClass(QueryRequest.class);
+                    Optional<String> sql = HttpRequestSupport.sqlOrBadRequest(ctx, request.sql);
+                    if (sql.isEmpty()) {
+                        return;
+                    }
+                    Optional<String> accepted = asyncQueryService.trySubmit(sql.get());
                     if (accepted.isEmpty()) {
                         ctx.status(HttpStatus.TOO_MANY_REQUESTS)
                                 .header("Retry-After", "5")
@@ -175,6 +202,10 @@ public final class CoordinatorHttpServer {
                         ctx.status(HttpStatus.CONFLICT).json(Map.of("error", exception.getMessage()));
                     }
                 })
+                .post("/v1/cluster/reconcile", ctx -> {
+                    shardReplicator.triggerReconcile();
+                    ctx.status(HttpStatus.ACCEPTED).json(Map.of("status", "reconcile_scheduled"));
+                })
                 .get("/v1/cluster/health", ctx -> {
                     Map<String, Object> body = new LinkedHashMap<>();
                     body.put("status", registry.isHealthy() ? "UP" : "DEGRADED");
@@ -192,6 +223,15 @@ public final class CoordinatorHttpServer {
                     ctx.json(body);
                 })
                 .get("/v1/catalog/tables", ctx -> ctx.json(monitorService.catalogTables()))
+                .get("/v1/catalog/tables/{tableName}", ctx -> {
+                    String tableName = ctx.pathParam("tableName");
+                    monitorService.describeTable(tableName).ifPresentOrElse(
+                            ctx::json,
+                            () -> ctx.status(HttpStatus.NOT_FOUND)
+                                    .json(Map.of(
+                                            "code", ApiErrorCode.NOT_FOUND.name(),
+                                            "error", "unknown table: " + tableName)));
+                })
                 .post("/v1/catalog/tables", ctx -> {
                     CatalogTableRequest request = ctx.bodyAsClass(CatalogTableRequest.class);
                     if (request.name == null || request.name.isBlank()) {
@@ -222,6 +262,49 @@ public final class CoordinatorHttpServer {
                         return;
                     }
                     ctx.json(Map.of("dropped", tableName));
+                })
+                .put("/v1/catalog/tables/{tableName}/versions/{version}/shards/{shardId}", ctx -> {
+                    String tableName = ctx.pathParam("tableName");
+                    Optional<Long> version = HttpRequestSupport.parseCatalogVersion(ctx, ctx.pathParam("version"));
+                    if (version.isEmpty()) {
+                        return;
+                    }
+                    Optional<Integer> shardId = HttpRequestSupport.parseShardId(ctx, ctx.pathParam("shardId"));
+                    if (shardId.isEmpty()) {
+                        return;
+                    }
+                    byte[] payload = ctx.bodyAsBytes();
+                    if (payload == null || payload.length == 0) {
+                        ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", "request body must contain shard bytes"));
+                        return;
+                    }
+                    try {
+                        shardIngestService.stageShard(tableName, shardId.get(), version.get(), payload);
+                        ctx.status(HttpStatus.CREATED)
+                                .json(Map.of(
+                                        "table", tableName,
+                                        "shardId", shardId.get(),
+                                        "version", version.get(),
+                                        "bytes", payload.length));
+                    } catch (IllegalArgumentException e) {
+                        ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", e.getMessage()));
+                    } catch (IllegalStateException e) {
+                        ctx.status(HttpStatus.CONFLICT).json(Map.of("error", e.getMessage()));
+                    }
+                })
+                .post("/v1/catalog/tables/{tableName}/versions/{version}/activate", ctx -> {
+                    String tableName = ctx.pathParam("tableName");
+                    Optional<Long> version = HttpRequestSupport.parseCatalogVersion(ctx, ctx.pathParam("version"));
+                    if (version.isEmpty()) {
+                        return;
+                    }
+                    try {
+                        ctx.json(tableVersionService.activateVersion(tableName, version.get()));
+                    } catch (IllegalArgumentException e) {
+                        ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", e.getMessage()));
+                    } catch (IllegalStateException e) {
+                        ctx.status(HttpStatus.CONFLICT).json(Map.of("error", e.getMessage()));
+                    }
                 })
                 .get("/metrics", ctx -> ctx.contentType("text/plain; version=0.0.4").result(metrics.prometheusText()))
                 .get("/v1/cluster/workers", ctx -> {
@@ -301,6 +384,18 @@ public final class CoordinatorHttpServer {
             body.put("stats", QueryResponseMapper.toStatsMap(status.stats()));
         }
         return body;
+    }
+
+    private boolean rejectIfDraining(io.javalin.http.Context ctx) {
+        if (!admission.isDraining()) {
+            return false;
+        }
+        ctx.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header("Retry-After", "30")
+                .json(Map.of(
+                        "code", ApiErrorCode.RESOURCE_EXHAUSTED.name(),
+                        "error", "coordinator is draining; not accepting new queries"));
+        return true;
     }
 
     private static int parseIntQuery(io.javalin.http.Context ctx, String name, int defaultValue) {

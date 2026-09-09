@@ -33,8 +33,18 @@ final class QueryResultSpool implements AutoCloseable {
     }
 
     static QueryResultSpool open(String queryId) {
+        return open(queryId, null);
+    }
+
+    static QueryResultSpool open(String queryId, Path dataDir) {
         try {
-            Path file = Files.createTempFile("duckcluster-query-" + queryId + "-", ".ndjson");
+            Path spoolDir = dataDir != null ? dataDir.resolve(".query-spool") : null;
+            if (spoolDir != null) {
+                Files.createDirectories(spoolDir);
+            }
+            Path file = spoolDir != null
+                    ? Files.createTempFile(spoolDir, "query-" + queryId + "-", ".ndjson")
+                    : Files.createTempFile("duckcluster-query-" + queryId + "-", ".ndjson");
             BufferedWriter writer = new BufferedWriter(
                     new OutputStreamWriter(Files.newOutputStream(file), StandardCharsets.UTF_8));
             return new QueryResultSpool(file, writer);
@@ -61,6 +71,18 @@ final class QueryResultSpool implements AutoCloseable {
         } catch (IOException e) {
             return 0;
         }
+    }
+
+    void appendRow(List<Object> row) {
+        try {
+            writeRow(row);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to append row to result spool", e);
+        }
+    }
+
+    void flush() throws IOException {
+        writer.flush();
     }
 
     void appendBatch(RowBatchData batch) {
