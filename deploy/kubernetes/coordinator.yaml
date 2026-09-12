@@ -54,4 +54,5 @@ spec:
             periodSeconds: 20
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: duckcluster-coordinator-data
