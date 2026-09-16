@@ -49,13 +49,24 @@ def wait_for_shard_file(
     data_dir: Path,
     shard_filename: str,
     timeout_sec: float = 90.0,
+    reconcile_url: str | None = None,
 ) -> None:
     target = data_dir / shard_filename
+    deadline = time.time() + timeout_sec
 
-    def exists() -> bool:
-        return target.is_file() and target.stat().st_size > 0
+    while time.time() < deadline:
+        if target.is_file() and target.stat().st_size > 0:
+            return
+        if reconcile_url:
+            try:
+                import requests
 
-    wait_until(exists, timeout_sec=timeout_sec, description=f"{shard_filename} on {data_dir}")
+                requests.post(reconcile_url, json={}, timeout=5)
+            except Exception:
+                pass
+        time.sleep(0.5)
+
+    raise TimeoutError(f"Timed out waiting for {shard_filename} on {data_dir}")
 
 
 def count_shard_replicas(data_base: Path, worker_ids: list[str], shard_filename: str) -> int:

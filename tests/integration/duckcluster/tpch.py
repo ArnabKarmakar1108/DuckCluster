@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
+
+import requests
 
 HARNESS_ROOT = Path(__file__).resolve().parent.parent
 QUERIES_DIR = HARNESS_ROOT / "queries" / "tpch"
@@ -58,8 +61,18 @@ def tpch_data_dir(repo_root: Path, scale_factor: float = DEFAULT_SF) -> Path:
     return repo_root / "benchmark" / "data" / f"sf{label}"
 
 
-def ensure_tpch_data(repo_root: Path, scale_factor: float = DEFAULT_SF) -> Path:
-    data_dir = tpch_data_dir(repo_root, scale_factor)
+# Default generator layout: both fact tables hash-partitioned by order key (co-partitioned).
+DEFAULT_PARTITIONING = {"lineitem": "l_orderkey", "orders": "o_orderkey"}
+
+
+def ensure_tpch_data(
+    repo_root: Path,
+    scale_factor: float = DEFAULT_SF,
+    data_dir: Path | None = None,
+    partitions: tuple[str, ...] = (),
+) -> Path:
+    """Generate TPC-H shards once. ``partitions`` holds TABLE=KEY:SHARDS layout overrides."""
+    data_dir = data_dir or tpch_data_dir(repo_root, scale_factor)
     baseline = data_dir / "baseline.duckdb"
     if baseline.is_file():
         return data_dir
@@ -77,17 +90,43 @@ def ensure_tpch_data(repo_root: Path, scale_factor: float = DEFAULT_SF) -> Path:
         )
         venv_python = repo_root / "tests" / "integration" / ".venv" / "bin" / "python"
 
-    subprocess.run(
-        [
-            str(repo_root / "scripts" / "benchmark-datagen.sh"),
-            str(scale_factor),
-            "6",
-            str(data_dir),
-        ],
-        cwd=repo_root,
-        check=True,
-    )
+    command = [
+        str(repo_root / "scripts" / "benchmark-datagen.sh"),
+        str(scale_factor),
+        "6",
+        str(data_dir),
+    ]
+    for partition in partitions:
+        command += ["--partition", partition]
+    subprocess.run(command, cwd=repo_root, check=True)
     return data_dir
+
+
+def tpch_partitioning(data_dir: Path) -> dict[str, tuple[str, int]]:
+    """Fact-table layout recorded by the generator (older datasets predate the field)."""
+    metadata = json.loads((data_dir / "metadata.json").read_text(encoding="utf-8"))
+    recorded = metadata.get("partitioning")
+    if recorded:
+        return {table: (spec["shard_key"], int(spec["shard_count"])) for table, spec in recorded.items()}
+    shard_count = int(metadata["shard_count"])
+    return {table: (key, shard_count) for table, key in DEFAULT_PARTITIONING.items()}
+
+
+def declare_tpch_tables(base_url: str, data_dir: Path) -> None:
+    """Declare fact-table shard keys so the planner can co-partition or shuffle joins."""
+    for table, (shard_key, shard_count) in tpch_partitioning(data_dir).items():
+        response = requests.post(
+            f"{base_url}/v1/catalog/tables",
+            json={"name": table, "shardCount": shard_count, "shardKey": shard_key},
+            timeout=30,
+        )
+        response.raise_for_status()
+
+
+def explain(base_url: str, sql: str) -> dict:
+    response = requests.post(f"{base_url}/v1/query/explain", json={"sql": sql}, timeout=60)
+    response.raise_for_status()
+    return response.json()
 
 
 def load_tpch_sql(query_id: str) -> str:

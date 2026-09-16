@@ -17,6 +17,18 @@ PARTITIONED_TABLES = {
     "orders": "o_orderkey",
 }
 
+
+def parse_partition_overrides(values: list[str]) -> dict[str, tuple[str, int]]:
+    """Parse repeated TABLE=KEY:SHARDS options for fact tables."""
+    overrides: dict[str, tuple[str, int]] = {}
+    for value in values:
+        table, _, spec = value.partition("=")
+        key, _, shards = spec.partition(":")
+        if table not in PARTITIONED_TABLES or not key or not shards.isdigit():
+            raise SystemExit(f"invalid --partition {value!r}; expected e.g. orders=o_custkey:4")
+        overrides[table] = (key, int(shards))
+    return overrides
+
 DIMENSION_TABLES = [
     "customer",
     "nation",
@@ -178,7 +190,18 @@ def main() -> int:
         help="Shard-to-worker assignment: balanced (round-robin, default) or ring (consistent hash)",
     )
     parser.add_argument("--root", type=Path)
+    parser.add_argument(
+        "--partition",
+        action="append",
+        default=[],
+        help="Override a fact table layout as TABLE=KEY:SHARDS (repeatable)",
+    )
     args = parser.parse_args()
+    overrides = parse_partition_overrides(args.partition)
+    layout = {
+        table: overrides.get(table, (key, args.shard_count))
+        for table, key in PARTITIONED_TABLES.items()
+    }
 
     root = args.root or Path(__file__).resolve().parent.parent
     output_dir = args.output_dir.resolve()
@@ -208,21 +231,22 @@ def main() -> int:
 
     manifest: dict[str, dict[str, list[str]]] = {}
 
-    print(f"Step 3: Partitioning fact tables into {args.shard_count} shards ({args.placement} placement)...")
-    for table, key in PARTITIONED_TABLES.items():
+    print(f"Step 3: Partitioning fact tables ({args.placement} placement)...")
+    for table, (key, shard_count) in layout.items():
+        print(f"  {table}: {shard_count} shards by {key}")
         table_manifest: dict[str, list[str]] = {}
         if args.placement == "balanced":
-            assignments = balanced_assignments(worker_ids, table, args.shard_count, args.rf)
+            assignments = balanced_assignments(worker_ids, table, shard_count, args.rf)
         else:
-            assignments = ring_assignments(root, worker_ids, table, args.shard_count, args.rf)
-        for shard_id in range(args.shard_count):
+            assignments = ring_assignments(root, worker_ids, table, shard_count, args.rf)
+        for shard_id in range(shard_count):
             shard_path = build_partitioned_shard(
                 source_db,
                 staging / table,
                 table,
                 key,
                 shard_id,
-                args.shard_count,
+                shard_count,
             )
             shard_key = f"{table}_shard{shard_id}"
             owners = assignments[shard_key]
@@ -252,6 +276,10 @@ def main() -> int:
         "workers": worker_ids,
         "replication_factor": args.rf,
         "placement": args.placement,
+        "partitioning": {
+            table: {"shard_key": key, "shard_count": shard_count}
+            for table, (key, shard_count) in layout.items()
+        },
         "baseline": str(baseline_db),
         "manifest": manifest,
     }

@@ -25,7 +25,9 @@ from duckcluster.tpch import (
     TOPK_AGGREGATE_ALIAS_PASSING,
     UNCORRELATED_SUBQUERY_PASSING,
     WITH_CTE_MERGE_PASSING,
+    declare_tpch_tables,
     ensure_tpch_data,
+    explain,
     load_tpch_sql,
 )
 
@@ -62,6 +64,7 @@ def tpch_cluster(repo_root: Path, tpch_data_dir: Path) -> ClusterManager:
         )
     )
     manager.start()
+    declare_tpch_tables(manager.config.http_base_url, tpch_data_dir)
     yield manager
     manager.stop()
 
@@ -262,3 +265,13 @@ def test_tpch_query_files_load(query_id: str) -> None:
     assert stripped.startswith("SELECT") or stripped.startswith("WITH"), (
         f"{query_id} must be a SELECT or WITH query"
     )
+
+
+@pytest.mark.tpch
+@pytest.mark.parametrize("query_id", ("q03", "q05", "q10", "q12", "q18", "q21"))
+def test_tpch_orders_lineitem_joins_are_co_partitioned(query_id: str, tpch_cluster: ClusterManager) -> None:
+    """Order-key partitioned fact tables join shard-locally instead of broadcasting either side."""
+    plan = explain(tpch_cluster.config.http_base_url, load_tpch_sql(query_id))
+    sliced = {plan["table"], *plan["coPartitionJoinTables"]}
+    assert {"orders", "lineitem"} <= sliced, plan
+    assert not any(view["table"] in ("orders", "lineitem") for view in plan["broadcastTables"]), plan

@@ -37,6 +37,7 @@ def test_hot_shard_auto_replication(harness_root: Path, with_cluster_config) -> 
             heartbeat_interval_sec=1,
             heartbeat_miss_threshold=2,
             watcher_interval_ms=500,
+            replication_reconcile_interval_sec=5,
         )
     )
     manager.start()
@@ -58,11 +59,13 @@ def test_hot_shard_auto_replication(harness_root: Path, with_cluster_config) -> 
         ]
         assert replica_targets, "expected a replica target worker from the hash ring"
 
+        reconcile_url = f"{manager.config.http_base_url}/v1/cluster/reconcile"
         for replica_worker in replica_targets:
             wait_for_shard_file(
                 manager.worker_data_dir(replica_worker),
                 "events_shard0.duckdb",
                 timeout_sec=90,
+                reconcile_url=reconcile_url,
             )
 
         assert_result_matches(client.query(sql), expected)
@@ -98,6 +101,7 @@ def test_manual_hot_shard_placement_triggers_replication(harness_root: Path, wit
             heartbeat_interval_sec=1,
             heartbeat_miss_threshold=2,
             watcher_interval_ms=500,
+            replication_reconcile_interval_sec=5,
         )
     )
     demo_csv = manager.config.data_base / "demo-events.csv"
@@ -122,6 +126,7 @@ def test_manual_hot_shard_placement_triggers_replication(harness_root: Path, wit
             manager.worker_data_dir(replica_worker),
             "events_shard0.duckdb",
             timeout_sec=90,
+            reconcile_url=f"{manager.config.http_base_url}/v1/cluster/reconcile",
         )
 
         client = QueryClient(manager.config.http_base_url)

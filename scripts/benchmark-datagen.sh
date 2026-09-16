@@ -4,6 +4,8 @@ set -euo pipefail
 # Usage: ./scripts/benchmark-datagen.sh <scale_factor> [shard_count] [output_dir] [options]
 #
 # Options:
+#   --partition T=KEY:SHARDS  Override a fact table's shard key/count (repeatable),
+#                             e.g. --partition orders=o_custkey:4
 #   --replace         Remove output_dir before generating
 #   --clean-other-sf  Remove other benchmark/data/sf* dirs (keeps output_dir only)
 #
@@ -22,6 +24,7 @@ SHARD_COUNT="6"
 OUTPUT_DIR=""
 REPLACE=0
 CLEAN_OTHER_SF=0
+PARTITION_ARGS=()
 
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
@@ -33,6 +36,10 @@ while [[ $# -gt 0 ]]; do
     --clean-other-sf)
       CLEAN_OTHER_SF=1
       shift
+      ;;
+    --partition)
+      PARTITION_ARGS+=("--partition" "$2")
+      shift 2
       ;;
     *)
       POSITIONAL+=("$1")
@@ -67,4 +74,5 @@ echo
   "$SCALE_FACTOR" \
   "$SHARD_COUNT" \
   "$OUTPUT_DIR" \
-  ${PLACEMENT:+--placement "$PLACEMENT"}
+  ${PLACEMENT:+--placement "$PLACEMENT"} \
+  "${PARTITION_ARGS[@]}"

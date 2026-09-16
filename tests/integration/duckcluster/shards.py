@@ -56,9 +56,7 @@ def ring_assignments(
 
 
 def shard_for_id(row_id: int, shard_count: int) -> int:
-    return duckdb.sql(
-        f"SELECT abs(hash(CAST('{row_id}' AS VARCHAR))) % {shard_count}"
-    ).fetchone()[0]
+    return duckdb.sql(f"SELECT abs(hash({row_id})) % {shard_count}").fetchone()[0]
 
 
 def ids_for_shard(demo_csv: Path, shard_id: int, shard_count: int) -> list[int]:
@@ -67,7 +65,7 @@ def ids_for_shard(demo_csv: Path, shard_id: int, shard_count: int) -> list[int]:
         f"""
         SELECT id
         FROM read_csv_auto('{demo_csv}')
-        WHERE abs(hash(CAST(id AS VARCHAR))) % {shard_count} = {shard_id}
+        WHERE abs(hash(id)) % {shard_count} = {shard_id}
         ORDER BY id
         """
     ).fetchall()
@@ -92,7 +90,7 @@ def build_shard_db(
         f"""
         CREATE TABLE {table} AS
         SELECT * FROM read_csv_auto('{demo_csv}')
-        WHERE abs(hash(CAST(id AS VARCHAR))) % {shard_count} = {shard_id}
+        WHERE abs(hash(id)) % {shard_count} = {shard_id}
         """
     )
     connection.close()

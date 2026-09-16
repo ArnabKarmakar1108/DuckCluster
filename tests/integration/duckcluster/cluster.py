@@ -75,6 +75,25 @@ _INTEGRATION_TEST_BASE_PORTS: tuple[int, ...] = (
     39801,
     39802,
     39803,
+    38880,
+    39890,
+    39901,
+    39902,
+    39903,
+    38980,
+    39990,
+    40001,
+    40002,
+    39080,
+    40090,
+    40101,
+    40102,
+    40103,
+    37080,
+    37090,
+    37101,
+    37102,
+    37103,
 )
 
 
@@ -114,6 +133,10 @@ class ClusterConfig:
     heartbeat_interval_sec: int = 2
     heartbeat_miss_threshold: int = 3
     watcher_interval_ms: int = 1000
+    replication_reconcile_interval_sec: int | None = None
+    cache_max_shards: int | None = None
+    shard_pin_lease_sec: int | None = None
+    worker_extra_env: dict[str, str] | None = None
     data_mode: Literal["distributed", "primary_only_shard0", "empty", "tpch"] = "distributed"
     demo_csv: Path | None = None
     demo_row_count: int | None = None
@@ -246,6 +269,12 @@ class ClusterManager:
         worker_env = env.copy()
         worker_env["DUCKCLUSTER_DATA_DIR"] = str(self.config.data_base / worker_id)
         worker_env["DUCKCLUSTER_WATCHER_INTERVAL_MS"] = str(self.config.watcher_interval_ms)
+        if self.config.cache_max_shards is not None:
+            worker_env["DUCKCLUSTER_CACHE_MAX_SHARDS"] = str(self.config.cache_max_shards)
+        if self.config.shard_pin_lease_sec is not None:
+            worker_env["DUCKCLUSTER_SHARD_PIN_LEASE_SEC"] = str(self.config.shard_pin_lease_sec)
+        if self.config.worker_extra_env:
+            worker_env.update(self.config.worker_extra_env)
         if self.config.pool_size is not None:
             worker_env["DUCKCLUSTER_POOL_SIZE"] = str(self.config.pool_size)
         if self.config.pool_wait_ms is not None:
@@ -266,6 +295,12 @@ class ClusterManager:
         ClusterManager._jars_built = True
 
     def _prepare_data(self) -> None:
+        coordinator_dir = self.config.data_base / "coordinator"
+        coordinator_dir.mkdir(parents=True, exist_ok=True)
+        metadata_snapshot = coordinator_dir / "coordinator-metadata.json"
+        if metadata_snapshot.is_file():
+            metadata_snapshot.unlink()
+
         worker_dirs = [str(self.config.data_base / worker_id) for worker_id in self.config.worker_ids]
         for worker_dir in worker_dirs:
             path = Path(worker_dir)
@@ -376,7 +411,7 @@ class ClusterManager:
                 f"""
                 CREATE TABLE events AS
                 SELECT * FROM read_csv_auto('{demo_source}')
-                WHERE abs(hash(CAST(id AS VARCHAR))) % {self.config.shard_count} = {shard_id}
+                WHERE abs(hash(id)) % {self.config.shard_count} = {shard_id}
                 """
             )
             connection.close()
@@ -406,10 +441,15 @@ class ClusterManager:
         env["DUCKCLUSTER_COORDINATOR_HOST"] = self.config.coordinator_host
         env["DUCKCLUSTER_COORDINATOR_HTTP_PORT"] = str(self.config.coordinator_http_port)
         env["DUCKCLUSTER_COORDINATOR_GRPC_PORT"] = str(self.config.coordinator_grpc_port)
+        env["DUCKCLUSTER_DATA_DIR"] = str(self.config.data_base / "coordinator")
         env["DUCKCLUSTER_SHARD_COUNT"] = str(self.config.shard_count)
         env["DUCKCLUSTER_REPLICATION_FACTOR"] = str(self.config.replication_factor)
         env["DUCKCLUSTER_HEARTBEAT_INTERVAL_SEC"] = str(self.config.heartbeat_interval_sec)
         env["DUCKCLUSTER_HEARTBEAT_MISS_THRESHOLD"] = str(self.config.heartbeat_miss_threshold)
+        if self.config.replication_reconcile_interval_sec is not None:
+            env["DUCKCLUSTER_REPLICATION_RECONCILE_INTERVAL_SEC"] = str(
+                self.config.replication_reconcile_interval_sec
+            )
         if self.config.fragment_wait_ms is not None:
             env["DUCKCLUSTER_FRAGMENT_WAIT_MS"] = str(self.config.fragment_wait_ms)
         return env
