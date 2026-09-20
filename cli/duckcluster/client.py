@@ -69,6 +69,12 @@ class CoordinatorClient:
     def catalog_tables(self) -> dict[str, Any]:
         return self._get("/v1/catalog/tables")
 
+    def explain(self, sql: str) -> dict[str, Any]:
+        return self._post("/v1/query/explain", {"sql": sql})
+
+    def trigger_reconcile(self) -> dict[str, Any]:
+        return self._post("/v1/cluster/reconcile", {})
+
     @property
     def timeout_sec(self) -> float:
         return self._timeout_sec

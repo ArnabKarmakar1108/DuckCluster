@@ -99,6 +99,39 @@ def format_workers(workers: dict[str, Any], fmt: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def format_explain_plan(plan: dict[str, Any], fmt: str) -> str:
+    if fmt == "json":
+        return json.dumps(plan, indent=2) + "\n"
+
+    lines: list[str] = []
+    lines.append(f"Query id: {plan.get('queryId', '?')}")
+    lines.append(f"Table: {plan.get('table', '?')}")
+    lines.append(f"Merge: {plan.get('mergeStrategy', '?')}")
+    sharded = plan.get("shardedTables") or []
+    if sharded:
+        lines.append(f"Sharded tables: {', '.join(str(t) for t in sharded)}")
+    for label, key in (
+        ("Broadcast", "broadcastTables"),
+        ("Subquery broadcast", "subqueryBroadcastTables"),
+    ):
+        tables = plan.get(key) or []
+        for entry in tables:
+            lines.append(
+                f"  {label}: {entry.get('table')} "
+                f"(shards={entry.get('shardCount')}, temp={entry.get('workerTempTable')})"
+            )
+    fragments = plan.get("fragments") or []
+    lines.append(f"Fragments ({len(fragments)}):")
+    for fragment in fragments:
+        sql = str(fragment.get("sql", "")).replace("\n", " ")
+        if len(sql) > 120:
+            sql = sql[:117] + "..."
+        lines.append(
+            f"  #{fragment.get('fragmentId')} shard={fragment.get('shardId')}: {sql}"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def format_stats(result: dict[str, Any]) -> str:
     stats = result.get("stats") or {}
     merge = stats.get("mergeStrategy", "?")

@@ -40,6 +40,23 @@ class ValidateTest(unittest.TestCase):
 
 
 class FormatTest(unittest.TestCase):
+    def test_explain_table_format_lists_fragments(self) -> None:
+        from duckcluster.format import format_explain_plan
+
+        rendered = format_explain_plan(
+            {
+                "queryId": "q-1",
+                "table": "events",
+                "mergeStrategy": "CONCATENATE",
+                "shardedTables": ["events"],
+                "fragments": [{"fragmentId": 0, "shardId": 0, "sql": "SELECT 1"}],
+            },
+            "table",
+        )
+        self.assertIn("CONCATENATE", rendered)
+        self.assertIn("Fragment", rendered)
+        self.assertIn("SELECT 1", rendered)
+
     def test_table_output_includes_rows(self) -> None:
         rendered = format_query_result(
             {

@@ -9,7 +9,13 @@ from duckcluster.async_query import execute_query
 from duckcluster.banner import print_banner
 from duckcluster.client import ClusterError, ConnectionError
 from duckcluster.input import read_command, remember_command, setup_history
-from duckcluster.format import format_query_result, format_stats, format_status, format_workers
+from duckcluster.format import (
+    format_explain_plan,
+    format_query_result,
+    format_stats,
+    format_status,
+    format_workers,
+)
 from duckcluster.validate import ValidationError, validate_query_prerequisites
 
 if TYPE_CHECKING:
@@ -54,7 +60,7 @@ def run_shell(
             return 0
 
         if not buffer and stripped.startswith("\\"):
-            if _run_meta(client, base_url, stripped, fmt):
+            if _run_meta(client, base_url, stripped, fmt, skip_validate):
                 return 0
             continue
 
@@ -101,9 +107,12 @@ def _run_meta(
     base_url: str,
     command: str,
     fmt: str,
+    skip_validate: bool = False,
 ) -> bool:
     """Handle backslash meta-commands. Returns True when the shell should exit."""
-    name = command.lower().split(None, 1)[0]
+    parts = command.split(None, 1)
+    name = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
     if name in {"\\q", "\\quit", "\\exit"}:
         return True
     if name == "\\help":
@@ -113,6 +122,7 @@ def _run_meta(
             "  \\status            Cluster health summary\n"
             "  \\workers           List workers\n"
             "  \\tables            Tables in shard catalog\n"
+            "  \\explain SQL       Show query plan (no execution)\n"
             "  \\help              Show this help\n"
             "  Up/Down arrows      Previous queries"
         )
@@ -141,6 +151,21 @@ def _run_meta(
                 print("(no tables in catalog)")
             else:
                 print(", ".join(sorted(tables)))
+        except (ConnectionError, ClusterError) as exc:
+            message = exc.message if isinstance(exc, ClusterError) else str(exc)
+            print(f"error: {message}", file=sys.stderr)
+        return False
+    if name == "\\explain":
+        if not arg:
+            print("usage: \\explain SELECT ...", file=sys.stderr)
+            return False
+        try:
+            if not skip_validate:
+                validate_query_prerequisites(client, arg)
+            plan = client.explain(arg)
+            sys.stdout.write(format_explain_plan(plan, fmt))
+        except ValidationError as exc:
+            print(f"error: {exc}", file=sys.stderr)
         except (ConnectionError, ClusterError) as exc:
             message = exc.message if isinstance(exc, ClusterError) else str(exc)
             print(f"error: {message}", file=sys.stderr)

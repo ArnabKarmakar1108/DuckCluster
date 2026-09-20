@@ -11,6 +11,7 @@ from duckcluster.async_query import execute_query
 from duckcluster.client import ClientConfig, ClusterError, ConnectionError, CoordinatorClient
 from duckcluster.format import (
     default_format,
+    format_explain_plan,
     format_query_result,
     format_stats,
     format_status,
@@ -60,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_status(client, base_url, fmt)
         if args.command == "workers":
             return _run_workers(client, fmt)
+        if args.command == "explain":
+            return _run_explain(client, args, fmt)
     except ValidationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -118,6 +121,25 @@ def _run_status(client: CoordinatorClient, base_url: str, fmt: str) -> int:
 def _run_workers(client: CoordinatorClient, fmt: str) -> int:
     workers = client.workers()
     sys.stdout.write(format_workers(workers, fmt))
+    return 0
+
+
+def _run_explain(client: CoordinatorClient, args: argparse.Namespace, fmt: str) -> int:
+    try:
+        sql = _read_sql(args)
+    except OSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if not sql.strip():
+        print("error: SQL is required", file=sys.stderr)
+        return 2
+
+    if not args.skip_validate:
+        validate_query_prerequisites(client, sql)
+
+    plan = client.explain(sql)
+    sys.stdout.write(format_explain_plan(plan, fmt))
     return 0
 
 
@@ -228,6 +250,20 @@ def _build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="List registered workers",
     )
+
+    explain_parser = subparsers.add_parser(
+        "explain",
+        parents=[common],
+        help="Show distributed query plan without executing",
+    )
+    explain_parser.add_argument("sql", nargs="?", help="SQL to explain")
+    explain_parser.add_argument("-f", "--file", help="Read SQL from file")
+    explain_parser.add_argument(
+        "--skip-validate",
+        action="store_true",
+        help="Skip table/shard pre-flight checks",
+    )
+
     return parser
 
 

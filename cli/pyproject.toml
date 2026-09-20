@@ -16,3 +16,7 @@ duckcluster = "duckcluster.__main__:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["duckcluster*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
