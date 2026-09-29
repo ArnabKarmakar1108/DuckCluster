@@ -10,6 +10,10 @@ logs/
 pids/
 docs/PROPOSAL-*.md
 /data/
+coordinator/data/
+**/.query-spool/
+**/.merge-tmp/
+**/.transfer-tmp/
 benchmark/data/
 benchmark/results/
 benchmark/dependency-reduced-pom.xml
@@ -18,3 +22,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 docs/study-guide
+**/.shuffle-tmp/
+hs_err_pid*.log
+coordinator.ERROR

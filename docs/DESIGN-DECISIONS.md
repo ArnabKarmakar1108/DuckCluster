@@ -945,3 +945,19 @@ ALTER TABLE __merge_phase1 RENAME TO __merge_temp;
 | 8 | Node stability | Cgroup pressure at SF40+ | Open |
 
 **Suite trajectory (SF1 c=1):** pre-fix minutes+ → bulk **19.2s** → hardened **15.5s** (7.2×) → pushdown **6.6s** (3.2×).
+
+---
+
+## 11. Out of scope (portfolio / future work)
+
+DuckCluster is a distributed-systems portfolio project, not a multi-tenant production service. The following are intentionally deferred:
+
+| Area | Notes |
+|------|--------|
+| **Security** | No HTTP auth, plaintext worker gRPC, open registration — fine for local demos only |
+| **Apache Arrow IPC** | Typed row batches still use protobuf + JDBC today; Arrow would be a wire-format upgrade |
+| **OpenTelemetry** | Minimal `/metrics` gauges only; no distributed tracing stack |
+| **Warm-standby coordinator** | Cold active–passive with PVC + worker re-registration is documented in [HA.md](HA.md) |
+| **Full SQL surface lockdown** | Planner allows `SELECT` fragments; explicit denylist for `COPY`/`ATTACH`/file functions not enforced |
+
+Correctness and operability items that *were* in scope (query-scoped broadcasts, pin leases, wire types, co-partition/shuffle joins, catalog versioning, coordinator metadata snapshot) are implemented and covered by unit and integration tests.
