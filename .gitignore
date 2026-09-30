@@ -18,6 +18,7 @@ benchmark/data/
 benchmark/results/
 benchmark/dependency-reduced-pom.xml
 .venv/
+*.egg-info/
 __pycache__/
 *.py[cod]
 .pytest_cache/
