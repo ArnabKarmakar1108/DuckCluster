@@ -254,6 +254,46 @@ class CalciteQueryPlannerTest {
     }
 
     @Test
+    void rejectsShapesThatWouldBeEvaluatedPerShard() {
+        for (String sql : new String[] {
+                "SELECT DISTINCT category FROM events",
+                "SELECT category, COUNT(*) AS c FROM events GROUP BY category HAVING COUNT(*) > 2",
+                "SELECT id, ROW_NUMBER() OVER (ORDER BY score DESC) AS rn FROM events",
+                "SELECT id FROM events ORDER BY id LIMIT 3 OFFSET 2",
+                "SELECT COUNT(*) AS c FROM (SELECT DISTINCT category FROM events) t"}) {
+            IllegalArgumentException error = assertThrows(
+                    IllegalArgumentException.class, () -> planner.plan(sql, catalog), sql);
+            assertTrue(error.getMessage().contains("not supported on multi-shard tables"), error.getMessage());
+        }
+    }
+
+    @Test
+    void rejectsMultipleCtes() {
+        assertThrows(IllegalArgumentException.class, () -> planner.plan(
+                "WITH a AS (SELECT category, COUNT(*) AS c FROM events GROUP BY category), "
+                        + "b AS (SELECT category, SUM(score) AS s FROM events GROUP BY category) "
+                        + "SELECT a.category, a.c FROM a",
+                catalog));
+    }
+
+    @Test
+    void allowsPerShardShapesWhenEveryTableHasOneShard() {
+        ClusterCatalog singleShard = ClusterCatalog.demo(1);
+        PlannedQuery planned = planner.plan(
+                "SELECT category, COUNT(*) AS c FROM events GROUP BY category HAVING COUNT(*) > 2", singleShard);
+        assertEquals(1, planned.fragments().size());
+    }
+
+    @Test
+    void allowsHavingInsideGlobalPredicateSubquery() {
+        PlannedQuery planned = planner.plan(
+                "SELECT COUNT(*) FROM events WHERE category IN "
+                        + "(SELECT category FROM events GROUP BY category HAVING COUNT(*) > 2)",
+                catalog);
+        assertEquals(3, planned.fragments().size());
+    }
+
+    @Test
     void planDetectsMergeStrategyForJoinQuery() {
         ClusterCatalog joinCatalog = ClusterCatalog.withTables(Map.of(
                 "orders", new TableShardConfig("orders", 3, "o_orderkey"),

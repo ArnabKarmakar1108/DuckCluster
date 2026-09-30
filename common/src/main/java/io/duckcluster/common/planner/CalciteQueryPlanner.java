@@ -60,6 +60,7 @@ public final class CalciteQueryPlanner implements QueryPlanner {
             return planWithCte(sql, parsed, with, catalog, queryId);
         }
         SqlSelect select = asSelect(parsed);
+        DistributedQueryGuard.validate(parsed, select, catalog);
 
         Optional<NestedDerivedTableDetector.Match> nested = NestedDerivedTableDetector.detect(select, parsed);
         if (nested.isPresent()) {
@@ -104,10 +105,14 @@ public final class CalciteQueryPlanner implements QueryPlanner {
 
     private PlannedQuery planWithCte(
             String sql, SqlNode parsed, SqlWith with, ClusterCatalog catalog, String queryId) {
+        if (with.withList.size() > 1) {
+            throw new IllegalArgumentException("WITH supports a single CTE for distributed planning");
+        }
         SqlSelect cteSelect = WithClauseExpander.firstCteSelect(with);
         if (cteSelect.getGroup() == null || cteSelect.getGroup().isEmpty()) {
             throw new IllegalArgumentException("WITH CTE body must include GROUP BY for distributed planning");
         }
+        DistributedQueryGuard.validate(cteSelect, catalog);
 
         String cteName = WithClauseExpander.firstCteName(with);
         SqlNode outerNode = outerQueryNode(parsed, with);
