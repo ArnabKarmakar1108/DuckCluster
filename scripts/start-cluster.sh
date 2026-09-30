@@ -173,6 +173,11 @@ done
 
 sleep 3
 
+# Demo shards are split by hash(id); declaring the key enables shard-local self-joins and co-partitioning.
+curl -s -o /dev/null -X POST "http://${DUCKCLUSTER_COORDINATOR_HOST}:${DUCKCLUSTER_COORDINATOR_HTTP_PORT}/v1/catalog/tables" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"events\",\"shardCount\":${DUCKCLUSTER_SHARD_COUNT},\"shardKey\":\"id\"}" || true
+
 echo
 echo "Cluster health:"
 curl -s "http://${DUCKCLUSTER_COORDINATOR_HOST}:${DUCKCLUSTER_COORDINATOR_HTTP_PORT}/v1/cluster/health" | python3 -m json.tool

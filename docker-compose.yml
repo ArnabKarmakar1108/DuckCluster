@@ -35,6 +35,19 @@ services:
       datagen:
         condition: service_completed_successfully
 
+  catalog-init:
+    image: duckcluster:latest
+    command:
+      - sh
+      - -c
+      - >-
+        curl -sf -X POST http://coordinator:8080/v1/catalog/tables
+        -H 'Content-Type: application/json'
+        -d '{"name":"events","shardCount":${DUCKCLUSTER_SHARD_COUNT:-6},"shardKey":"id"}'
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
   worker-1:
     build: .
     image: duckcluster:latest

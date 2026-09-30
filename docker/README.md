@@ -69,6 +69,7 @@ worker-1/2/3  →  gRPC :9101 inside the compose network
 |---------|---------|
 | `datagen` | Runs `prepare-data.sh`, splits `demo-events.csv` into shard files, copies them into per-worker volumes, then exits |
 | `coordinator` | Query planner, REST API, dashboard, worker registry |
+| `catalog-init` | One-shot: declares `events` with shard key `id` (`POST /v1/catalog/tables`) once the coordinator is healthy, so self-joins and co-partitioned joins on `id` are planned shard-locally |
 | `worker-1`, `worker-2`, `worker-3` | Execute fragments on local shard files and register with the coordinator |
 
 Startup order:

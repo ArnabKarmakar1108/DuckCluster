@@ -137,6 +137,7 @@ class ClusterConfig:
     cache_max_shards: int | None = None
     shard_pin_lease_sec: int | None = None
     worker_extra_env: dict[str, str] | None = None
+    worker_ready_timeout_sec: float = 90.0
     data_mode: Literal["distributed", "primary_only_shard0", "empty", "tpch"] = "distributed"
     demo_csv: Path | None = None
     demo_row_count: int | None = None
@@ -176,7 +177,21 @@ class ClusterManager:
         for worker_id, port in zip(self.config.worker_ids, self.config.worker_ports):
             self._start_worker_process(worker_id, port, worker_jar, env)
 
-        self._wait_for_workers(len(self.config.worker_ids))
+        self._wait_for_workers(
+            len(self.config.worker_ids), timeout_sec=self.config.worker_ready_timeout_sec
+        )
+        self._declare_demo_table()
+
+    def _declare_demo_table(self) -> None:
+        """Demo shards are split by hash(id); declaring it lets the planner prove shard-local joins."""
+        if self.config.data_mode not in ("distributed", "primary_only_shard0"):
+            return
+        response = requests.post(
+            f"{self.config.http_base_url}/v1/catalog/tables",
+            json={"name": "events", "shardCount": self.config.shard_count, "shardKey": "id"},
+            timeout=10,
+        )
+        response.raise_for_status()
 
     def stop(self) -> None:
         for process in reversed(list(self._workers.values())):
@@ -229,7 +244,10 @@ class ClusterManager:
         )
         self._coordinator = self._spawn(["java", "-jar", str(coordinator_jar)], env)
         self._wait_for_coordinator()
-        self._wait_for_workers(len(self._workers), timeout_sec=90)
+        self._wait_for_workers(
+            len(self._workers), timeout_sec=max(90.0, self.config.worker_ready_timeout_sec)
+        )
+        self._declare_demo_table()
 
     def kill_worker(self, worker_id: str) -> None:
         process = self._workers.get(worker_id)

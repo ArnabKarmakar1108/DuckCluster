@@ -40,6 +40,7 @@ def test_pool_sizing_under_concurrency(
             pool_size=pool_size,
             pool_wait_ms=pool_wait_ms,
             fragment_wait_ms=90_000,
+            worker_ready_timeout_sec=120.0,
         )
     )
     manager.start()
