@@ -462,8 +462,7 @@ java -jar worker/target/duckcluster-worker-0.1.0-SNAPSHOT.jar worker-1 127.0.0.1
 
 ## Benchmark — TPC-H vs single-node DuckDB
 
-Full TPC-H (22 queries) benchmarked at **SF0.01–SF40** on identical hardware (single Linux VM, 3 workers + coordinator vs single-node DuckDB baseline). All 22 queries pass correctness verification. TPC-DS is out of scope for now (planner not ready). Charts under `docs/plots/` are from an earlier baseline run; regenerate with `scripts/benchmark-plots.py` after a fresh benchmark if needed.
-
+Full TPC-H (22 queries) benchmarked at **SF0.01–SF40** on identical hardware (single Linux VM, 3 workers + coordinator vs single-node DuckDB baseline). All 22 queries pass correctness verification. TPC-DS is out of scope for now (planner not ready).
 **Key results (SF40, ~56 GB, concurrency=1):**
 
 - **7/22 queries outperform single-node DuckDB** — despite DuckCluster running 4 processes vs 1
@@ -528,7 +527,7 @@ Regenerate plots: `python3 scripts/benchmark-plots.py` (requires matplotlib). Fu
 
 - **Dashboard** — read-only monitoring UI at `/dashboard/` ([demo video](docs/media/DuckCluster-demo.mp4), [screenshots](#monitoring-dashboard)); SSE drill-down pending ([plan](docs/PLAN-dashboard.md))
 - **CLI** — shipped: interactive shell + `query` / `status` / `workers` ([guide](cli/README.md), [plan](docs/PLAN-cli.md))
-- **Broadcast materialization** — worker-side `__dc_bcast_*` tables (landed; formal re-benchmark pending) — see [OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md)
+- **Broadcast materialization** — worker-side `__dc_bcast_*` tables (landed) — see [OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md)
 ---
 
 

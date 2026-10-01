@@ -506,7 +506,7 @@ Ordered by measured impact. Resolved items struck through.
 | Priority | Action | Queries helped | Expected impact |
 |----------|--------|----------------|-----------------|
 | 1 | **Broadcast join reform** — shared dimension cache per worker, not `UNION ALL` per fragment | Q03, Q07, Q09, Q05 | High — removes redundant scans |
-| 2 | **Merge pushdown** — hierarchical per-worker collapse + TOP-K oversample on fragments | Q03, Q07, Q16, Q17 | **Done (Opt 5)** — re-benchmark to measure |
+| 2 | **Merge pushdown** — hierarchical per-worker collapse + TOP-K oversample on fragments | Q03, Q07, Q16, Q17 | **Done (Opt 5)** |
 | 3 | **Stream results** — chunked HTTP or Arrow; skip `toQueryResult` monolith | Q13, Q18, large outputs | Medium — fixes client gap |
 | 4 | **Fix SF10 worker failures** — broadcast cache eviction | Q10, Q18 | **Done** — shard pin session |
 | 5 | **Typed proto columns** — `DOUBLE`/`BIGINT` from workers, direct Appender | All merge queries | Medium at SF10+ |
@@ -621,7 +621,6 @@ single-node DuckDB cannot provide from one process.
 
 6. **TOP_K / partial-agg pushdown** — **done (Opt 5):** hierarchical per-worker collapse +
    TOP-K oversample on fragments (`LIMIT × shard_count`); coordinator merges smaller intermediates.
-   Re-benchmark pending to quantify Q03/Q07 impact.
 
 ### Minuses that still hurt (measured at SF1/SF10)
 

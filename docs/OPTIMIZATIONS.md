@@ -126,7 +126,7 @@ Exec p50 sum across 22 queries, DuckCluster vs single-node ratio in parentheses.
 | **Problem** | Every fragment SQL contained `UNION ALL` over all broadcast shards — repeated scans per fragment |
 | **Solution** | Materialize each multi-shard broadcast once per worker per query as `__dc_bcast_<table>`; `MaterializeBroadcast` / `ClearBroadcastTables` RPC; planner references materialized table in fragment SQL |
 | **Key files** | `BroadcastMaterializer.java`, `BroadcastSqlNames.java`, `FragmentSqlGenerator.java`, `QueryExecutionService.prepareWorkersForQuery` |
-| **Benchmark** | **Pending formal re-benchmark** — code merged; canonical SF10/SF20/SF40 numbers predate or overlap this work. Expected to help Q03/Q07/Q08/Q09/Q18 |
+| **Impact** | Expected to help Q03/Q07/Q08/Q09/Q18 |
 
 ---
 
@@ -137,7 +137,7 @@ Exec p50 sum across 22 queries, DuckCluster vs single-node ratio in parentheses.
 | **Problem** | Pin/materialize per fragment attempt; hierarchical collapse round-tripped merge rows through Java strings |
 | **Solution** | `prepareWorkersForQuery()` — one pin + broadcast materialize per worker per query; hierarchical step uses `CREATE TABLE __merge_worker_N AS` + `INSERT INTO __merge_temp SELECT *` |
 | **Key files** | `QueryExecutionService.java`, `DuckDbMergeSupport.collapseWorkerFragments` |
-| **Benchmark** | **Pending formal re-benchmark**. Reduces RPC/pin churn and coordinator string materialization |
+| **Impact** | Reduces RPC/pin churn and coordinator string materialization |
 
 ---
 
@@ -187,12 +187,12 @@ Ordered by measured impact at SF10–SF40. See [BENCHMARK.md — Remaining bottl
 
 | # | Bottleneck | Symptom | Status |
 |---|------------|---------|--------|
-| 1 | Broadcast cost (even with materialization at scale) | Q03/Q07/Q08/Q09/Q18 remain 3–5× slower than SN | **Partial** — materialization landed; full suite re-benchmark pending |
+| 1 | Broadcast cost (even with materialization at scale) | Q03/Q07/Q08/Q09/Q18 remain 3–5× slower than SN | **Partial** — materialization landed; join-heavy queries still slower |
 | 2 | Coordinator merge SQL | Workers finish in &lt;1 s; Q03 still multi-second at SF10+ | **Partial** — pushdown helped SF1; large fan-in remains |
 | 3 | Result materialization | Client latency &gt; exec time (e.g. Q13) | **Open** — full `ResultSet` → JSON, no streaming |
 | 4 | gRPC fragment overhead | ~50–200 ms fixed tax per query | **Open** |
 | 5 | Coordinator merge serialization | c=4 suite **2.5× worse** than c=1 | **Open** — needs parallel merge executor |
-| 6 | All-string proto columns | Parse/convert overhead at merge | **Open** — Arrow/typed cells deferred |
+| 6 | Row-oriented protobuf batches | Parse/convert overhead at merge | **Partial** — columns now carry types and null flags; a columnar format (Arrow) is out of scope |
 | 7 | Fragment wave count | 6–12 fragments on 3 workers → 2–4 execution waves | **Open** — more workers/shards |
 | 8 | Node stability | Workers crash / SSH hangs at sustained SF40+ load | **Open** — blocks SF100 |
 
@@ -202,11 +202,10 @@ Ordered by measured impact at SF10–SF40. See [BENCHMARK.md — Remaining bottl
 
 | Priority | Work | Queries | Expected impact |
 |----------|------|---------|-----------------|
-| 1 | Re-benchmark after broadcast materialization + per-query pin | Q03/Q07/Q08/Q09/Q18 | Quantify #8 above |
-| 2 | Stream results (chunked HTTP or Arrow) | Q13, Q18, large outputs | Cut client–exec gap |
-| 3 | Parallel merge executor + backpressure | All queries at c≥4 | Throughput crossover |
-| 4 | Typed proto / Arrow worker → coordinator | Merge-heavy queries | Less parse CPU at SF10+ |
-| 5 | More workers + shards | Scan-heavy Q01/Q04/Q06 | Hide RPC latency |
+| 1 | Stream results (chunked HTTP) | Q13, Q18, large outputs | Cut client–exec gap |
+| 2 | Parallel merge executor + backpressure | All queries at c≥4 | Throughput crossover |
+| 3 | Columnar worker → coordinator transfer | Merge-heavy queries | Less parse CPU at SF10+ |
+| 4 | More workers + shards | Scan-heavy Q01/Q04/Q06 | Hide RPC latency |
 
 ---
 

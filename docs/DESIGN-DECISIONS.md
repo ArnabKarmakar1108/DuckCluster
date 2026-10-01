@@ -1036,8 +1036,7 @@ DuckCluster is a distributed-systems portfolio project, not a multi-tenant produ
 
 - One active coordinator. In-flight queries and unfetched async results are lost on restart (see [HA.md](HA.md)).
 - The metadata snapshot keeps table declarations and shard ownership but not the active data version per table. After a restart the coordinator falls back to per-query broadcast tables until the next activation.
-- Workers on one VM became unstable at SF40+ (Challenge 8). The benchmark numbers predate the co-partition and shuffle join work.
-
+- Workers on one VM became unstable at SF40+ (Challenge 8).
 ### Out of scope
 
 | Area | Notes |
