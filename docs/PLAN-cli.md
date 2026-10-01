@@ -4,15 +4,14 @@
 
 ## Delivered
 
-- `shell` (default on TTY), `query`, `status`, `workers`
+- `shell` (default on TTY), `query`, `status`, `workers`, `explain` (and `\explain` in the shell)
 - Table + JSON output, pre-flight validation, readline history
+- Async query submit + poll + chunked fetch (`--async`, `/v1/query/async`)
 - Launcher: `./scripts/duckcluster` or `pip install -e cli/`
 
 ## TODO
 
 - [ ] Shell completion (bash/zsh)
-- [ ] `duckcluster query --explain` (needs plan-only REST endpoint)
-- [x] Async query submit + poll + chunked fetch (`--async`, `/v1/query/async`)
 
 ## Non-goals
 

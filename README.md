@@ -7,7 +7,7 @@ A **distributed SQL query coordinator** for analytical workloads. Clients submit
 
 **Read the full write-up on Medium:** [Building DuckCluster — distributed SQL on DuckDB](https://medium.com/@arnabk1108/building-duckcluster-distributed-sql-on-top-of-duckdb-e5dbae2f967d)
 
-For design details, see [DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md), [DESIGN-planner.md](docs/DESIGN-planner.md), and [HA.md](docs/HA.md) for coordinator failover notes.
+For design details, see [DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md), [DESIGN-planner.md](docs/DESIGN-planner.md), and [HA.md](docs/HA.md) for coordinator failover notes. Supported SQL and known limitations are listed in [DESIGN-DECISIONS.md §15](docs/DESIGN-DECISIONS.md#15-known-limitations-and-out-of-scope); debugging write-ups are in [§14](docs/DESIGN-DECISIONS.md#14-challenges--solutions).
 
 ---
 
@@ -298,11 +298,24 @@ See `[tests/integration/README.md](tests/integration/README.md)` for harness lay
 | Method | Path                            | Description                                      |
 | ------ | ------------------------------- | ------------------------------------------------ |
 | `POST` | `/v1/query`                     | Execute SQL synchronously (blocking)             |
+| `POST` | `/v1/query/explain`             | Plan only: driving table, join placement (broadcast / co-partition / shuffle), fragment SQL |
 | `POST` | `/v1/query/async`               | Submit SQL; returns **202** + `queryId`          |
 | `GET`  | `/v1/query/{queryId}`           | Poll status (`QUEUED` / `RUNNING` / `SUCCEEDED` / `FAILED`) |
 | `GET`  | `/v1/query/{queryId}/results`   | Fetch result rows (`offset`, `limit`; chunked)   |
-| `GET`  | `/v1/cluster/health`            | Cluster liveness summary                         |
+| `GET`  | `/v1/query/{queryId}/profile`   | Per-query phases, fragments, and timings         |
+| `DELETE` | `/v1/query/{queryId}`         | Cancel a running async query                     |
+| `GET`  | `/v1/cluster/health`            | Cluster liveness summary (`UP` / `DEGRADED`)     |
+| `GET`  | `/v1/cluster/ready`             | Readiness: workers registered and catalog non-empty |
 | `GET`  | `/v1/cluster/workers`           | Registered workers and heartbeat status          |
+| `POST` | `/v1/cluster/reconcile`         | Trigger a shard replication reconcile pass       |
+| `GET`  | `/v1/catalog/tables`            | Tables with shard count, shard key, version, row estimate, columns |
+| `GET`  | `/v1/catalog/tables/{table}`    | Describe one table                               |
+| `POST` | `/v1/catalog/tables`            | Declare a table: `{"name", "shardCount", "shardKey"}` (enables co-partition / shuffle joins) |
+| `DELETE` | `/v1/catalog/tables/{table}`  | Remove a table from the catalog                  |
+| `PUT`  | `/v1/catalog/tables/{table}/versions/{v}/shards/{id}` | Upload a staged shard file for version `v` |
+| `POST` | `/v1/catalog/tables/{table}/versions/{v}/activate` | Atomically switch the table to version `v` |
+| `GET`  | `/v1/monitor/summary`, `/v1/monitor/shards` | Dashboard data                     |
+| `GET`  | `/metrics`                      | Minimal Prometheus-format gauges                 |
 
 
 **Query request**
@@ -361,7 +374,7 @@ Environment variables (defaults shown):
 | `DUCKCLUSTER_COORDINATOR_HTTP_PORT`    | `8080`                   | REST API + dashboard port             |
 | `DUCKCLUSTER_COORDINATOR_GRPC_PORT`    | `9090`                   | Worker registration / heartbeat port  |
 | `DUCKCLUSTER_HEARTBEAT_INTERVAL_SEC`   | `5`                      | Heartbeat period (seconds)            |
-| `DUCKCLUSTER_HEARTBEAT_MISS_THRESHOLD` | `3`                      | Missed beats before worker removed    |
+| `DUCKCLUSTER_HEARTBEAT_MISS_THRESHOLD` | `6`                      | Missed beats before worker removed    |
 | `DUCKCLUSTER_SHARD_COUNT`              | `3`                      | Logical shard count for demo catalog  |
 | `DUCKCLUSTER_DATA_DIR`                 | `./data`                 | Worker data directory for shard files |
 | `DUCKCLUSTER_POOL_SIZE`                | `max(2, min(4, CPUs-1))` | DuckDB connections per worker         |
@@ -372,6 +385,20 @@ Environment variables (defaults shown):
 | `DUCKCLUSTER_ASYNC_RESULT_TTL_SEC`     | `1800`                   | Retain async query results (seconds)  |
 | `DUCKCLUSTER_ASYNC_MAX_STORED_JOBS`  | `200`                    | Max async jobs in coordinator memory  |
 | `DUCKCLUSTER_ASYNC_MAX_STORED_BYTES` | `67108864` (64 MiB)      | Max estimated bytes for async results |
+| `DUCKCLUSTER_MAX_CONCURRENT_QUERIES`   | `32`                     | Admission limit; extra queries get `503` |
+| `DUCKCLUSTER_QUERY_TIMEOUT_SEC`        | `300`                    | Per-query deadline                    |
+| `DUCKCLUSTER_WORKER_RPC_DEADLINE_SEC`  | `120`                    | Deadline on coordinator→worker RPCs   |
+| `DUCKCLUSTER_CACHE_MAX_SHARDS`         | `32`                     | Worker cache of fetched broadcast shards |
+| `DUCKCLUSTER_SHARD_PIN_LEASE_SEC`      | `600`                    | Lease before an abandoned shard pin is reaped |
+| `DUCKCLUSTER_MERGE_POOL_SIZE`          | `4`                      | Coordinator merge connections         |
+| `DUCKCLUSTER_MERGE_MEMORY_LIMIT_MB`    | `2048`                   | DuckDB memory limit for coordinator merges |
+| `DUCKCLUSTER_WORKER_MEMORY_LIMIT_MB`   | `4096`                   | DuckDB memory limit per worker        |
+| `DUCKCLUSTER_METADATA_SNAPSHOT_INTERVAL_SEC` | `300`              | How often `coordinator-metadata.json` is written |
+| `DUCKCLUSTER_COPARTITION_JOINS`        | `true`                   | Allow co-partitioned local joins      |
+| `DUCKCLUSTER_SHUFFLE_JOINS`            | `true`                   | Allow hash-shuffle joins              |
+| `DUCKCLUSTER_SHUFFLE_MIN_ROWS`         | `0`                      | Broadcast instead of shuffle below this row estimate |
+
+Less common tunables (fragment batch size, gRPC message size and compression, replication concurrency and interval, heartbeat suspect threshold) are listed in [`ClusterConfig.fromEnvironment`](common/src/main/java/io/duckcluster/common/config/ClusterConfig.java).
 
 
 ---

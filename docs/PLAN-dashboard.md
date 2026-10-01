@@ -17,7 +17,7 @@
 
 - [ ] **P4** — SSE `GET /v1/events` (replace polling for active queries)
 - [ ] **P5** — `GET /v1/monitor/queries/{id}` drill-down + optional worker cache stats
-- [ ] Prometheus `/v1/metrics` export (optional)
+- [x] Minimal Prometheus-format gauges at `GET /metrics` (no histograms or tracing; see [DESIGN-DECISIONS §15](DESIGN-DECISIONS.md#15-known-limitations-and-out-of-scope))
 
 ## Non-goals
 

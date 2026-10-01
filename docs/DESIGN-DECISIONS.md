@@ -470,7 +470,9 @@ Non-retryable errors fail immediately.
 
 ---
 
-## 7. JOIN Execution: Broadcast Shuffle
+## 7. JOIN Execution: Broadcast, Co-partition, and Shuffle
+
+> **Current behavior:** `JoinPlacementAnalyzer` picks one of three placements for each non-driving multi-shard table. **Co-partitioned** tables share the shard count and are equi-joined key-to-key with the driving table, so fragment *i* joins shard *i* of both locally. **Shuffle** tables are joined on the driving shard key but partitioned differently; they are re-bucketed worker-to-worker (`ShuffleTable` / `ReceiveShufflePiece`, Parquet pieces into `__dc_shuf_<qid>_<table>_b<i>`). Everything else is **broadcast**, which is described below and is still the fallback. Broadcast copies are materialized per query (`__dc_bcast_<qid>_<table>`), or shared per active table version (`__dc_bcast_v<N>_<table>`). Co-partition and shuffle require shard keys declared via `POST /v1/catalog/tables`. Tables discovered only from shard files have an undeclared key and always broadcast.
 
 ### Problem
 
@@ -522,9 +524,9 @@ Query: SELECT ... FROM lineitem(6 shards) l JOIN orders(4 shards) o ON ...
    └── Standard merge strategy (GROUP_BY_MERGE, PARTIAL_AGG, etc.)
 ```
 
-### Why broadcast instead of hash-repartition?
+### Why broadcast first, then shuffle?
 
-True hash-repartition (read rows, re-hash on join key, redistribute by bucket) requires streaming individual rows at query time — significant infrastructure for row-level shuffling. Broadcasting entire shard files is simpler and leverages existing infrastructure (`ReadShard` + `LoadTempData` + `TempShardCache`).
+Broadcast came first because it reuses whole-file transfer (`ReadShard` + `LoadTempData` + `TempShardCache`) and is correct for any join predicate. Hash-repartition was added later as `ShuffleJoinExecutor` for large tables joined on the driving shard key. Workers write `COPY … (FORMAT PARQUET, PARTITION_BY (__dc_bucket))` and stream the pieces to their peers, so each row moves at most once. Shuffle is used only when the table has at least `DUCKCLUSTER_SHUFFLE_MIN_ROWS` estimated rows; smaller tables stay on broadcast.
 
 The tradeoff: broadcasting moves more data when both tables are large. But shard files are cached across queries (`TempShardCache`), so the transfer cost is paid once. For the common pattern (large fact table + smaller dimension-like table), broadcast is efficient.
 
@@ -737,7 +739,7 @@ Both use `private volatile boolean closed` for cheap cross-thread shutdown visib
 
 `TempShardCache` is a bounded LRU cache of remotely-fetched broadcast shard DuckDB files on each worker. Backed by `LinkedHashMap<String, CacheEntry>` with `accessOrder=true` — Java's built-in LRU iteration order. All public methods are `synchronized` (simple monitor; low contention since access is per-query, not per-row).
 
-The **pin session** mechanism prevents cache eviction during active query execution. Without it, fragment B's prefetch could evict a shard that fragment A (same query, same worker) is still reading — the root cause of SF10 Q10/Q18 failures. `beginPinSession()` increments a reentrant counter and snapshots all current cache keys into `pinnedKeys`; eviction skips pinned entries. `endPinSession()` decrements and clears pins at depth zero.
+The **pin session** mechanism prevents cache eviction during active query execution. Without it, fragment B's prefetch could evict a shard that fragment A (same query, same worker) is still reading — the root cause of SF10 Q10/Q18 failures. Sessions are keyed by query id: `beginPinSession(queryId, leaseMs)` records the shards that query loads, eviction skips any key held by a live session, and `endPinSession(queryId)` releases only that query's pins. Each session has a lease (`DUCKCLUSTER_SHARD_PIN_LEASE_SEC`). The `temp-shard-pin-reaper` thread expires sessions whose `EndShardPin` never arrived (coordinator crash or a failed cleanup RPC), so pins cannot leak.
 
 ### Fragment dispatch (scatter-gather)
 
@@ -793,10 +795,10 @@ All use single-thread `ScheduledExecutorService` with daemon threads (JVM exits 
 
 - **No storage engine extension** — uses DuckDB as-is via JDBC; no C++ plugin or custom catalog
 - **No cross-shard writes / distributed transactions** — read-only analytical workloads only
-- **No persistent metadata store** — in-memory registry rebuilt on restart from worker shard reports
+- **No external metadata store** — the worker registry is rebuilt from worker re-registration; table declarations (shard count, shard key) and shard ownership are saved to a local JSON snapshot (`coordinator-metadata.json`), not a replicated store
 - **No authentication / multi-tenancy** — single-user, no auth layer
-- **No custom wire format** — Protobuf string columns today; typed Arrow IPC is future work
-- **No dynamic query routing** — all queries go through one coordinator; no multi-coordinator HA
+- **No columnar wire format** — Protobuf row batches with per-column types and NULL markers; Arrow IPC is out of scope
+- **No multi-coordinator HA** — one active coordinator; failover is a cold restart (see [HA.md](HA.md))
 
 ---
 
@@ -931,6 +933,56 @@ ALTER TABLE __merge_phase1 RENAME TO __merge_temp;
 
 ---
 
+### Challenge 9: Native worker crash — re-registration recursion on a shared DuckDB connection
+
+**Symptom:** Workers occasionally died with a JVM `SIGSEGV` and an `hs_err_pid*.log` whose problematic frame was inside DuckDB's native library — no Java exception, no stack trace in the worker log. It showed up most often in tests that restart the coordinator.
+
+**Investigation:** The crash logs' Java frames led back into worker code that calls DuckDB through `ShardManager`, on threads other than the fragment pool: gRPC callbacks and the heartbeat thread. That pointed to the caller (two threads using one connection) rather than to a bug in DuckDB.
+
+**Root cause (two bugs that compounded):**
+
+1. **Unbounded re-registration recursion.** `CoordinatorClient.observeBootEpoch` compared the coordinator's boot epoch with a plain `volatile long` and, on a change, called the reconnect handler *synchronously*. That handler calls `registerWorker`, whose response also goes through `observeBootEpoch`. Because the stored epoch was updated *after* the handler ran, the check stayed true and the worker re-registered recursively. Heartbeat responses arriving on gRPC threads could start the same chain in parallel.
+2. **Unsynchronized admin connection.** Re-registration builds the shard ownership list via `ShardManager`, which uses one shared DuckDB JDBC admin connection. DuckDB connections are not safe for concurrent use, and `ShardManager`'s metadata methods (`estimateRowCount`, `describeTable`, `detachShard`, …) were not locked. Several re-registrations reading through the same connection at once corrupted native state and crashed the process.
+
+**Fix:**
+
+- `lastCoordinatorBootEpoch` became an `AtomicLong` updated with `getAndSet` *before* reacting, so one epoch change triggers exactly one re-registration.
+- An `AtomicBoolean reregistrationPending` de-duplicates requests, and the work runs on the single heartbeat executor (never on a gRPC callback thread) under a `registrationLock`.
+- All `ShardManager` admin-connection methods are `synchronized` and check a `closed` flag.
+- `WorkerMain`'s shutdown hook closes `CoordinatorClient` first, so no re-registration can race with `ShardManager.close()`.
+
+**Verification:** `CoordinatorClientReregistrationTest` reproduces the recursion (it failed with `StackOverflowError` before the fix) and asserts exactly one handler run per epoch change. `ShardManagerTest` runs concurrent metadata reads alongside attach, detach, and close. The coordinator-restart integration test no longer leaves crash logs.
+
+**Lesson:** a native crash is usually a concurrency bug in the caller. Embedded engines like DuckDB give you a connection, not a thread-safe service.
+
+---
+
+### Challenge 10: TPC-H Q12 — `SUM` of integers arrives as text (`HUGEINT`)
+
+**Symptom:** After result columns became typed on the wire, Q12 failed in the coordinator merge with a DuckDB binder error for `sum(VARCHAR)`. Every other query still passed.
+
+**Root cause:** Q12 computes `SUM(CASE WHEN … THEN 1 ELSE 0 END)`. In DuckDB, `SUM` over integers returns `HUGEINT` (128-bit). The DuckDB JDBC driver reports `HUGEINT` (and unsigned integer types) as `Types.JAVA_OBJECT` because JDBC has no standard type for them. `SqlJdbcTypes.toProtoType` mapped every unknown JDBC type to `SQL_VARCHAR`, so the worker sent the partial sums as strings. The coordinator then created a `VARCHAR` column in its merge table and tried to re-aggregate it with `SUM`.
+
+**Fix:** `toProtoType(int jdbcType, String typeName)` also looks at `ResultSetMetaData.getColumnTypeName`. `HUGEINT`, `UHUGEINT`, `UBIGINT`, `UINTEGER`, `USMALLINT`, and `UTINYINT` map to `SQL_BIGINT`. `FragmentExecutor` passes the type name through. `TopKMergeTypingTest` and unit tests in `common` cover the mapping.
+
+**Lesson:** typing the wire made results correct for NULL vs `''` and leading zeros, but it also exposed every place where the type system was being guessed. Driver-specific type names matter as much as JDBC codes.
+
+---
+
+### Challenge 11: Latent wrong results in correlated `EXISTS` (Q04, Q21)
+
+**Symptom:** None — all 22 TPC-H queries matched single-node DuckDB, which is what made it latent. It surfaced while adding a second data layout for shuffle joins (`orders` split 4 ways by `o_custkey`, `lineitem` 6 ways by `l_orderkey`). Tracing Q04's plan on that layout showed fragment *i* would check only `lineitem_shard{i}`: rows in other shards would be missed, and `lineitem` shards 4 and 5 would never be read at all.
+
+**Root cause:** For correlated `EXISTS` / `NOT EXISTS`, the planner used the `CO_LOCATED_SUBQUERY` rewrite whenever the driving table had more than one shard: fragment *i* checked the inner table's shard *i* only. That is correct **only** if the inner table is partitioned on the correlation key with the same shard count and hash as the outer row. In the original TPC-H layout, `orders` and `lineitem` are both split on the order key, so the correlation `l_orderkey = o_orderkey` happened to line up and results were right by coincidence. With any other layout, matching inner rows lived on other shards and `EXISTS` silently returned false.
+
+**Fix:** `JoinPlacementAnalyzer.canCoLocateSubquery` now proves co-location instead of assuming it. Each multi-shard inner table must have a declared shard key, the same shard count and key type as the driving table, and its shard key must be connected through the equi-join graph (union-find over `alias.column`) to the shard key of an outer table that is itself sliced by shard. Otherwise the subquery falls back to `GLOBAL_SUBQUERY` (all shards via `UNION ALL`).
+
+**Verification:** `test_tpch_shuffle.py` runs all 22 queries against the second layout and compares them with single-node DuckDB. It also checks the `explain` output to confirm Q04 has no co-located subquery tables on that layout. Planner unit tests still expect co-location on the order-key layout, where it is valid.
+
+**Lesson:** a passing correctness suite on one data layout only proves correctness for that layout. Partitioning assumptions belong in the planner as checked preconditions, and the test matrix needs at least two layouts.
+
+---
+
 ### Summary: optimization trajectory
 
 | # | Challenge | Bottleneck | Key metric |
@@ -943,21 +995,55 @@ ALTER TABLE __merge_phase1 RENAME TO __merge_temp;
 | 6 | Cache eviction mid-query | LRU evicts active shard | SF10: 20/22 → 22/22 |
 | 7 | Planner correctness | 8 failure classes | 0/22 → 22/22 TPC-H |
 | 8 | Node stability | Cgroup pressure at SF40+ | Open |
+| 9 | Native worker crash | Re-registration recursion + unlocked DuckDB connection | SIGSEGV → none |
+| 10 | `HUGEINT` partial sums | JDBC `JAVA_OBJECT` mapped to VARCHAR | Q12 fixed |
+| 11 | Correlated `EXISTS` | Co-location assumed, not proven | Q04 correct on any layout |
 
 **Suite trajectory (SF1 c=1):** pre-fix minutes+ → bulk **19.2s** → hardened **15.5s** (7.2×) → pushdown **6.6s** (3.2×).
 
 ---
 
-## 11. Out of scope (portfolio / future work)
+## 15. Known limitations and out of scope
 
-DuckCluster is a distributed-systems portfolio project, not a multi-tenant production service. The following are intentionally deferred:
+DuckCluster is a distributed-systems portfolio project, not a multi-tenant production service. The rule for SQL it can't run correctly is to **fail with a clear error rather than return a wrong answer**. Everything listed here was checked against the code or run against a live cluster and compared with single-node DuckDB.
+
+### SQL rejected with an error
+
+| Shape | Behavior |
+|-------|----------|
+| Anything other than one `SELECT` (`INSERT`, DDL, top-level `UNION` / `INTERSECT` / `EXCEPT`) | `400` — "Only SELECT queries are supported". Data is loaded as shard files or through the catalog ingest API |
+| `SELECT DISTINCT`, `HAVING`, window functions (`OVER`), `OFFSET` on a query or derived table that touches a multi-shard table | `400` from `DistributedQueryGuard`. Each shard would apply them to its own rows. Allowed when every table has one shard, and inside `WHERE` subqueries (those scan all shards). Use `GROUP BY` instead of `DISTINCT` |
+| Self-join of a multi-shard table where some alias is not equi-joined on the declared shard key (or no key is declared) | `400`. Shard-local evaluation would miss cross-shard matches. Declare the key with `POST /v1/catalog/tables` |
+| Aggregates other than `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `COUNT(DISTINCT …)` (e.g. `MEDIAN`, `STDDEV`) | Error. For `MEDIAN` the message is unhelpful ("Missing aggregate metadata") |
+| `AVG(…)` inside an arithmetic expression, e.g. `AVG(x) * 2` | Error. `SUM(x) / COUNT(x)` works |
+| `ORDER BY` on an expression; non-literal `LIMIT` | Error. Order by a column or an alias instead |
+| `LIMIT` inside a derived table | Error (message currently says "No tables found in FROM clause") |
+| `WITH` with more than one CTE, or a CTE body without `GROUP BY` (the supported shape is TPC-H Q15) | Error |
+
+### Planner heuristics (correct, but not optimal)
+
+- **Correlation detection** relies on TPC-H column prefixes (`l_`, `o_`, …) plus alias qualifiers. On other schemas a correlated subquery is treated as uncorrelated and scans every shard. Results are still correct (checked with `EXISTS` on the demo table), but it doesn't get the shard-local speedup.
+- **Co-partition and shuffle joins need declared shard keys.** Tables known only from worker shard files get the placeholder key `rowid` and are always broadcast.
+- **Join placement is per table name, not per alias.** If one occurrence of a table cannot be co-partitioned, every occurrence is broadcast.
+
+### Result types
+
+- `DECIMAL` is sent as `DOUBLE`, so results are subject to floating-point rounding (the TPC-H checks use a relative tolerance).
+- `DATE`, `TIMESTAMP` and other non-numeric types are sent as `VARCHAR` (ISO strings). `MIN`, `MAX` and `ORDER BY` still work because ISO strings sort correctly, but the coordinator merge treats them as text.
+- `HUGEINT` partial sums are merged as `BIGINT`, so totals beyond the 64-bit range are not supported.
+
+### Operations
+
+- One active coordinator. In-flight queries and unfetched async results are lost on restart (see [HA.md](HA.md)).
+- The metadata snapshot keeps table declarations and shard ownership but not the active data version per table. After a restart the coordinator falls back to per-query broadcast tables until the next activation.
+- Workers on one VM became unstable at SF40+ (Challenge 8). The benchmark numbers predate the co-partition and shuffle join work.
+
+### Out of scope
 
 | Area | Notes |
 |------|--------|
-| **Security** | No HTTP auth, plaintext worker gRPC, open registration — fine for local demos only |
-| **Apache Arrow IPC** | Typed row batches still use protobuf + JDBC today; Arrow would be a wire-format upgrade |
-| **OpenTelemetry** | Minimal `/metrics` gauges only; no distributed tracing stack |
-| **Warm-standby coordinator** | Cold active–passive with PVC + worker re-registration is documented in [HA.md](HA.md) |
-| **Full SQL surface lockdown** | Planner allows `SELECT` fragments; explicit denylist for `COPY`/`ATTACH`/file functions not enforced |
-
-Correctness and operability items that *were* in scope (query-scoped broadcasts, pin leases, wire types, co-partition/shuffle joins, catalog versioning, coordinator metadata snapshot) are implemented and covered by unit and integration tests.
+| **Security** | No HTTP auth, plaintext worker gRPC, open worker registration — local demos only |
+| **Apache Arrow IPC** | Typed protobuf row batches instead of a columnar wire format |
+| **OpenTelemetry** | Minimal `/metrics` gauges only; no distributed tracing |
+| **Warm-standby coordinator** | Cold active–passive only ([HA.md](HA.md)) |
+| **SQL surface lockdown** | Fragments are validated as `SELECT` over known shards, but `COPY` / `ATTACH` / file table functions are not explicitly denylisted |
