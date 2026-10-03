@@ -116,6 +116,8 @@ INTEGRATION_TEST_PORTS: tuple[int, ...] = tuple(
     sorted(set(_INTEGRATION_TEST_BASE_PORTS + _stress_test_ports()))
 )
 
+_MAX_WORKER_START_RETRIES = 3
+
 
 @dataclass
 class ClusterConfig:
@@ -160,22 +162,36 @@ class ClusterManager:
         self.config = config
         self._coordinator: subprocess.Popen | None = None
         self._workers: dict[str, subprocess.Popen] = {}
+        self._worker_log_paths: dict[str, Path] = {}
+        self._worker_restart_attempts: dict[str, int] = {}
+        self._worker_ports: dict[str, int] = {}
+        self._worker_jar: Path | None = None
+        self._cluster_env: dict[str, str] | None = None
 
     def start(self) -> None:
         self._build_jars()
         self._release_ports()
         self._prepare_data()
+        self._worker_restart_attempts.clear()
         env = self._base_env()
+        self._cluster_env = env
         coordinator_jar = (
             self.config.root / "coordinator/target/duckcluster-coordinator-0.1.0-SNAPSHOT.jar"
         )
         worker_jar = self.config.root / "worker/target/duckcluster-worker-0.1.0-SNAPSHOT.jar"
+        self._worker_jar = worker_jar
 
-        self._coordinator = self._spawn(["java", "-jar", str(coordinator_jar)], env)
+        self._coordinator = self._spawn(
+            ["java", "-jar", str(coordinator_jar)], env, log_name="coordinator"
+        )
         self._wait_for_coordinator()
 
-        for worker_id, port in zip(self.config.worker_ids, self.config.worker_ports):
+        for index, (worker_id, port) in enumerate(
+            zip(self.config.worker_ids, self.config.worker_ports, strict=True)
+        ):
             self._start_worker_process(worker_id, port, worker_jar, env)
+            if index + 1 < len(self.config.worker_ids):
+                time.sleep(1)
 
         self._wait_for_workers(
             len(self.config.worker_ids), timeout_sec=self.config.worker_ready_timeout_sec
@@ -218,20 +234,47 @@ class ClusterManager:
 
     @staticmethod
     def _kill_listeners_on_port(port: int) -> None:
+        if shutil.which("fuser") is not None:
+            probe = subprocess.run(
+                ["fuser", f"{port}/tcp"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if probe.returncode != 0:
+                return
+            subprocess.run(
+                ["fuser", "-k", f"{port}/tcp"],
+                capture_output=True,
+                check=False,
+            )
+            time.sleep(0.3)
+            return
+
+        if shutil.which("ss") is None:
+            return
         probe = subprocess.run(
-            ["fuser", f"{port}/tcp"],
+            ["ss", "-ltnp", f"sport = :{port}"],
             capture_output=True,
             text=True,
             check=False,
         )
         if probe.returncode != 0:
             return
-        subprocess.run(
-            ["fuser", "-k", f"{port}/tcp"],
-            capture_output=True,
-            check=False,
-        )
-        time.sleep(0.3)
+        pids: set[int] = set()
+        for line in probe.stdout.splitlines():
+            if "pid=" not in line:
+                continue
+            for token in line.split(","):
+                token = token.strip()
+                if token.startswith("pid="):
+                    pid_text = token.removeprefix("pid=").split(",", 1)[0]
+                    if pid_text.isdigit():
+                        pids.add(int(pid_text))
+        for pid in pids:
+            subprocess.run(["kill", "-TERM", str(pid)], capture_output=True, check=False)
+        if pids:
+            time.sleep(0.3)
 
     def restart_coordinator(self) -> None:
         """Stop and start only the coordinator; workers stay up and should re-register."""
@@ -283,7 +326,9 @@ class ClusterManager:
         port: int,
         worker_jar: Path,
         env: dict[str, str],
+        append_log: bool = False,
     ) -> None:
+        self._worker_ports[worker_id] = port
         worker_env = env.copy()
         worker_env["DUCKCLUSTER_DATA_DIR"] = str(self.config.data_base / worker_id)
         worker_env["DUCKCLUSTER_WATCHER_INTERVAL_MS"] = str(self.config.watcher_interval_ms)
@@ -300,7 +345,11 @@ class ClusterManager:
         self._workers[worker_id] = self._spawn(
             ["java", "-jar", str(worker_jar), worker_id, self.config.coordinator_host, str(port)],
             worker_env,
+            log_name=f"worker-{worker_id}",
+            append_log=append_log,
         )
+        log_path = self.config.data_base / "logs" / f"worker-{worker_id}.log"
+        self._worker_log_paths[worker_id] = log_path
 
     def _build_jars(self) -> None:
         if self.config.skip_build and ClusterManager._jars_built:
@@ -472,11 +521,17 @@ class ClusterManager:
             env["DUCKCLUSTER_FRAGMENT_WAIT_MS"] = str(self.config.fragment_wait_ms)
         return env
 
-    def _spawn(self, command: list[str], env: dict[str, str]) -> subprocess.Popen:
+    def _spawn(
+        self,
+        command: list[str],
+        env: dict[str, str],
+        log_name: str | None = None,
+        append_log: bool = False,
+    ) -> subprocess.Popen:
         log_dir = self.config.data_base / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        label = Path(command[-1]).stem if command else "process"
-        log_file = open(log_dir / f"{label}.log", "w", encoding="utf-8")
+        label = log_name or (Path(command[-1]).stem if command else "process")
+        log_file = open(log_dir / f"{label}.log", "a" if append_log else "w", encoding="utf-8")
         return subprocess.Popen(
             command,
             cwd=self.config.root,
@@ -513,18 +568,58 @@ class ClusterManager:
         )
 
     def _wait_for_workers(self, expected: int, timeout_sec: float = 45) -> None:
+        expected_ids = set(list(self._workers.keys())[:expected])
+        if not expected_ids:
+            expected_ids = set(self.config.worker_ids[:expected])
         deadline = time.time() + timeout_sec
+        last_seen: list[str] = []
         while time.time() < deadline:
+            self._raise_if_worker_process_exited()
             if self._coordinator is not None and self._coordinator.poll() is not None:
                 raise RuntimeError("Coordinator process exited while waiting for workers")
             try:
                 response = requests.get(f"{self.config.http_base_url}/v1/cluster/workers", timeout=2)
                 response.raise_for_status()
                 workers = response.json().get("workers", [])
-                if len(workers) >= expected:
+                last_seen = [worker.get("workerId", "?") for worker in workers]
+                present_ids = {worker.get("workerId") for worker in workers}
+                if expected_ids.issubset(present_ids):
                     time.sleep(2)
                     return
             except requests.RequestException:
                 pass
             time.sleep(1)
-        raise RuntimeError(f"Expected {expected} workers, cluster did not become ready")
+        raise RuntimeError(
+            "Expected workers "
+            f"{sorted(expected_ids)}, cluster did not become ready "
+            f"(last seen: {sorted(last_seen)}, timeout={timeout_sec}s)"
+        )
+
+    def _raise_if_worker_process_exited(self) -> None:
+        """Retry workers that die at startup (e.g. the fixed port was grabbed as an ephemeral
+        source port by an unrelated connection: "bind failed: Address already in use")."""
+        for worker_id, process in list(self._workers.items()):
+            if process.poll() is None:
+                continue
+            attempts = self._worker_restart_attempts.get(worker_id, 0)
+            port = self._worker_ports.get(worker_id)
+            if (
+                attempts < _MAX_WORKER_START_RETRIES
+                and port is not None
+                and self._worker_jar is not None
+                and self._cluster_env is not None
+            ):
+                self._worker_restart_attempts[worker_id] = attempts + 1
+                time.sleep(1)
+                self._start_worker_process(
+                    worker_id, port, self._worker_jar, self._cluster_env, append_log=True
+                )
+                continue
+            log_path = self._worker_log_paths.get(worker_id)
+            log_hint = ""
+            if log_path is not None and log_path.is_file():
+                tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+                log_hint = f"; log tail:\n{tail}"
+            raise RuntimeError(
+                f"Worker {worker_id} exited before cluster became ready (code={process.returncode}){log_hint}"
+            )

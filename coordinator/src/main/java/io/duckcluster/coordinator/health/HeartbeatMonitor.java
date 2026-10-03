@@ -66,6 +66,9 @@ public final class HeartbeatMonitor implements AutoCloseable {
             List<String> toRemove = new ArrayList<>();
 
             for (WorkerRegistry.WorkerRecord worker : registry.listWorkers()) {
+                if (now.isBefore(worker.registeredAt().plus(deadTimeout))) {
+                    continue;
+                }
                 Instant lastHeartbeat = worker.lastHeartbeatAt();
                 if (lastHeartbeat.isBefore(deadDeadline)) {
                     toRemove.add(worker.workerId());
